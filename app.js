@@ -11,6 +11,8 @@
  *   6. Rendering  (Today view, Settings view, header, tabs)
  *   7. Event handling & mutations  (checks, steppers, finish, settings, editor)
  *   8. Import / export / clear / history  (Phase 2 & 3)
+ *  10. Heuristics  (Phase 4 — volume nudge, skip swap, progression hint;
+ *                   variety guarantee is in section 4's selectVariety)
  *   9. Service worker + init
  *
  * Phase 4/5 implementers: the two clean seams are
@@ -53,6 +55,7 @@ function escapeHtml(s) {
 let state = null;
 let SEED_ROUTINE = null;
 let renderedExercises = [];       // flat list built each render; handlers index into it
+let renderedSuggestions = [];     // Phase 4 suggestion banners built each render; handlers index into it
 const ui = { expanded: new Set(), finishing: false };
 
 function freshState(routine) {
@@ -66,7 +69,9 @@ function freshState(routine) {
     routine: routine,
     routineHistory: [],           // [{ timestamp, routine }] most-recent first, max 10
     log: [],                      // Phase 2 session log
-    lastFinished: null
+    lastFinished: null,
+    dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
+    swaps: {}                     // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
   };
 }
 
@@ -90,6 +95,8 @@ function normalizeState(obj) {
     intensity: obj.intensity || {},
     routineHistory: obj.routineHistory || [],
     log: obj.log || [],
+    dismissed: obj.dismissed || {},
+    swaps: obj.swaps || {},
     routine: obj.routine || base.routine,
     view: obj.view || 'today'
   });
@@ -227,17 +234,50 @@ function resolveExercise(ex, aerial) {
 }
 
 /*
- * Variety-slot selection. v1 semantics: rotate `count` items out of the
- * eligible pool by session index (window shifts by one each session).
- * Phase 4 replaces this body with least-recently-COMPLETED-from-log logic;
- * keep the signature stable.
+ * Variety-slot selection (Phase 4, heuristic #3 — variety guarantee).
+ * Picks the `count` LEAST-RECENTLY-COMPLETED eligible items from the pool
+ * (from state.log). Never-completed items count as least-recent and are
+ * preferred; ties break by pool order (stable). Deterministic for a given
+ * (log, pool) so re-renders never reshuffle.
+ *
+ * Fallback: when the log is empty we keep the documented v1 behaviour —
+ * rotate `count` items by session index (window shifts by one each session).
+ *
+ * Signature is intentionally stable (buildStapleBlock calls it unchanged).
+ * The log is read from the module-level `state` — in the app buildSession is
+ * always called as buildSession(state), so st === state and this is consistent;
+ * tests inject a log via module.exports._set(state).
  */
 function selectVariety(pool, count, session, day, aerial) {
   const elig = pool.filter((ex) => eligible(ex, day, aerial));
   const n = Math.min(Math.max(count, 0), elig.length);
-  const out = [];
-  for (let i = 0; i < n; i++) out.push(elig[(session + i) % elig.length]);
-  return out;
+  const log = (state && state.log) || [];
+
+  if (!log.length) {                                  // empty-log fallback: index rotation
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(elig[(session + i) % elig.length]);
+    return out;
+  }
+  return leastRecentlyCompleted(elig, log).slice(0, n);
+}
+
+// Index of the most recent log entry in which `name` was COMPLETED (done),
+// or -1 if it was never completed (so it sorts first as "least recent").
+function lastCompletedIndex(name, log) {
+  for (let i = log.length - 1; i >= 0; i--) {
+    const hit = (log[i].exercises || []).some((e) => e.name === name && e.done);
+    if (hit) return i;
+  }
+  return -1;
+}
+
+// Order `elig` least-recently-completed first; never-completed (-1) lead the
+// list; ties preserve pool order. Pure — same (elig, log) => same order.
+function leastRecentlyCompleted(elig, log) {
+  return elig
+    .map((ex, i) => ({ ex, i, rec: lastCompletedIndex(ex.name, log) }))
+    .sort((a, b) => (a.rec - b.rec) || (a.i - b.i))
+    .map((o) => o.ex);
 }
 
 // A skill/core block = eligible staples (dayLock-filtered) + N variety slots.
@@ -293,7 +333,51 @@ function buildSession(st) {
   blocks.push({ key: 'cooldown', title: 'Cool-down',
     exercises: buildCooldown(b.cooldown, s.cool, day, s.aerial) });
 
-  return { session, day, blocks };
+  return { session, day, blocks: applySwaps(blocks, st) };
+}
+
+// Find an exercise object anywhere in the routine by name (base, unresolved).
+function findExerciseByName(routine, name) {
+  for (const pool of collectPools(routine)) {
+    const f = pool.find((ex) => ex && ex.name === name);
+    if (f) return f;
+  }
+  return null;
+}
+
+// All exercise arrays in the routine (staples + variety pools + flat blocks).
+function collectPools(routine) {
+  const b = (routine && routine.blocks) || {};
+  const pools = [];
+  ['warmup', 'weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown']
+    .forEach((k) => { if (Array.isArray(b[k])) pools.push(b[k]); });
+  ['skill', 'core'].forEach((k) => {
+    if (b[k]) {
+      if (Array.isArray(b[k].staples)) pools.push(b[k].staples);
+      if (Array.isArray(b[k].varietyPool)) pools.push(b[k].varietyPool);
+    }
+  });
+  return pools;
+}
+
+/*
+ * Phase 4, heuristic #2 (apply side): substitute skip-swapped exercises into
+ * the rendered session only. state.routine is NEVER edited — this maps a
+ * display copy. Swaps are cleared on finish (see finishSession), so a swap is
+ * a one-session trial; if the skip pattern persists the suggestion returns.
+ */
+function applySwaps(blocks, st) {
+  const swaps = st.swaps || {};
+  if (!Object.keys(swaps).length) return blocks;
+  return blocks.map((bl) => ({
+    key: bl.key, title: bl.title, info: bl.info,
+    exercises: bl.exercises.map((ex) => {
+      const repName = swaps[ex.name];
+      if (!repName) return ex;
+      const rep = findExerciseByName(st.routine, repName);
+      return rep ? resolveExercise(rep, st.settings.aerial) : ex;
+    })
+  }));
 }
 
 /* --- 5. Doses & intensity overrides (Phase 1) ----------------------------- */
@@ -397,7 +481,7 @@ function renderTabs() {
 
 function renderToday(build) {
   renderedExercises = [];
-  let html = '';
+  let html = renderSuggestions(build);
   build.blocks.forEach((bl) => {
     if (!bl.exercises.length) return;   // skip empty blocks (e.g. machines at count 0)
     html += '<section class="block"><h2 class="block-title">' + escapeHtml(bl.title) + '</h2>';
@@ -440,6 +524,9 @@ function renderCard(ex, idx, isInfo) {
 
 function renderSteppers(ex, idx, overridden) {
   const eff = effectiveDose(ex);
+  // Phase 4, heuristic #4: subtle "ready to add?" marker when this exercise has
+  // been completed 4+ times at the current effective intensity.
+  const ready = progressionReady(ex.name, eff, state.log || []);
   const row = (label, field, val) =>
     '<div class="stepper">' +
       '<span class="stepper-label">' + escapeHtml(label) + '</span>' +
@@ -450,8 +537,24 @@ function renderSteppers(ex, idx, overridden) {
   return '<div class="steppers">' +
       row('Sets', 'sets', eff.sets) +
       row(amountLabel(ex.dose.unit), 'amount', eff.amount) +
+      (ready ? '<span class="prog-hint" title="Completed 4+ times at this intensity">ready to add?</span>' : '') +
       (overridden ? '<button class="reset" data-action="reset" data-idx="' + idx + '">Reset to default</button>' : '') +
     '</div>';
+}
+
+// Render the suggestion banners (Phase 4) at the very top of the Today view.
+function renderSuggestions(build) {
+  renderedSuggestions = computeSuggestions(state, build);
+  if (!renderedSuggestions.length) return '';
+  return '<div class="suggests">' + renderedSuggestions.map((s, i) =>
+    '<div class="suggest suggest-' + escapeHtml(s.kind) + '">' +
+      '<div class="suggest-text">' + escapeHtml(s.text) + '</div>' +
+      '<div class="suggest-actions">' +
+        '<button class="btn small ghost" data-action="suggest-dismiss" data-sidx="' + i + '">Dismiss</button>' +
+        '<button class="btn small primary" data-action="suggest-apply" data-sidx="' + i + '">' + escapeHtml(s.applyLabel) + '</button>' +
+      '</div>' +
+    '</div>'
+  ).join('') + '</div>';
 }
 
 function renderFinish() {
@@ -557,6 +660,8 @@ function onClick(e) {
     case 'clear': clearData(); break;
     case 'rollback': rollback(+el.dataset.hidx); break;
     case 'save-routine': saveRoutineFromEditor(); break;
+    case 'suggest-apply': applySuggestion(+el.dataset.sidx); break;
+    case 'suggest-dismiss': dismissSuggestion(+el.dataset.sidx); break;
     default: break;
   }
 }
@@ -620,6 +725,7 @@ function finishSession(note) {
   state.log.push(entry);
   state.session += 1;
   state.checks = {};
+  state.swaps = {};              // Phase 4: swaps are per-session trials — clear on finish
   state.lastFinished = entry.date;
   saveState();
 }
@@ -715,6 +821,256 @@ function saveRoutineFromEditor() {
   render();   // re-renders settings with the new pretty-printed JSON + cleared errors
 }
 
+/* --- 10. Heuristics (Phase 4 — deterministic, offline, no LLM) ------------ *
+ * All suggestions, never silent changes. Every function here is pure (takes
+ * log/state as args) so the smoke test can exercise them directly.
+ * Heuristic #3 (variety guarantee) lives in section 4 (selectVariety).
+ *
+ * Dismissal / re-show policy: dismissing a suggestion records the current
+ * session index in state.dismissed[key]. The SAME key stays suppressed until
+ * DISMISS_COOLDOWN more sessions have been finished (session index advances by
+ * one per finish). If the underlying condition changes the key itself changes
+ * (keys embed the target knob/value or the skipped name), so a genuinely new
+ * suggestion always shows immediately regardless of cooldown.
+ */
+
+const DISMISS_COOLDOWN = 3;                    // sessions to suppress an identical dismissed key
+const ALL_KNOBS = ['skill', 'core', 'wts', 'mach', 'cool'];
+// Raise candidates + tie-break order. Weights first so the canonical
+// "raise weights to 3?" wins ties (matches the spec example). mach/cool are
+// structural, not effort knobs, so they're never *raised* by the nudge.
+const RAISE_KNOBS = ['wts', 'skill', 'core'];
+const KNOB_LABEL = { skill: 'skill variety', core: 'core variety', wts: 'weights', mach: 'machines', cool: 'cool-down' };
+
+function sliderRanges(routine) {
+  return (routine && routine.structure && routine.structure.sliders) || DEFAULT_RANGES;
+}
+
+// Fraction (0..1) of an entry's exercises marked done. Empty entry => 0.
+function sessionCompletion(entry) {
+  const ex = (entry && entry.exercises) || [];
+  if (!ex.length) return 0;
+  return ex.filter((e) => e.done).length / ex.length;
+}
+
+// name -> knob (block slider) map, derived from the routine so old logs work.
+function buildKnobMap(routine) {
+  const b = (routine && routine.blocks) || {};
+  const map = {};
+  const add = (arr, knob) => (arr || []).forEach((ex) => { if (ex && ex.name) map[ex.name] = knob; });
+  if (b.skill) { add(b.skill.staples, 'skill'); add(b.skill.varietyPool, 'skill'); }
+  if (b.core) { add(b.core.staples, 'core'); add(b.core.varietyPool, 'core'); }
+  add(b.weightsA, 'wts'); add(b.weightsB, 'wts');
+  add(b.machinesA, 'mach'); add(b.machinesB, 'mach');
+  add(b.cooldown, 'cool');   // warmup intentionally omitted (user-managed, no knob)
+  return map;
+}
+
+function sameKnobs(a, b, keys) {
+  return !!a && !!b && keys.every((k) => a[k] === b[k]);
+}
+
+// Lowest-value raisable knob (most room to grow); tie-break by RAISE_KNOBS order.
+function pickRaiseKnob(settings, ranges) {
+  const cands = RAISE_KNOBS.filter((k) => settings[k] < (ranges[k] || DEFAULT_RANGES[k])[1]);
+  if (!cands.length) return null;
+  cands.sort((x, y) => (settings[x] - settings[y]) || (RAISE_KNOBS.indexOf(x) - RAISE_KNOBS.indexOf(y)));
+  return cands[0];
+}
+
+// Least-completed lowerable block's knob across the given entries; tie-break by ALL_KNOBS order.
+function pickLowerKnob(entries, routine, settings, ranges) {
+  const knobMap = buildKnobMap(routine);
+  const agg = {};   // knob -> { done, total }
+  entries.forEach((e) => (e.exercises || []).forEach((ex) => {
+    const knob = knobMap[ex.name];
+    if (!knob) return;
+    agg[knob] = agg[knob] || { done: 0, total: 0 };
+    agg[knob].total++;
+    if (ex.done) agg[knob].done++;
+  }));
+  const cands = Object.keys(agg).filter((k) => settings[k] > (ranges[k] || DEFAULT_RANGES[k])[0]);
+  if (!cands.length) return null;
+  cands.sort((x, y) =>
+    (agg[x].done / agg[x].total) - (agg[y].done / agg[y].total) ||
+    (ALL_KNOBS.indexOf(x) - ALL_KNOBS.indexOf(y)));
+  return cands[0];
+}
+
+/*
+ * Heuristic #1 — volume nudge. Returns a suggestion object or null.
+ *   RAISE: last 3 logged sessions all 100% AND all logged at the CURRENT slider
+ *          values (so the streak really reflects today's load) -> raise a knob.
+ *   LOWER: last 2 logged sessions both < 60% complete -> lower the least-
+ *          completed block's knob.
+ */
+function volumeNudge(st) {
+  const log = st.log || [];
+  const s = st.settings;
+  const ranges = sliderRanges(st.routine);
+
+  if (log.length >= 3) {
+    const last3 = log.slice(-3);
+    const all100 = last3.every((e) => sessionCompletion(e) >= 1);
+    const sameLoad = last3.every((e) => sameKnobs(e.settings, s, ALL_KNOBS));
+    if (all100 && sameLoad) {
+      const knob = pickRaiseKnob(s, ranges);
+      if (knob) {
+        const target = s[knob] + 1;
+        return {
+          kind: 'raise', knob: knob, target: target,
+          key: 'raise:' + knob + ':' + target,
+          text: "You've cleared everything 3 sessions running — raise " + KNOB_LABEL[knob] + ' to ' + target + '?',
+          applyLabel: 'Raise to ' + target
+        };
+      }
+    }
+  }
+
+  if (log.length >= 2) {
+    const last2 = log.slice(-2);
+    if (last2.every((e) => sessionCompletion(e) < 0.6)) {
+      const knob = pickLowerKnob(last2, st.routine, s, ranges);
+      if (knob) {
+        const target = s[knob] - 1;
+        return {
+          kind: 'lower', knob: knob, target: target,
+          key: 'lower:' + knob + ':' + target,
+          text: 'Only partly finishing lately — ease ' + KNOB_LABEL[knob] + ' down to ' + target + '?',
+          applyLabel: 'Lower to ' + target
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// The most-recent `k` appearances of `name` in the log (most-recent first).
+function recentAppearances(name, log, k) {
+  const apps = [];
+  for (let i = log.length - 1; i >= 0 && apps.length < k; i--) {
+    const e = (log[i].exercises || []).find((x) => x.name === name);
+    if (e) apps.push(e);
+  }
+  return apps;
+}
+
+// Heuristic #2 predicate: skipped in 2+ of its last 3 appearances (needs >=2 appearances).
+function skippedRecently(name, log) {
+  const apps = recentAppearances(name, log, 3);
+  if (apps.length < 2) return false;
+  return apps.filter((a) => !a.done).length >= 2;
+}
+
+/*
+ * Pick a same-category replacement for a skipped exercise. Candidates: same
+ * BASE category (looked up in the routine, so aerial resolution doesn't
+ * confuse it), eligible for the day/aerial state, not currently shown, not
+ * already proposed, not itself. Ranked least-recently-completed (consistent
+ * with the variety guarantee), tie-break pool order.
+ */
+function pickReplacement(name, st, shownNames, proposed, day) {
+  const routine = st.routine;
+  const base = findExerciseByName(routine, name);
+  if (!base) return null;
+  const cat = base.category;
+  const aerial = st.settings.aerial;
+  const log = st.log || [];
+  const cands = [];
+  collectPools(routine).forEach((pool) => pool.forEach((ex) => {
+    if (!ex || ex.name === name || ex.category !== cat) return;
+    if (!eligible(ex, day, aerial)) return;
+    if (shownNames.has(ex.name) || proposed.has(ex.name)) return;
+    if (!cands.some((c) => c.name === ex.name)) cands.push(ex);
+  }));
+  if (!cands.length) return null;
+  return leastRecentlyCompleted(cands, log)[0].name;
+}
+
+// Heuristic #2 — one swap suggestion per currently-shown, recently-skipped exercise.
+function skipSuggestions(st, build) {
+  const log = st.log || [];
+  if (!build || !log.length) return [];
+  const shownNames = new Set();
+  build.blocks.forEach((bl) => bl.exercises.forEach((ex) => shownNames.add(ex.name)));
+
+  const out = [];
+  const proposed = new Set();   // don't propose the same replacement for two skips
+  build.blocks.forEach((bl) => {
+    if (bl.key === 'warmup') return;
+    bl.exercises.forEach((ex) => {
+      if (st.swaps && st.swaps[ex.name]) return;      // already swapped this session
+      if (!skippedRecently(ex.name, log)) return;
+      const rep = pickReplacement(ex.name, st, shownNames, proposed, build.day);
+      if (!rep) return;
+      proposed.add(rep);
+      out.push({
+        kind: 'swap', name: ex.name, replacement: rep,
+        key: 'swap:' + ex.name,
+        text: 'You keep skipping ' + ex.name + '. Swap in ' + rep + ' instead?',
+        applyLabel: 'Swap in ' + rep
+      });
+    });
+  });
+  return out;
+}
+
+/*
+ * Heuristic #4 predicate: exercise completed 4+ times at the CURRENT effective
+ * intensity (sets+amount+unit). Bumping the dose changes `cur`, so the count
+ * naturally resets at the new level.
+ */
+function progressionReady(name, cur, log) {
+  let n = 0;
+  (log || []).forEach((entry) => (entry.exercises || []).forEach((e) => {
+    if (e.name === name && e.done && e.dose &&
+        e.dose.sets === cur.sets && e.dose.amount === cur.amount && e.dose.unit === cur.unit) {
+      n++;
+    }
+  }));
+  return n >= 4;
+}
+
+// Is `key` currently suppressed by a recent dismissal? (see policy note above)
+function isDismissed(key, st) {
+  const d = st.dismissed || {};
+  if (!(key in d)) return false;
+  return (st.session - d[key]) < DISMISS_COOLDOWN;
+}
+
+// The suggestion banners to show for the current session, minus dismissed ones.
+function computeSuggestions(st, build) {
+  const list = [];
+  const vol = volumeNudge(st);
+  if (vol && !isDismissed(vol.key, st)) list.push(vol);
+  skipSuggestions(st, build).forEach((sg) => { if (!isDismissed(sg.key, st)) list.push(sg); });
+  return list;
+}
+
+// Apply: volume nudge writes the slider (user-owned knob); swap records a
+// per-session substitution (state.routine is never touched).
+function applySuggestion(i) {
+  const sg = renderedSuggestions[i];
+  if (!sg) return;
+  if (sg.kind === 'raise' || sg.kind === 'lower') {
+    state.settings[sg.knob] = sg.target;
+  } else if (sg.kind === 'swap') {
+    state.swaps = state.swaps || {};
+    state.swaps[sg.name] = sg.replacement;
+  }
+  saveState();
+  render();
+}
+
+function dismissSuggestion(i) {
+  const sg = renderedSuggestions[i];
+  if (!sg) return;
+  state.dismissed = state.dismissed || {};
+  state.dismissed[sg.key] = state.session;
+  saveState();
+  render();
+}
+
 /* --- 9. Service worker + init -------------------------------------------- */
 
 function registerSW() {
@@ -769,6 +1125,11 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     validateRoutine, formatDose, effectiveDose, buildSession, selectVariety,
     migrateFromV1, freshState, currentDay, amountStep,
+    // Phase 4 heuristics (pure — take log/state as args)
+    leastRecentlyCompleted, lastCompletedIndex, sessionCompletion, buildKnobMap,
+    volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
+    pickReplacement, progressionReady, isDismissed, computeSuggestions,
+    findExerciseByName, collectPools, recentAppearances,
     _set: (s) => { state = s; }
   };
 }

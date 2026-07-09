@@ -273,6 +273,33 @@ textarea {
 }
 .errors.show { display: block; }
 
+/* --- Suggestion banners (Phase 4) --- */
+.suggests { margin-bottom: 16px; display: flex; flex-direction: column; gap: 10px; }
+.suggest {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+.suggest-lower { border-left-color: var(--danger); }
+.suggest-swap { border-left-color: var(--teal); }
+.suggest-text { font-size: 14px; line-height: 1.4; }
+.suggest-actions { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; }
+.suggest-actions .btn { flex: 0 0 auto; }
+
+/* --- Progression hint (Phase 4) — subtle inline marker by the steppers --- */
+.prog-hint {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--teal);
+  background: color-mix(in srgb, var(--teal) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--teal) 40%, transparent);
+  border-radius: 99px;
+  padding: 3px 9px;
+  white-space: nowrap;
+}
+
 /* --- Tab bar (generic) --- */
 #tabs {
   position: fixed;
