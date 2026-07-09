@@ -1,0 +1,300 @@
+/* Tumble Trainer v2 — styles.css
+   Dark, mobile-first. Category palette lives in CSS custom properties. */
+
+:root {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-2: #273449;
+  --line: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #a78bfa;
+  --danger: #f87171;
+  --radius: 14px;
+
+  /* Category palette (keyed by colorId) — accessible on the dark surface */
+  --purple: #a78bfa;
+  --teal:   #2dd4bf;
+  --coral:  #fb7185;
+  --pink:   #f472b6;
+  --gray:   #94a3b8;
+
+  --tabbar-h: 60px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  max-width: 640px;
+  margin: 0 auto;
+  min-height: 100vh;
+}
+
+/* --- Header --- */
+#app-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: linear-gradient(180deg, var(--bg) 70%, rgba(15,23,42,0.85));
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--line);
+}
+#app-header .title { font-size: 20px; font-weight: 700; letter-spacing: 0.2px; }
+#app-header .sub { color: var(--muted); font-size: 14px; margin-top: 2px; }
+.progress {
+  margin-top: 10px;
+  height: 6px;
+  background: var(--surface-2);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+.progress-text { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+/* --- View / blocks --- */
+#view {
+  padding: 12px 16px calc(var(--tabbar-h) + 24px);
+}
+.block { margin-bottom: 18px; }
+.block-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin: 0 0 8px 2px;
+}
+
+/* --- Exercise card --- */
+.card {
+  --cat: var(--gray);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--cat);
+  border-radius: var(--radius);
+  margin-bottom: 10px;
+  overflow: hidden;
+  transition: border-color 0.15s ease, opacity 0.15s ease;
+}
+.card.cat-purple { --cat: var(--purple); }
+.card.cat-teal   { --cat: var(--teal); }
+.card.cat-coral  { --cat: var(--coral); }
+.card.cat-pink   { --cat: var(--pink); }
+.card.cat-gray   { --cat: var(--gray); }
+
+.card.is-done { opacity: 0.6; }
+.card.is-open { border-color: var(--cat); }
+
+.card-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.tag {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cat);
+  background: color-mix(in srgb, var(--cat) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--cat) 35%, transparent);
+  padding: 3px 8px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.card-body { flex: 1 1 auto; min-width: 0; }
+.card-name { font-weight: 600; font-size: 15px; }
+.card-name .mod {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 1px 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.dose { font-size: 14px; color: var(--text); margin-top: 3px; font-variant-numeric: tabular-nums; }
+.why { font-size: 12.5px; color: var(--muted); margin-top: 4px; line-height: 1.35; }
+
+.check {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  margin: 9px 0 0;   /* keeps the 44px tap target via padding of card-main */
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* --- Steppers (Phase 1) --- */
+.steppers {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  padding: 0 14px 14px 18px;
+  border-top: 1px solid var(--line);
+  margin-top: -1px;
+  padding-top: 12px;
+}
+.stepper { display: flex; align-items: center; gap: 8px; }
+.stepper-label { font-size: 12px; color: var(--muted); min-width: 52px; }
+.stepper button {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.stepper button:active { background: var(--accent); color: #0f172a; }
+.stepper-val { min-width: 30px; text-align: center; font-weight: 600; font-variant-numeric: tabular-nums; }
+.reset {
+  background: none;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+/* --- Buttons --- */
+.btn {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  padding: 12px 16px;
+  border-radius: 12px;
+  cursor: pointer;
+  min-height: 44px;
+}
+.btn.primary { background: var(--accent); color: #0f172a; border-color: var(--accent); }
+.btn.ghost { background: none; }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, var(--line)); }
+.btn.small { font-size: 13px; padding: 8px 12px; min-height: 36px; }
+.btn.big { width: 100%; font-size: 16px; padding: 16px; margin-top: 6px; }
+.btn.file { display: inline-flex; align-items: center; justify-content: center; }
+.row { display: flex; gap: 10px; margin-top: 10px; }
+.row.wrap { flex-wrap: wrap; }
+.row .btn { flex: 1 1 auto; }
+
+/* --- Finish panel --- */
+.finish-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-top: 8px;
+}
+.finish-panel label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 6px; }
+
+textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  resize: vertical;
+}
+.finish-panel textarea { min-height: 70px; }
+
+/* --- Settings --- */
+.settings .panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.panel h3 { margin: 0 0 12px; font-size: 15px; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 14px; margin-bottom: 6px; }
+.field .val {
+  color: var(--accent);
+  font-weight: 700;
+  float: right;
+  font-variant-numeric: tabular-nums;
+}
+.field input[type="range"] { width: 100%; accent-color: var(--accent); height: 30px; }
+.field.toggle { display: flex; align-items: center; justify-content: space-between; }
+.field.toggle input { width: 44px; height: 26px; accent-color: var(--accent); }
+
+.muted { color: var(--muted); font-size: 13px; }
+
+.history { list-style: none; margin: 0; padding: 0; }
+.history li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.history li:last-child { border-bottom: none; }
+
+#routine-json { min-height: 260px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre; }
+.errors {
+  display: none;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  color: #fecaca;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.errors.show { display: block; }
+
+/* --- Tab bar (generic) --- */
+#tabs {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  display: flex;
+  max-width: 640px;
+  margin: 0 auto;
+  height: var(--tabbar-h);
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tab {
+  flex: 1;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.tab.active { color: var(--accent); }
