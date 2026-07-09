@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "goals": [
+    { "name": "General core strength", "weight": 100, "active": true },
+    { "name": "Successive backflips", "weight": 100, "active": true },
+    { "name": "Aerial", "weight": 15, "active": false },
+    { "name": "Plantar fasciitis care", "weight": 100, "active": true },
+    { "name": "Cubital tunnel care", "weight": 100, "active": true },
+    { "name": "Posture", "weight": 100, "active": true },
+    { "name": "Sciatic nerve mobility", "weight": 100, "active": true },
+    { "name": "Joint-friendly recovery from tumbling", "weight": 100, "active": true }
+  ],
+  "categories": {
+    "gen": { "label": "General core", "colorId": "purple" },
+    "flip": { "label": "Backflip power", "colorId": "teal" },
+    "aerial": { "label": "Aerial prep", "colorId": "coral" },
+    "health": { "label": "Health / rehab", "colorId": "pink" },
+    "str": { "label": "Strength", "colorId": "gray" }
+  },
+  "blocks": {
+    "warmup": [
+      { "name": "Your warmup routine", "dose": { "sets": 1, "amount": 1, "unit": "as usual" }, "category": "health", "why": "Bike, plantar fasciitis / posture / cubital tunnel moves, muscle warmups", "userManaged": true }
+    ],
+    "skill": {
+      "staples": [
+        { "name": "Handstand wall hold", "dose": { "sets": 3, "amount": 30, "range": 45, "unit": "sec" }, "category": "gen", "why": "Shoulder stack and balance (soft elbows, no hard lockout)", "dayLock": "A" },
+        { "name": "Jump tucks", "dose": { "sets": 3, "amount": 6, "unit": "reps" }, "category": "flip", "why": "B days only — plyo power without extra joint cost", "dayLock": "B" },
+        { "name": "Hip abduction (band walks or side-lying)", "dose": { "sets": 2, "amount": 15, "unit": "reps/side" }, "category": "str", "why": "Glute med — landing control and knee tracking", "aerialAlt": { "category": "aerial", "why": "Glute med — drives the aerial takeoff, landing control" } }
+      ],
+      "varietyPool": [
+        { "name": "Bridge push-ups", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "gen", "why": "Bridge strength for walkovers and handsprings" },
+        { "name": "Single-leg glute bridge", "dose": { "sets": 3, "amount": 10, "unit": "reps/side" }, "category": "str", "why": "One-leg hip drive, zero impact", "aerialAlt": { "category": "aerial", "why": "One-leg hip drive, zero impact" } },
+        { "name": "Wall handstand shoulder taps", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "gen", "why": "Handstand stability under shift" },
+        { "name": "Candlestick to stand", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "flip", "why": "Rebound and landing mechanics" },
+        { "name": "Broad jump stick landing", "dose": { "sets": 3, "amount": 5, "unit": "reps" }, "category": "flip", "why": "Quiet, absorbed landings — joint-friendly power" },
+        { "name": "Wall-sit hollow press", "dose": { "sets": 3, "amount": 20, "unit": "sec" }, "category": "flip", "why": "Rib-down position for the set" }
+      ]
+    },
+    "core": {
+      "staples": [
+        { "name": "Hollow rocks", "dose": { "sets": 3, "amount": 20, "unit": "reps" }, "category": "flip", "why": "Staple A — hollow under momentum", "dayLock": "A" },
+        { "name": "Tuck-ups (fast)", "dose": { "sets": 4, "amount": 12, "unit": "reps" }, "category": "flip", "why": "Staple B — explosive knee snap", "dayLock": "B" },
+        { "name": "Hollow body hold", "dose": { "sets": 3, "amount": 30, "range": 45, "unit": "sec" }, "category": "gen", "why": "Every-session staple — the shape behind every skill" }
+      ],
+      "varietyPool": [
+        { "name": "V-ups", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "flip", "why": "Fast hip flexion for rotation speed" },
+        { "name": "Side plank hip dips", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "category": "aerial", "why": "Oblique strength for sideways rotation", "aerialOnly": true },
+        { "name": "Arch (superman) hold", "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "category": "gen", "why": "Back tension for handsprings" },
+        { "name": "L-sit or tuck sit hold", "dose": { "sets": 4, "amount": 15, "range": 20, "unit": "sec" }, "category": "gen", "why": "Compression strength" },
+        { "name": "Single-leg V-up", "dose": { "sets": 3, "amount": 8, "unit": "reps/side" }, "category": "aerial", "why": "One-leg drive like the aerial kick", "aerialOnly": true },
+        { "name": "Straight jump to fast tuck", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "flip", "why": "Set + tuck timing" },
+        { "name": "Dead bug", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "category": "gen", "why": "Core stability with moving limbs" }
+      ]
+    },
+    "weightsA": [
+      { "name": "Hex bar deadlift", "dose": { "sets": 3, "amount": 5, "unit": "reps" }, "category": "str", "why": "Tumbling power; loads feet in a fascia-friendly way" },
+      { "name": "Overhead press", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "str", "why": "Neutral wrists, don't slam elbow lockout (cubital tunnel)" },
+      { "name": "Face pulls or band pull-aparts", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "category": "health", "why": "Posture — balances all the pressing" }
+    ],
+    "weightsB": [
+      { "name": "Bulgarian split squat", "dose": { "sets": 3, "amount": 8, "unit": "reps/side" }, "category": "str", "why": "Single-leg drive and landing strength", "aerialAlt": { "category": "aerial", "why": "Single-leg drive — your best aerial lift" } },
+      { "name": "Chest-supported or cable row", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "health", "why": "The missing pull your posture needs" },
+      { "name": "Leg press (light-moderate)", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "str", "why": "Optional volume, easy on joints" }
+    ],
+    "machinesA": [
+      { "name": "Standing calf raise (slow eccentric)", "dose": { "sets": 3, "amount": 10, "unit": "reps", "tempoNote": "3 sec down" }, "category": "health", "why": "Slow heavy loading treats the fascia — different job than your jumping" },
+      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "str", "why": "Hamstrings protect knees on landings" }
+    ],
+    "machinesB": [
+      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "str", "why": "Hamstrings protect knees on landings" },
+      { "name": "Tibialis raises", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "category": "health", "why": "Balances all that calf and jump work — shin and foot health" }
+    ],
+    "cooldown": [
+      { "name": "Splits routine (incl. sciatic floss)", "dose": { "sets": 1, "amount": 5, "unit": "min" }, "category": "gen", "why": "Your routine — hip range plus the nerve work you already do", "aerialAlt": { "category": "aerial", "why": "Your routine — hip range for aerials, plus your nerve work" }, "alwaysInShort": true },
+      { "name": "Doorway pec stretch + thoracic extension", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "category": "health", "why": "Posture — opens what tumbling rounds", "alwaysInShort": true },
+      { "name": "Calf + plantar fascia stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "category": "health", "why": "Gentle end-of-session foot care" }
+    ]
+  },
+  "structure": {
+    "frequencyPerWeek": "2-3",
+    "dayAlternation": "A on odd sessions, B on even",
+    "sliders": { "skill": [1, 3], "core": [1, 3], "wts": [1, 3], "mach": [0, 2], "cool": [1, 2] },
+    "varietySlotIndex": "third item of skill and core blocks",
+    "notes": [
+      "Warmup is user-managed — never modify it",
+      "Aerial toggle: when off, aerialOnly items leave rotation and aerialAlt items use base category/why",
+      "Health constraints: cubital tunnel (no hard elbow lockout pressing), plantar fasciitis (keep slow calf loading, conservative impact), sciatic nerve (gentle flossing lives in user's splits routine), posture (never drop the pulling work), user stims by jumping (extra daily impact through feet)"
+    ]
+  }
+}
