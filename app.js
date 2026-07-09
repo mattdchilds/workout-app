@@ -13,6 +13,7 @@
  *   8. Import / export / clear / history  (Phase 2 & 3)
  *  10. Heuristics  (Phase 4 — volume nudge, skip swap, progression hint;
  *                   variety guarantee is in section 4's selectVariety)
+ *  11. LLM integration  (Phase 5 — callClaude, 5a edit flow + diff, 5b Ask)
  *   9. Service worker + init
  *
  * Phase 4/5 implementers: the two clean seams are
@@ -37,7 +38,17 @@ const DEFAULT_RANGES = { skill: [1, 3], core: [1, 3], wts: [1, 3], mach: [0, 2],
 // Generic tab registry. Later phases just push more entries.
 const TABS = [
   { id: 'today', label: 'Today' },
+  { id: 'edit', label: 'Edit' },      // Phase 5a — natural-language routine editing
+  { id: 'ask', label: 'Ask' },        // Phase 5b — technique/planning chat
   { id: 'settings', label: 'Settings' }
+];
+
+// Phase 5 (LLM): model choice. Default is fast/cheap Haiku; Sonnet is the
+// "correctness wins" toggle for structurally sloppy edits (per spec).
+const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
+const MODELS = [
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fast (default)' },
+  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 — slower, sharper' }
 ];
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
@@ -56,7 +67,22 @@ let state = null;
 let SEED_ROUTINE = null;
 let renderedExercises = [];       // flat list built each render; handlers index into it
 let renderedSuggestions = [];     // Phase 4 suggestion banners built each render; handlers index into it
-const ui = { expanded: new Set(), finishing: false };
+const ui = {
+  expanded: new Set(),
+  finishing: false,
+  // Phase 5 (LLM) — all in-memory, never persisted.
+  llm: {
+    editInput: '',        // free-text edit instruction (survives re-render / prefill from Ask)
+    editStatus: 'idle',   // 'idle' | 'loading' | 'error' | 'diff' | 'raw'
+    editError: '',
+    editRaw: '',          // raw model output shown when it won't validate twice
+    proposal: null,       // { routine, changes[], warnings[], diff }
+    ask: [],              // [{ role:'user'|'assistant', text }] — in-memory chat history
+    askStatus: 'idle',    // 'idle' | 'loading'
+    askError: '',
+    askInput: ''
+  }
+};
 
 function freshState(routine) {
   return {
@@ -71,7 +97,9 @@ function freshState(routine) {
     log: [],                      // Phase 2 session log
     lastFinished: null,
     dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
-    swaps: {}                     // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
+    swaps: {},                    // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
+    apiKey: '',                   // Phase 5: BYO Anthropic key. Device-only; never committed, never sent anywhere but api.anthropic.com
+    model: DEFAULT_MODEL          // Phase 5: model toggle
   };
 }
 
@@ -97,6 +125,8 @@ function normalizeState(obj) {
     log: obj.log || [],
     dismissed: obj.dismissed || {},
     swaps: obj.swaps || {},
+    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : base.apiKey,
+    model: obj.model || base.model,
     routine: obj.routine || base.routine,
     view: obj.view || 'today'
   });
@@ -441,13 +471,22 @@ function resetOverride(ex) {
 /* --- 6. Rendering --------------------------------------------------------- */
 
 function render() {
+  if (typeof document === 'undefined') return;   // no-op under Node (smoke tests call mutators directly)
   const y = window.scrollY;
   renderTabs();
   const view = document.getElementById('view');
   if (state.view === 'settings') {
     renderedExercises = [];
     view.innerHTML = renderSettings();
-    renderHeader(null);
+    renderHeader(null, 'Settings');
+  } else if (state.view === 'edit') {
+    renderedExercises = [];
+    view.innerHTML = renderEdit();
+    renderHeader(null, 'Edit routine');
+  } else if (state.view === 'ask') {
+    renderedExercises = [];
+    view.innerHTML = renderAsk();
+    renderHeader(null, 'Ask');
   } else {
     const build = buildSession(state);
     view.innerHTML = renderToday(build);   // populates renderedExercises
@@ -456,10 +495,11 @@ function render() {
   window.scrollTo(0, y);
 }
 
-function renderHeader(build) {
+function renderHeader(build, subtitle) {
   const h = document.getElementById('app-header');
   if (!build) {
-    h.innerHTML = '<div class="title">Tumble Trainer</div><div class="sub">Settings</div>';
+    h.innerHTML = '<div class="title">Tumble Trainer</div><div class="sub">' +
+      escapeHtml(subtitle || 'Settings') + '</div>';
     return;
   }
   const total = renderedExercises.length;
@@ -599,6 +639,28 @@ function renderSettings() {
       '<input type="checkbox" id="aerial" data-action="toggle-aerial"' + (s.aerial ? ' checked' : '') + '>' +
     '</div></section>';
 
+  // AI routine editing (Phase 5) — password key + model toggle. Optional:
+  // everything else in the app works fully with no key set.
+  html += '<section class="panel"><h3>AI routine editing (optional)</h3>' +
+    '<div class="field">' +
+      '<label for="apikey">Anthropic API key</label>' +
+      '<input type="password" id="apikey" data-action="apikey" autocomplete="off" ' +
+        'autocapitalize="off" spellcheck="false" placeholder="sk-ant-…" value="' +
+        escapeHtml(state.apiKey || '') + '">' +
+    '</div>' +
+    '<div class="field">' +
+      '<label for="model">Model</label>' +
+      '<select id="model" data-action="model">' +
+        MODELS.map((m) => '<option value="' + escapeHtml(m.id) + '"' +
+          (state.model === m.id ? ' selected' : '') + '>' + escapeHtml(m.label) + '</option>').join('') +
+      '</select>' +
+    '</div>' +
+    '<p class="muted">Your key is stored only on this device and is sent only to ' +
+      'api.anthropic.com — never committed, never to any other server. ' +
+      'Recommended: set a monthly spend limit in the Anthropic Console. ' +
+      'The rest of the app (workouts, logging, heuristics) works fully without a key.</p>' +
+    '</section>';
+
   // Data
   html += '<section class="panel"><h3>Data</h3>' +
     '<div class="row wrap">' +
@@ -662,6 +724,13 @@ function onClick(e) {
     case 'save-routine': saveRoutineFromEditor(); break;
     case 'suggest-apply': applySuggestion(+el.dataset.sidx); break;
     case 'suggest-dismiss': dismissSuggestion(+el.dataset.sidx); break;
+    // Phase 5 (LLM) — all gated behind explicit user action.
+    case 'llm-goto-settings': setView('settings'); break;
+    case 'llm-send-edit': sendEdit(); break;
+    case 'llm-apply': applyProposal(); break;
+    case 'llm-discard': discardProposal(); break;
+    case 'ask-send': sendAsk(); break;
+    case 'ask-forward': forwardToEditor(+el.dataset.i); break;
     default: break;
   }
 }
@@ -685,6 +754,13 @@ function onChange(e) {
     render();
   } else if (action === 'import') {
     importFile(el.files && el.files[0]);
+  } else if (action === 'apikey') {
+    // Persist quietly — no re-render, so focus/caret in the field is preserved.
+    state.apiKey = el.value.trim();
+    saveState();
+  } else if (action === 'model') {
+    state.model = el.value;
+    saveState();
   }
 }
 
@@ -799,6 +875,8 @@ function rollback(hidx) {
   if (!confirm('Roll back to this routine version?')) return;
   pushHistory(state.routine);            // current becomes undoable
   state.routine = deepClone(entry.routine);
+  state.swaps = {};                      // a routine change may invalidate swap/dismissed keys
+  state.dismissed = {};
   saveState();
   render();
 }
@@ -1071,6 +1149,619 @@ function dismissSuggestion(i) {
   render();
 }
 
+/* --- 11. LLM integration (Phase 5 — BYO Anthropic key) -------------------- *
+ * PRIMARY PURPOSE: natural-language routine editing (5a). Secondary: Ask (5b).
+ * Everything here is gated behind explicit user action — no LLM call ever
+ * happens on its own. Degrades gracefully with no key / offline: the UI shows
+ * an inline message instead of a dead input, and the rest of the app is
+ * untouched. All chat/edit UI state lives in ui.llm (in-memory only).
+ * ==========================================================================*/
+
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+let LLM_RETRY_MS = 1500;   // delay before the single 429/529 retry (0 in tests)
+
+// Constraints/goals blurb sent with every 5a edit (from the spec + seed).
+const GOALS_BLURB =
+  '2–3 sessions/week, alternating A/B day structure. Primary goals: general core ' +
+  'strength and successive backflips; aerial work is a lower-weight optional goal. ' +
+  'Health constraints that must be respected: plantar fasciitis (keep impact ' +
+  'conservative, keep slow calf loading), cubital tunnel (no aggressive elbow-lockout ' +
+  'pressing volume), posture (keep the pulling / row work), sciatic nerve mobility ' +
+  '(gentle flossing lives in the user\'s splits routine), and joint-friendly recovery ' +
+  'from tumbling. The user already stims by jumping (extra daily impact through the ' +
+  'feet), so added plyometric/impact volume should stay conservative. Warm-up is ' +
+  'user-managed.';
+
+// 5a system prompt: ONLY-JSON output, the full schema, and every guardrail.
+const EDIT_SYSTEM_PROMPT =
+  'You are a strength & tumbling coach editing a workout routine stored as JSON.\n\n' +
+  'Respond with ONLY a single JSON object — no markdown, no code fences, no prose ' +
+  'before or after. It MUST have exactly this shape:\n' +
+  '{\n' +
+  '  "routine": <the COMPLETE new routine object, same schema as the input>,\n' +
+  '  "changes": ["short human-readable description of each change", ...],\n' +
+  '  "warnings": ["anything the user should double-check", ...]\n' +
+  '}\n' +
+  'Return the ENTIRE routine, not a diff. Copy every field you are not changing ' +
+  'exactly as given.\n\n' +
+  'ROUTINE SCHEMA:\n' +
+  '- Top level: { version:int, goals:[...], categories:{...}, blocks:{...}, structure?:{...} }\n' +
+  '- goals: array of { name:string, weight:number, active:boolean }\n' +
+  '- categories: object mapping a short id -> { label:string, colorId:string }. colorId ' +
+  'is one of: purple, teal, coral, pink, gray. Every exercise.category MUST be one of the ' +
+  'category ids you define here.\n' +
+  '- blocks:\n' +
+  '    skill: { staples:[exercise...], varietyPool:[exercise...] }\n' +
+  '    core:  { staples:[exercise...], varietyPool:[exercise...] }\n' +
+  '    weightsA, weightsB, machinesA, machinesB, cooldown, warmup: [exercise...]\n' +
+  '  skill and core must each keep at least one staple. No duplicate exercise names within a ' +
+  'single array.\n' +
+  '- exercise: {\n' +
+  '    name: string (unique within its array),\n' +
+  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"reps"|"reps/side"|"min", range?:number },\n' +
+  '    category: one of the category ids above,\n' +
+  '    why: short string explaining the purpose,\n' +
+  '    aerialAlt?: { category, why }   // used when the user turns aerial mode on\n' +
+  '    aerialOnly?: boolean            // item only appears when aerial mode is on\n' +
+  '    dayLock?: "A" | "B"             // item only appears on that day\n' +
+  '  }\n' +
+  '  (Warm-up items may carry unit "as usual" and userManaged:true.)\n\n' +
+  'GUARDRAILS (follow strictly):\n' +
+  '- Preserve the A/B day structure and the block shapes unless the user explicitly asks to change them.\n' +
+  '- Never remove health/rehab items (slow calf work, nerve/sciatic care, rows/pulling, tibialis ' +
+  'raises, plantar-fascia and posture work) unless the user explicitly names that item for removal — ' +
+  'and if they do, add a warning.\n' +
+  '- Respect known issues: no aggressive elbow-lockout pressing volume (cubital tunnel); keep impact / ' +
+  'plyometric volume conservative (plantar fasciitis, joint recovery); the user already gets daily ' +
+  'impact from jumping.\n' +
+  '- Warm-up is user-managed — NEVER add, edit, or remove warmup items.\n' +
+  '- When adding a new goal, give it an explicit weight, and rebalance the variety pools so their ' +
+  'emphasis roughly matches the active goal weights.\n' +
+  '- For anything symptom- or pain-related, adjust conservatively and add a warning recommending the ' +
+  'user see a physical therapist rather than prescribing rehab.\n' +
+  '- Keep dayLock, aerialAlt, and aerialOnly semantics intact on items you keep.';
+
+// 5b system prompt: technique/planning assistant, not medical advice.
+const ASK_SYSTEM_PROMPT =
+  'You are a knowledgeable tumbling and strength-training assistant helping the user plan and ' +
+  'refine a workout routine. Answer questions about technique, programming, and progression ' +
+  'concisely and practically. You are a technique and planning assistant, NOT a medical ' +
+  'professional — for pain, injury, or symptoms, recommend seeing a physical therapist rather ' +
+  'than prescribing treatment. If you suggest a concrete change to the routine, phrase it clearly ' +
+  'so it can be forwarded to the routine editor, but do NOT output JSON here.';
+
+function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Attach a machine-readable kind to LLM errors so callers can pick a message.
+function llmError(kind, message) {
+  const e = new Error(message);
+  e.kind = kind;
+  return e;
+}
+
+/*
+ * Shared API helper — the ONLY place that talks to Anthropic. Uses the exact
+ * fetch shape from the spec (browser-direct via the dangerous-direct-browser
+ * header). Error handling per spec:
+ *   offline / network fail -> "needs connection" (nothing queued)
+ *   401                     -> message pointing to Settings
+ *   429 / 529 (overloaded)  -> retry ONCE after a short delay, then friendly msg
+ * Resolves to the assistant's text; rejects with an llmError otherwise.
+ */
+async function callClaude({ system, messages, maxTokens }) {
+  if (!state.apiKey) {
+    throw llmError('no-key', 'Add your Anthropic API key in Settings to use this.');
+  }
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw llmError('offline', 'This needs an internet connection — try again when you\'re back online.');
+  }
+
+  const body = JSON.stringify({
+    model: state.model || DEFAULT_MODEL,
+    max_tokens: maxTokens || 1500,
+    system: system,
+    messages: messages
+  });
+
+  const attempt = () => fetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: {
+      'x-api-key': state.apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: body
+  });
+
+  let res;
+  try {
+    res = await attempt();
+  } catch (e) {
+    throw llmError('offline', 'Couldn\'t reach the server — check your connection and try again.');
+  }
+
+  // Retry ONCE on rate-limit / overload.
+  if (res.status === 429 || res.status === 529) {
+    await delay(LLM_RETRY_MS);
+    try { res = await attempt(); }
+    catch (e) { throw llmError('offline', 'Couldn\'t reach the server — check your connection and try again.'); }
+  }
+
+  if (res.status === 401) {
+    throw llmError('auth', 'That API key was rejected. Check it in Settings.');
+  }
+  if (res.status === 429 || res.status === 529) {
+    throw llmError('overloaded', 'The service is busy right now. Give it a minute and try again.');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { const j = await res.json(); detail = (j && j.error && j.error.message) || ''; } catch (e) { /* ignore */ }
+    throw llmError('http', 'Request failed (' + res.status + ')' + (detail ? ': ' + detail : '') + '.');
+  }
+
+  let data;
+  try { data = await res.json(); }
+  catch (e) { throw llmError('parse', 'Got an unreadable response from the server.'); }
+
+  const text = extractText(data);
+  if (!text) throw llmError('empty', 'The model returned an empty response.');
+  return text;
+}
+
+// Concatenate all text blocks of an Anthropic Messages response.
+function extractText(data) {
+  if (!data || !Array.isArray(data.content)) return '';
+  return data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('').trim();
+}
+
+// Strip a single ```json … ``` (or bare ```) fence if the model wrapped its output.
+function stripFences(text) {
+  let t = String(text == null ? '' : text).trim();
+  if (t.indexOf('```') === 0) {
+    t = t.replace(/^```[^\n]*\n?/, '');   // opening fence + optional language tag
+    t = t.replace(/\n?```\s*$/, '');      // closing fence
+  }
+  return t.trim();
+}
+
+/* --- 5a: edit flow -------------------------------------------------------- */
+
+// Compact log summary for the 5a payload: last ~10 sessions, completion %, skips, notes.
+function buildLogSummary(st) {
+  const log = st.log || [];
+  if (!log.length) return 'No sessions logged yet.';
+  return log.slice(-10).map((e) => {
+    const pct = Math.round(sessionCompletion(e) * 100);
+    const skipped = (e.exercises || []).filter((x) => !x.done).map((x) => x.name);
+    let line = 'Session ' + e.session + ' (Day ' + e.day + '): ' + pct + '% complete';
+    if (skipped.length) line += '; skipped: ' + skipped.join(', ');
+    if (e.note) line += '; note: "' + e.note + '"';
+    return line;
+  }).join('\n');
+}
+
+function buildEditUserMessage(instruction) {
+  return 'CURRENT ROUTINE (JSON):\n' + JSON.stringify(state.routine, null, 2) + '\n\n' +
+    'GOALS & CONSTRAINTS:\n' + GOALS_BLURB + '\n\n' +
+    'RECENT TRAINING LOG (last ~10 sessions):\n' + buildLogSummary(state) + '\n\n' +
+    'MY INSTRUCTION:\n' + instruction;
+}
+
+// Strip fences -> JSON.parse -> shape check. Returns { ok, value?, errors? }.
+function tryParseProposal(text) {
+  const stripped = stripFences(text);
+  let obj;
+  try { obj = JSON.parse(stripped); }
+  catch (e) { return { ok: false, errors: ['Output was not valid JSON: ' + e.message] }; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !obj.routine) {
+    return { ok: false, errors: ['Output was not a single JSON object with a "routine" key.'] };
+  }
+  return { ok: true, value: {
+    routine: obj.routine,
+    changes: Array.isArray(obj.changes) ? obj.changes : [],
+    warnings: Array.isArray(obj.warnings) ? obj.warnings : []
+  } };
+}
+
+// Wrap a parsed proposal with a COMPUTED diff against the current routine.
+function buildProposal(value) {
+  return {
+    routine: value.routine,
+    changes: value.changes,
+    warnings: value.warnings,
+    diff: computeDiff(state.routine, value.routine)
+  };
+}
+
+// Flat name -> exercise map across every pool (staples, variety, flat blocks).
+function flattenExercises(routine) {
+  const map = {};
+  collectPools(routine).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.name) map[ex.name] = ex;
+  }));
+  return map;
+}
+
+// Dose identity string for equality checks.
+function doseKey(d) {
+  d = d || {};
+  return [d.sets, d.amount, d.range == null ? '' : d.range, d.unit].join('|');
+}
+
+// modified = same name, different dose / category / why / flags.
+function exerciseEqual(a, b) {
+  return doseKey(a.dose) === doseKey(b.dose) &&
+    a.category === b.category &&
+    a.why === b.why &&
+    JSON.stringify(a.aerialAlt || null) === JSON.stringify(b.aerialAlt || null) &&
+    !!a.aerialOnly === !!b.aerialOnly &&
+    (a.dayLock || null) === (b.dayLock || null);
+}
+
+function diffGoals(oldGoals, newGoals) {
+  const changes = [];
+  const o = {}; (oldGoals || []).forEach((g) => { if (g && g.name) o[g.name] = g; });
+  const n = {}; (newGoals || []).forEach((g) => { if (g && g.name) n[g.name] = g; });
+  Object.keys(n).forEach((name) => {
+    const ng = n[name], og = o[name];
+    if (!og) {
+      changes.push('Added goal: ' + name + ' (weight ' + ng.weight + ', ' + (ng.active ? 'active' : 'inactive') + ')');
+    } else if (og.weight !== ng.weight || !!og.active !== !!ng.active) {
+      let c = 'Changed goal: ' + name;
+      if (og.weight !== ng.weight) c += ' — weight ' + og.weight + ' → ' + ng.weight;
+      if (!!og.active !== !!ng.active) c += ' — ' + (ng.active ? 'activated' : 'deactivated');
+      changes.push(c);
+    }
+  });
+  Object.keys(o).forEach((name) => { if (!n[name]) changes.push('Removed goal: ' + name); });
+  return changes;
+}
+
+function diffCategories(oldC, newC) {
+  const changes = [];
+  oldC = oldC || {}; newC = newC || {};
+  Object.keys(newC).forEach((id) => {
+    if (!(id in oldC)) changes.push('Added category: ' + id + ' (' + (newC[id].label || '') + ')');
+    else if (oldC[id].label !== newC[id].label || oldC[id].colorId !== newC[id].colorId)
+      changes.push('Changed category "' + id + '": ' + (oldC[id].label || '') + ' → ' + (newC[id].label || ''));
+  });
+  Object.keys(oldC).forEach((id) => { if (!(id in newC)) changes.push('Removed category: ' + id); });
+  return changes;
+}
+
+// Computed diff: added / removed / modified exercises + goal & category changes.
+function computeDiff(oldR, newR) {
+  const o = flattenExercises(oldR);
+  const n = flattenExercises(newR);
+  const added = [], removed = [], modified = [];
+  Object.keys(n).forEach((name) => {
+    if (!(name in o)) added.push(n[name]);
+    else if (!exerciseEqual(o[name], n[name])) modified.push({ from: o[name], to: n[name] });
+  });
+  Object.keys(o).forEach((name) => { if (!(name in n)) removed.push(o[name]); });
+  return {
+    added: added, removed: removed, modified: modified,
+    goalChanges: diffGoals(oldR && oldR.goals, newR && newR.goals),
+    catChanges: diffCategories(oldR && oldR.categories, newR && newR.categories)
+  };
+}
+
+/*
+ * Full request flow: send -> parse -> validate -> ONE automatic retry with the
+ * validator errors appended -> valid ? { proposal } : { raw }. Never mutates
+ * state; the caller decides what to do with the result.
+ */
+async function runEditRequest(messages) {
+  const first = await callClaude({ system: EDIT_SYSTEM_PROMPT, messages: messages, maxTokens: 1500 });
+  const parsed = tryParseProposal(first);
+  if (parsed.ok) {
+    const v = validateRoutine(parsed.value.routine);
+    if (v.valid) return { proposal: buildProposal(parsed.value) };
+    return finalizeRetry(await retryOnce(messages, first, v.errors));
+  }
+  return finalizeRetry(await retryOnce(messages, first, parsed.errors));
+}
+
+// Append the model's prior (bad) message + a user message listing the errors.
+async function retryOnce(messages, assistantText, errors) {
+  const convo = messages.concat([
+    { role: 'assistant', content: assistantText },
+    { role: 'user', content:
+      'That did not validate. Fix these problems and resend the COMPLETE JSON object ' +
+      '(routine, changes, warnings) with no other text:\n- ' + errors.join('\n- ') }
+  ]);
+  return callClaude({ system: EDIT_SYSTEM_PROMPT, messages: convo, maxTokens: 1500 });
+}
+
+function finalizeRetry(text) {
+  const parsed = tryParseProposal(text);
+  if (parsed.ok) {
+    const v = validateRoutine(parsed.value.routine);
+    if (v.valid) return { proposal: buildProposal(parsed.value) };
+  }
+  return { raw: text };
+}
+
+async function sendEdit() {
+  const ta = (typeof document !== 'undefined') ? document.getElementById('edit-input') : null;
+  const text = ta ? ta.value.trim() : (ui.llm.editInput || '').trim();
+  if (!text) return;
+  if (!state.apiKey) return;                    // gated in the UI, belt-and-suspenders here
+
+  ui.llm.editInput = text;
+  ui.llm.editStatus = 'loading';
+  ui.llm.editError = '';
+  render();
+
+  const messages = [{ role: 'user', content: buildEditUserMessage(text) }];
+  let result;
+  try {
+    result = await runEditRequest(messages);
+  } catch (e) {
+    ui.llm.editStatus = 'error';
+    ui.llm.editError = e.message || 'Something went wrong.';
+    render();
+    return;
+  }
+
+  if (result.proposal) {
+    ui.llm.proposal = result.proposal;
+    ui.llm.editStatus = 'diff';
+  } else {
+    ui.llm.editRaw = result.raw;               // invalid twice — show raw, change NOTHING
+    ui.llm.editStatus = 'raw';
+  }
+  render();
+}
+
+// Apply: pushHistory(old), swap in new, clear swaps + dismissed (keys may be stale).
+function applyProposal() {
+  const p = ui.llm.proposal;
+  if (!p) return;
+  pushHistory(state.routine);
+  state.routine = deepClone(p.routine);
+  state.swaps = {};
+  state.dismissed = {};
+  ui.llm.proposal = null;
+  ui.llm.editStatus = 'idle';
+  ui.llm.editInput = '';
+  ui.expanded.clear();
+  state.view = 'today';                          // show the freshly applied routine
+  saveState();
+  render();
+}
+
+// Discard: change nothing.
+function discardProposal() {
+  ui.llm.proposal = null;
+  ui.llm.editStatus = 'idle';
+  render();
+}
+
+/* --- 5b: Ask flow --------------------------------------------------------- */
+
+// Compact routine (names only) to keep the Ask context small.
+function compactRoutine(r) {
+  const b = (r && r.blocks) || {};
+  const names = (arr) => (arr || []).map((ex) => ex.name);
+  const out = { goals: (r && r.goals) || [], blocks: {} };
+  out.blocks.skill = { staples: names(b.skill && b.skill.staples), varietyPool: names(b.skill && b.skill.varietyPool) };
+  out.blocks.core = { staples: names(b.core && b.core.staples), varietyPool: names(b.core && b.core.varietyPool) };
+  ['weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown'].forEach((k) => { out.blocks[k] = names(b[k]); });
+  return out;
+}
+
+function buildAskContext(st) {
+  const build = buildSession(st);
+  const today = [];
+  build.blocks.forEach((bl) => bl.exercises.forEach((ex) => today.push(ex.name)));
+  const notes = (st.log || []).slice(-5).filter((e) => e.note).map((e) => '- ' + e.note);
+  const goals = (st.routine.goals || []).filter((g) => g.active).map((g) => g.name + ' (w' + g.weight + ')');
+  return 'CONTEXT (for your reference):\n' +
+    'Active goals: ' + (goals.join(', ') || 'none') + '\n' +
+    'Today is Session ' + build.session + ', Day ' + build.day + '. Today\'s exercises: ' +
+      (today.join(', ') || 'none') + '\n' +
+    'Recent session notes:\n' + (notes.join('\n') || '(none)') + '\n' +
+    'Compact routine: ' + JSON.stringify(compactRoutine(st.routine));
+}
+
+async function sendAsk() {
+  const ta = (typeof document !== 'undefined') ? document.getElementById('ask-input') : null;
+  const text = ta ? ta.value.trim() : (ui.llm.askInput || '').trim();
+  if (!text) return;
+  if (!state.apiKey) return;
+
+  ui.llm.ask.push({ role: 'user', text: text });
+  ui.llm.askInput = '';
+  ui.llm.askStatus = 'loading';
+  ui.llm.askError = '';
+  render();
+
+  // Send the in-memory history as conversation context so follow-ups work.
+  const messages = ui.llm.ask.map((m) => ({ role: m.role, content: m.text }));
+  const system = ASK_SYSTEM_PROMPT + '\n\n' + buildAskContext(state);
+
+  try {
+    const reply = await callClaude({ system: system, messages: messages, maxTokens: 1000 });
+    ui.llm.ask.push({ role: 'assistant', text: reply });
+    ui.llm.askStatus = 'idle';
+  } catch (e) {
+    ui.llm.askStatus = 'idle';
+    ui.llm.askError = e.message || 'Something went wrong.';   // keep the user message so they can retry
+  }
+  render();
+}
+
+/*
+ * Forward an assistant reply into the 5a edit input, then navigate there.
+ * Choice (per spec): rather than trying to detect "suggestion-ish" replies, we
+ * always offer this affordance on assistant bubbles and let the user decide —
+ * simplest robust option, and it never applies anything on its own.
+ */
+function forwardToEditor(i) {
+  const m = ui.llm.ask[i];
+  if (!m || m.role !== 'assistant') return;
+  ui.llm.editInput = m.text;
+  ui.llm.editStatus = 'idle';
+  ui.llm.editError = '';
+  ui.llm.proposal = null;
+  state.view = 'edit';
+  saveState();
+  render();
+}
+
+/* --- 5: rendering --------------------------------------------------------- */
+
+function llmKeyGate(label) {
+  return '<div class="llm-notice">' +
+    '<p>' + escapeHtml(label) + ' needs an Anthropic API key.</p>' +
+    '<button class="btn primary" data-action="llm-goto-settings">Add a key in Settings</button>' +
+    '</div>';
+}
+
+function isOffline() {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
+function renderEdit() {
+  const L = ui.llm;
+  let html = '<div class="llm">';
+
+  if (!state.apiKey) return html + llmKeyGate('Natural-language routine editing') + '</div>';
+
+  // Diff/approve screen takes over the whole view.
+  if (L.editStatus === 'diff' && L.proposal) return html + renderDiff(L.proposal) + '</div>';
+
+  const offline = isOffline();
+  const loading = L.editStatus === 'loading';
+
+  html += '<section class="panel">' +
+    '<h3>Edit routine</h3>' +
+    '<p class="muted">Describe a change in plain English — e.g. "add layout as a goal", ' +
+    '"swap leg press for something posterior chain", "make A days shoulder-light for a while".</p>' +
+    '<textarea id="edit-input" placeholder="What should change?"' + (loading ? ' disabled' : '') + '>' +
+      escapeHtml(L.editInput || '') + '</textarea>';
+
+  if (offline) html += '<p class="llm-inline warn">You\'re offline — connect to send.</p>';
+  if (L.editStatus === 'error') html += '<p class="llm-inline warn">' + escapeHtml(L.editError) + '</p>';
+
+  html += '<div class="row">';
+  if (loading) {
+    html += '<button class="btn primary" disabled><span class="spinner"></span>Thinking…</button>';
+  } else {
+    html += '<button class="btn primary" data-action="llm-send-edit"' + (offline ? ' disabled' : '') + '>Send</button>';
+  }
+  html += '</div></section>';
+
+  // Invalid-twice fallback: show the raw output, change nothing.
+  if (L.editStatus === 'raw') {
+    html += '<section class="panel">' +
+      '<h3>Couldn\'t use that response</h3>' +
+      '<p class="muted">The reply didn\'t validate as a routine, twice. Nothing was changed. Raw output:</p>' +
+      '<pre class="raw-output">' + escapeHtml(L.editRaw) + '</pre>' +
+      '</section>';
+  }
+
+  return html + '</div>';
+}
+
+function renderDiff(p) {
+  let html = '<section class="panel diff"><h3>Proposed changes</h3>';
+
+  if (p.changes && p.changes.length) {
+    html += '<ul class="change-list">' + p.changes.map((c) => '<li>' + escapeHtml(c) + '</li>').join('') + '</ul>';
+  } else {
+    html += '<p class="muted">The model reported no specific changes.</p>';
+  }
+
+  if (p.warnings && p.warnings.length) {
+    html += '<div class="warnings"><strong>Warnings — double-check these</strong><ul>' +
+      p.warnings.map((w) => '<li>' + escapeHtml(w) + '</li>').join('') + '</ul></div>';
+  }
+
+  html += renderComputedDiff(p.diff);
+
+  html += '<div class="row">' +
+    '<button class="btn ghost" data-action="llm-discard">Discard</button>' +
+    '<button class="btn primary" data-action="llm-apply">Apply</button>' +
+    '</div></section>';
+  return html;
+}
+
+function exLine(ex) {
+  return '<div class="dx-name">' + escapeHtml(ex.name) + '</div>' +
+    '<div class="dx-meta">' + escapeHtml(formatDose(ex.dose)) + ' · ' + escapeHtml(ex.category) + '</div>' +
+    '<div class="dx-why">' + escapeHtml(ex.why || '') + '</div>';
+}
+
+function renderComputedDiff(d) {
+  let h = '<div class="computed-diff">';
+  if (d.goalChanges.length) {
+    h += '<h4>Goals</h4><ul class="diff-list">' + d.goalChanges.map((g) => '<li>' + escapeHtml(g) + '</li>').join('') + '</ul>';
+  }
+  if (d.catChanges.length) {
+    h += '<h4>Categories</h4><ul class="diff-list">' + d.catChanges.map((g) => '<li>' + escapeHtml(g) + '</li>').join('') + '</ul>';
+  }
+  if (d.added.length) {
+    h += '<h4>Added exercises</h4>' + d.added.map((ex) =>
+      '<div class="dx dx-add"><span class="dx-tag">added</span>' + exLine(ex) + '</div>').join('');
+  }
+  if (d.removed.length) {
+    h += '<h4>Removed exercises</h4>' + d.removed.map((ex) =>
+      '<div class="dx dx-removed"><span class="dx-tag">removed</span>' + exLine(ex) + '</div>').join('');
+  }
+  if (d.modified.length) {
+    h += '<h4>Modified exercises</h4>' + d.modified.map((m) =>
+      '<div class="dx dx-mod">' +
+        '<div class="dx-col dx-old"><span class="dx-tag">was</span>' + exLine(m.from) + '</div>' +
+        '<div class="dx-col dx-new"><span class="dx-tag">now</span>' + exLine(m.to) + '</div>' +
+      '</div>').join('');
+  }
+  if (!d.added.length && !d.removed.length && !d.modified.length && !d.goalChanges.length && !d.catChanges.length) {
+    h += '<p class="muted">No structural differences detected.</p>';
+  }
+  return h + '</div>';
+}
+
+function renderAsk() {
+  const L = ui.llm;
+  let html = '<div class="llm ask">';
+
+  if (!state.apiKey) return html + llmKeyGate('The Ask assistant') + '</div>';
+
+  const offline = isOffline();
+
+  html += '<div class="chat">';
+  if (!L.ask.length && L.askStatus !== 'loading') {
+    html += '<p class="muted chat-empty">Ask about technique, programming, or how to progress. ' +
+      'Planning assistant — not medical advice.</p>';
+  }
+  L.ask.forEach((m, i) => {
+    html += '<div class="bubble bubble-' + m.role + '">' + escapeHtml(m.text).replace(/\n/g, '<br>') + '</div>';
+    if (m.role === 'assistant') {
+      html += '<div class="bubble-actions"><button class="btn small ghost" ' +
+        'data-action="ask-forward" data-i="' + i + '">Send to routine editor</button></div>';
+    }
+  });
+  if (L.askStatus === 'loading') {
+    html += '<div class="bubble bubble-assistant"><span class="spinner"></span>Thinking…</div>';
+  }
+  html += '</div>';
+
+  if (L.askError) html += '<p class="llm-inline warn">' + escapeHtml(L.askError) + '</p>';
+  if (offline) html += '<p class="llm-inline warn">You\'re offline — connect to send.</p>';
+
+  const busy = offline || L.askStatus === 'loading';
+  html += '<div class="ask-input">' +
+    '<textarea id="ask-input" placeholder="Ask a question…"' + (L.askStatus === 'loading' ? ' disabled' : '') + '>' +
+      escapeHtml(L.askInput || '') + '</textarea>' +
+    '<button class="btn primary" data-action="ask-send"' + (busy ? ' disabled' : '') + '>Send</button>' +
+    '</div>';
+
+  return html + '</div>';
+}
+
 /* --- 9. Service worker + init -------------------------------------------- */
 
 function registerSW() {
@@ -1130,6 +1821,11 @@ if (typeof module !== 'undefined' && module.exports) {
     volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
     pickReplacement, progressionReady, isDismissed, computeSuggestions,
     findExerciseByName, collectPools, recentAppearances,
+    // Phase 5 (LLM flow) — for the smoke test.
+    callClaude, extractText, stripFences, tryParseProposal, computeDiff, buildProposal,
+    runEditRequest, applyProposal, discardProposal, buildEditUserMessage, buildLogSummary,
+    _ui: ui,
+    _setRetryDelay: (ms) => { LLM_RETRY_MS = ms; },
     _set: (s) => { state = s; }
   };
 }

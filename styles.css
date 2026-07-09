@@ -325,3 +325,137 @@ textarea {
   cursor: pointer;
 }
 .tab.active { color: var(--accent); }
+
+/* --- Phase 5: LLM screens (Edit / Ask) --- */
+select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  min-height: 44px;
+}
+input[type="password"] {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  min-height: 44px;
+}
+
+.llm-notice {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px 18px;
+  text-align: center;
+}
+.llm-notice p { color: var(--muted); margin: 0 0 14px; }
+.llm-inline { font-size: 13px; margin: 8px 0 0; }
+.llm-inline.warn { color: var(--danger); }
+#edit-input { min-height: 92px; }
+
+/* spinner sits inside .btn.primary (dark text on accent) */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(15, 23, 42, 0.35);
+  border-top-color: #0f172a;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: -2px;
+  margin-right: 8px;
+}
+.bubble-assistant .spinner { border-color: rgba(148, 163, 184, 0.35); border-top-color: var(--accent); }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.raw-output {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Diff / approve screen */
+.diff .change-list { margin: 0 0 12px; padding-left: 18px; }
+.diff .change-list li { margin-bottom: 6px; font-size: 14px; }
+.warnings {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  color: #fecaca;
+}
+.warnings ul { margin: 6px 0 0; padding-left: 18px; }
+.warnings li { margin-bottom: 4px; font-size: 13px; }
+
+.computed-diff h4 {
+  margin: 14px 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+}
+.diff-list { margin: 0; padding-left: 18px; font-size: 13px; }
+.diff-list li { margin-bottom: 4px; }
+.dx {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.dx-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  margin-bottom: 5px;
+}
+.dx-add .dx-tag { color: var(--teal); border: 1px solid var(--teal); }
+.dx-removed .dx-tag { color: var(--danger); border: 1px solid var(--danger); }
+.dx-name { font-weight: 600; font-size: 14px; }
+.dx-meta { font-size: 12.5px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.dx-why { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+.dx-mod { display: flex; gap: 10px; }
+.dx-mod .dx-col { flex: 1 1 0; min-width: 0; }
+.dx-old { opacity: 0.7; }
+.dx-old .dx-tag { color: var(--muted); border: 1px solid var(--line); }
+.dx-new .dx-tag { color: var(--accent); border: 1px solid var(--accent); }
+
+/* Ask chat */
+.chat { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.chat-empty { text-align: center; padding: 12px; }
+.bubble {
+  max-width: 85%;
+  padding: 10px 12px;
+  border-radius: 14px;
+  font-size: 14px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+.bubble-user { align-self: flex-end; background: var(--accent); color: #0f172a; border-bottom-right-radius: 4px; }
+.bubble-assistant { align-self: flex-start; background: var(--surface); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+.bubble-actions { align-self: flex-start; margin: -2px 0 6px; }
+.ask-input { display: flex; gap: 8px; align-items: flex-end; }
+.ask-input textarea { min-height: 46px; }
+.ask-input .btn { flex: 0 0 auto; }
