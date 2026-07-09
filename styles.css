@@ -459,3 +459,22 @@ input[type="password"] {
 .ask-input { display: flex; gap: 8px; align-items: flex-end; }
 .ask-input textarea { min-height: 46px; }
 .ask-input .btn { flex: 0 0 auto; }
+
+/* --- Init failure message (e.g. opened via file://) --- */
+.init-error {
+  max-width: 480px;
+  margin: 15vh auto 0;
+  padding: 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.init-error h2 { margin: 0 0 12px; }
+.init-error p { color: var(--muted); line-height: 1.5; }
+.init-error pre, .init-error code {
+  background: var(--surface-2);
+  border-radius: 6px;
+  padding: 2px 6px;
+  color: var(--text);
+}
+.init-error pre { padding: 10px 12px; overflow-x: auto; }

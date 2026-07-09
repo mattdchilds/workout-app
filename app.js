@@ -1798,8 +1798,24 @@ async function init() {
   registerSW();
 }
 
+// A failed init (e.g. seed fetch blocked on the file:// protocol) must show a
+// message, not a blank page.
+function initFailed(e) {
+  const app = document.getElementById('app');
+  const overFile = location.protocol === 'file:';
+  app.innerHTML =
+    '<div class="init-error">' +
+    '<h2>Couldn’t start Tumble Trainer</h2>' +
+    (overFile
+      ? '<p>This app can’t run from a <code>file://</code> URL — the browser blocks loading its data files. Serve the folder over HTTP instead, e.g.</p>' +
+        '<pre>python -m http.server 8080</pre>' +
+        '<p>then open <code>http://localhost:8080</code>.</p>'
+      : '<p>' + escapeHtml(e && e.message ? e.message : String(e)) + '</p><p>Try reloading.</p>') +
+    '</div>';
+}
+
 if (typeof document !== 'undefined') {
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', () => init().catch(initFailed));
 }
 
 // Expose a small, stable API for Phase 5 (LLM flow) and testing.
