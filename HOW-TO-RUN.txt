@@ -16,13 +16,38 @@ Quick start
 
 3. Open http://localhost:8080 in your browser.
 
-On your phone (same Wi-Fi)
---------------------------
+On your phone — installed, offline, no PC required
+--------------------------------------------------
+The app is deployed to GitHub Pages:
+
+    https://mattdchilds.github.io/workout-app/
+
+1. Open that URL on the phone in Chrome (Android) or Safari (iOS).
+2. Let it finish loading once, on a network. The service worker
+   precaches every asset on that first visit.
+3. Install it:
+     Android/Chrome — menu > "Install app". If you only see
+       "Add to Home Screen", the manifest didn't validate; the
+       install is then a bookmark, not a standalone PWA.
+     iOS/Safari     — Share > "Add to Home Screen".
+4. Done. Turn on airplane mode, power off this PC — it still works.
+   Only the Ask tab needs a network (it calls the Anthropic API).
+
+Deploying an update: commit and `git push`. Pages rebuilds in ~1 min.
+Bump CACHE in sw.js or phones will keep serving the old cached copy.
+
+On your phone via LAN (dev only — NOT installable)
+--------------------------------------------------
+Useful for testing a change without pushing, but note that a service
+worker only registers in a secure context (https:// or localhost). Over
+a LAN IP the registration in app.js fails, is swallowed by its .catch(),
+and the app runs as a plain web page: no offline, no real install.
+
 1. Start the server as above.
 2. Find this PC's local IP:  ipconfig  (look for "IPv4 Address").
 3. On the phone, browse to http://<that-ip>:8080
-4. Optional: use the browser's "Add to Home Screen" to install it
-   as a PWA (works offline afterwards thanks to the service worker).
+   Windows Firewall must allow inbound python.exe on the active
+   network profile, or the phone will just time out.
 
 If changes don't show up
 ------------------------
