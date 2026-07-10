@@ -32,8 +32,9 @@ const V2_KEY = 'tumbleTrainer.v2';
 // Amount units the app understands. "sec/side" behaves like "sec".
 const UNITS = ['sec', 'sec/side', 'reps', 'reps/side', 'min'];
 
-// Fallback slider ranges if the routine omits structure.sliders.
-const DEFAULT_RANGES = { skill: [1, 5], core: [1, 5], wts: [1, 3], mach: [0, 2], cool: [1, 2] };
+// Fallback slider ranges if the routine omits structure.sliders (v3.0: one
+// unified "moves" slider replaces the four per-block sliders).
+const DEFAULT_RANGES = { moves: [3, 15], cool: [1, 2] };
 
 // v1 category id -> new goal id(s), for migrating LLM-added / hand-edited moves
 // that don't match a seed move by name (Feature A migration, step 2).
@@ -73,6 +74,11 @@ let state = null;
 let SEED_ROUTINE = null;
 let renderedExercises = [];       // flat list built each render; handlers index into it
 let renderedSuggestions = [];     // Phase 4 suggestion banners built each render; handlers index into it
+// v3.1 day preview: how many sessions ahead the Today view is peeking. TRANSIENT —
+// never persisted, never migrated; reset to 0 on finish. 0 = today (live, editable).
+let previewOffset = 0;
+const PREVIEW_MAX = 13;            // cap: peek up to ~2 weeks ahead
+function inPreview() { return previewOffset > 0; }
 const ui = {
   expanded: new Set(),
   finishing: false,
@@ -95,9 +101,9 @@ function freshState(routine) {
     version: 2,
     session: 1,                   // Session 1 = Day A (A on odd sessions)
     view: 'today',
-    // Skill/core sliders are now TOTAL items per block (Feature B); 4 preserves
-    // the old effective volume (~2 staples + 2 variety).
-    settings: { skill: 4, core: 4, wts: 2, mach: 1, cool: 2 },
+    // v3.0: ONE "moves" slider = total goal-weighted moves per session; the four
+    // per-block sliders (skill/core/wts/mach) collapsed into it. Default 10.
+    settings: { moves: 10, cool: 2 },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
     setsDone: {},                 // Feature E: { [exerciseName]: int } — per-session, cleared on finish
@@ -118,16 +124,17 @@ function freshState(routine) {
 function migrateFromV1(v1, routine) {
   const s = freshState(routine);
   if (v1 && typeof v1.session === 'number') s.session = v1.session;
-  ['wts', 'mach', 'cool'].forEach((k) => {
-    if (v1 && typeof v1[k] === 'number') s.settings[k] = v1[k];
-  });
-  // v1 skill/core were VARIETY counts; new sliders are TOTAL items (+2, clamp 1..5).
-  ['skill', 'core'].forEach((k) => {
-    if (v1 && typeof v1[k] === 'number') s.settings[k] = clamp(v1[k] + 2, 1, 5);
-  });
+  if (v1 && typeof v1.cool === 'number') s.settings.cool = v1.cool;
+  // v3.0: collapse the old per-block counts into ONE "moves" total. v1 skill/core
+  // were VARIETY counts, so add 2 apiece (matching the historic +2 TOTAL rule).
+  const skill = (v1 && typeof v1.skill === 'number') ? v1.skill + 2 : 4;
+  const core = (v1 && typeof v1.core === 'number') ? v1.core + 2 : 4;
+  const wts = (v1 && typeof v1.wts === 'number') ? v1.wts : 2;
+  const mach = (v1 && typeof v1.mach === 'number') ? v1.mach : 1;
+  s.settings.moves = clamp(skill + core + wts + mach, 3, 15);
   if (v1 && v1.aerial === true) {
     const a = (s.routine.goals || []).find((g) => g && g.id === 'aerial');
-    if (a) a.active = true;
+    if (a) a.weight = 10;                 // v3.0: aerial is a weighted training goal
   }
   return s;
 }
@@ -395,6 +402,140 @@ function migrateRoutineV5(routine) {
 }
 
 /*
+ * v2.5 -> v3.0 migration (goal-weighted generator). Runs for any stored routine
+ * whose version is < 6. Pure; returns a NEW routine object stamped version 6.
+ * Migrates GENERICALLY so user edits survive (the caller falls back to the seed
+ * wholesale if this throws — see normalizeState).
+ *
+ *  - goals: rebuild as four training goals (flip/aerial/core/gym with 0–10
+ *    weights) + the six care goals. Old "str" is dropped; "gym" is added.
+ *    Training weight = its default (flip 8 / core 6 / gym 5) when the old goal was
+ *    active, else 0; aerial stays 0. Care goals keep names/colours.
+ *  - blocks: flatten skill/core -> section "floor", weightsA/B -> "weights",
+ *    machinesA/B -> "machines" (dedupe by name, prefer the A copy; drop dayLock
+ *    when a name appeared in BOTH A and B). Each move's old goal tags become
+ *    goalScores (flip->{flip:3}, aerial->{aerial:3}, core->{core:2},
+ *    str->{flip:2,gym:1}); care tags (splits/plantar/cubital/posture/sciatic/
+ *    recovery) become `care`. A move known to the seed by name adopts the seed's
+ *    hand-authored goalScores/care instead (so an untouched routine gets the real
+ *    scoring matrix). Empty goalScores -> {gym:1}. `location` is removed.
+ *  - structure: one { moves:[3,15], cool:[1,2] } slider set.
+ */
+const TRAINING_WEIGHT_DEFAULTS = { flip: 8, core: 6, gym: 5, aerial: 0 };
+const CARE_GOAL_IDS = ['splits', 'plantar', 'cubital', 'posture', 'sciatic', 'recovery'];
+const OLD_TAG_TO_SCORES = {
+  flip: { flip: 3 }, aerial: { aerial: 3 }, core: { core: 2 }, str: { flip: 2, gym: 1 }
+};
+
+function migrateRoutineV6(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 6) return routine;
+  const src = deepClone(routine);
+
+  // Seed lookup by name for adopting hand-authored scores + the canonical goals.
+  const seedByName = {};
+  collectPools(seed).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.name) seedByName[ex.name] = ex;
+  }));
+
+  // --- goals -------------------------------------------------------------
+  const oldById = {};
+  (src.goals || []).forEach((g) => { if (g && g.id) oldById[g.id] = g; });
+  const goals = deepClone(seed.goals || []).map((g) => {
+    const ng = Object.assign({}, g);
+    if (ng.kind === 'training') {
+      const def = TRAINING_WEIGHT_DEFAULTS[ng.id] != null ? TRAINING_WEIGHT_DEFAULTS[ng.id] : 0;
+      const old = oldById[ng.id];
+      // Use the goal's default weight (gym 5, flip 8, core 6, aerial 0) unless the
+      // old goal was EXPLICITLY inactive. Missing `active` (e.g. goals injected by
+      // the v1-legacy migrateRoutine step, which carry no active flag) counts as
+      // on, so a legacy routine never migrates to an all-zero (empty) session.
+      ng.weight = (old && old.active === false) ? 0 : def;
+    }
+    return ng;
+  });
+
+  // --- moves -------------------------------------------------------------
+  const b = src.blocks || {};
+  const flatten = (arr) => Array.isArray(arr) ? arr : [];
+  const skillMoves = flatten(b.skill && b.skill.staples).concat(flatten(b.skill && b.skill.varietyPool));
+  const coreMoves = flatten(b.core && b.core.staples).concat(flatten(b.core && b.core.varietyPool));
+  const floorSrc = skillMoves.concat(coreMoves);
+
+  const convert = (ex, section) => {
+    const m = deepClone(ex);
+    delete m.location;
+    delete m.goals;
+    const seedEx = seedByName[m.name];
+    if (seedEx && seedEx.goalScores) {
+      m.goalScores = deepClone(seedEx.goalScores);
+      if (seedEx.care) m.care = deepClone(seedEx.care);
+    } else {
+      const scores = {};
+      const care = [];
+      (ex.goals || []).forEach((id) => {
+        if (OLD_TAG_TO_SCORES[id]) {
+          Object.keys(OLD_TAG_TO_SCORES[id]).forEach((gid) => {
+            scores[gid] = Math.max(scores[gid] || 0, OLD_TAG_TO_SCORES[id][gid]);
+          });
+        } else if (CARE_GOAL_IDS.indexOf(id) !== -1) {
+          if (care.indexOf(id) === -1) care.push(id);
+        }
+      });
+      if (!Object.keys(scores).length) scores.gym = 1;
+      m.goalScores = scores;
+      if (care.length) m.care = care;
+    }
+    m.section = section;
+    return m;
+  };
+
+  // Dedupe weights/machines by name across A and B and SYNTHESIZE the A/B parity
+  // v5 encoded as whole-block alternation (there were no per-move dayLocks there):
+  // a move only in the A block gets dayLock "A", only in B gets "B", and a name in
+  // BOTH (e.g. Leg curl) gets none (shown every day). A dayLock already on the move
+  // wins as-is. Prefers the A copy of a duplicate.
+  const dedupe = (aArr, bArr, section) => {
+    const out = [];
+    const seen = {};
+    const bNames = {};
+    flatten(bArr).forEach((ex) => { if (ex && ex.name) bNames[ex.name] = true; });
+    const aNames = {};
+    flatten(aArr).forEach((ex) => { if (ex && ex.name) aNames[ex.name] = true; });
+    const take = (arr, day) => flatten(arr).forEach((ex) => {
+      if (!ex || !ex.name || seen[ex.name]) return;
+      seen[ex.name] = true;
+      const m = convert(ex, section);
+      if (m.dayLock == null && !(aNames[ex.name] && bNames[ex.name])) m.dayLock = day;
+      out.push(m);
+    });
+    take(aArr, 'A');
+    take(bArr, 'B');
+    return out;
+  };
+
+  const moves = floorSrc.map((ex) => convert(ex, 'floor'))
+    .concat(dedupe(b.weightsA, b.weightsB, 'weights'))
+    .concat(dedupe(b.machinesA, b.machinesB, 'machines'));
+
+  const blocks = {
+    warmup: flatten(b.warmup),
+    moves: moves,
+    cooldown: flatten(b.cooldown)
+  };
+
+  const structure = Object.assign({}, src.structure);
+  structure.sliders = { moves: [3, 15], cool: [1, 2] };
+  if (seed.structure) {
+    if (seed.structure.selection) structure.selection = seed.structure.selection;
+    if (seed.structure.notes) structure.notes = deepClone(seed.structure.notes);
+  }
+  delete structure.varietySlotIndex;
+
+  return { version: 6, goals: goals, blocks: blocks, structure: structure };
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -444,6 +585,13 @@ function normalizeState(obj) {
   // v2.5 -> v2.5.1: runs whenever the stored routine.version is < 5, so a routine
   // already stamped version 4 (with location "wall" stored) merges wall into floor.
   routine = migrateRoutineV5(routine);
+  // v2.5 -> v3.0: goal-weighted generator. Migrate generically so user edits
+  // survive; if anything about the stored shape trips the migration, fall back
+  // to the fresh seed wholesale (per spec).
+  if (seed) {
+    try { routine = migrateRoutineV6(routine, seed); }
+    catch (e) { routine = deepClone(seed); }
+  }
   renameWarmupGroups(routine);   // v2.4.1 warm-up group rename (see below)
 
   const base = freshState(routine);
@@ -466,13 +614,21 @@ function normalizeState(obj) {
   });
   delete merged.settings.aerial;   // obsolete — aerial is now a goal
 
+  // v3.0: collapse the old four per-block sliders into one "moves" total. When any
+  // legacy slider is stored, moves = clamp(skill+core+wts+mach, 3, 15); then drop
+  // the old keys. (For legacy v2 routines the raw counts, not the +2 form, are
+  // summed — near enough, and the value is user-adjustable afterwards.)
+  const osettings = obj.settings || {};
+  if (['skill', 'core', 'wts', 'mach'].some((k) => typeof osettings[k] === 'number')) {
+    const sum = (osettings.skill || 0) + (osettings.core || 0) +
+      (osettings.wts || 0) + (osettings.mach || 0);
+    merged.settings.moves = clamp(sum, 3, 15);
+  }
+  ['skill', 'core', 'wts', 'mach'].forEach((k) => delete merged.settings[k]);
+  if (typeof merged.settings.moves !== 'number') merged.settings.moves = base.settings.moves;
+  merged.settings.moves = clamp(merged.settings.moves, 3, 15);
+
   if (legacy) {
-    // v2 skill/core were VARIETY counts; new sliders are TOTAL items (+2, clamp 1..5).
-    ['skill', 'core'].forEach((k) => {
-      if (obj.settings && typeof obj.settings[k] === 'number') {
-        merged.settings[k] = clamp(obj.settings[k] + 2, 1, 5);
-      }
-    });
     merged.intensity = migrateIntensity(obj.intensity || {}, routine);
     merged.routineHistory = [];   // old history is v1-shaped; clearing is acceptable per spec
   }
@@ -502,13 +658,19 @@ async function loadSeed() {
   return res.json();
 }
 
-/* --- 3. Routine schema validator (Phase 3, updated v2.3) ------------------- *
+/* --- 3. Routine schema validator (Phase 3, rewritten v3.0) ---------------- *
  * Standalone, no deps. Returns { valid, errors[] } with human-readable paths.
- * Reused verbatim by the manual JSON editor and the LLM edit flow.
- * Extra seed fields (group, rest, progression, dayLock, tempoNote,
- * alwaysInShort, muscle, location, largeEquipment, structure) are allowed
- * silently (muscle/location/largeEquipment drive v2.5 Auto Superset grouping).
+ * Reused by the manual JSON editor and the LLM edit flow.
+ *
+ * v3.0 schema: goals have a `kind` ("training" | "care"); training goals carry a
+ * numeric weight, care goals do not. blocks = { warmup[], moves[], cooldown[] }.
+ * A `moves` entry has a `section` ("floor"|"weights"|"machines"), a `goalScores`
+ * map (trainingGoalId -> integer 0..3), and an optional `care` array of care-goal
+ * ids. warmup/cooldown entries keep a `goals` tag array. Extra fields (group,
+ * rest, progression, dayLock, tempoNote, alwaysInShort, muscle) are allowed.
  */
+const SECTIONS = ['floor', 'weights', 'machines'];
+
 function validateRoutine(routine) {
   const errors = [];
   if (!routine || typeof routine !== 'object' || Array.isArray(routine)) {
@@ -522,8 +684,10 @@ function validateRoutine(routine) {
     errors.push('version must be a number');
   }
 
+  const trainingIds = [];
+  const careIds = [];
   if (!Array.isArray(routine.goals)) {
-    errors.push('goals must be an array of { id, name, weight, active, colorId }');
+    errors.push('goals must be an array of { id, name, kind, colorId, weight? }');
   } else {
     routine.goals.forEach((g, i) => {
       if (!g || typeof g !== 'object' || Array.isArray(g)) {
@@ -531,11 +695,20 @@ function validateRoutine(routine) {
       }
       if (typeof g.id !== 'string' || !g.id) errors.push('goals[' + i + '] missing string "id"');
       if (typeof g.name !== 'string' || !g.name) errors.push('goals[' + i + '] missing string "name"');
-      if (typeof g.active !== 'boolean') errors.push('goals[' + i + '] (' + (g.id || i) + ') "active" must be boolean');
+      if (g.kind !== 'training' && g.kind !== 'care') {
+        errors.push('goals[' + i + '] (' + (g.id || i) + ') "kind" must be "training" or "care"');
+      }
+      if (g.kind === 'training') {
+        if (typeof g.weight !== 'number' || g.weight < 0) {
+          errors.push('goals[' + i + '] (' + (g.id || i) + ') training goal "weight" must be a number >= 0');
+        }
+        if (typeof g.id === 'string') trainingIds.push(g.id);
+      } else if (g.kind === 'care' && typeof g.id === 'string') {
+        careIds.push(g.id);
+      }
     });
   }
-  const knownGoals = Array.isArray(routine.goals)
-    ? routine.goals.filter((g) => g && typeof g.id === 'string').map((g) => g.id) : [];
+  const knownGoals = trainingIds.concat(careIds);
 
   const blocks = routine.blocks;
   if (!blocks || typeof blocks !== 'object' || Array.isArray(blocks)) {
@@ -543,53 +716,32 @@ function validateRoutine(routine) {
     return { valid: errors.length === 0, errors };
   }
 
-  function validateExercise(ex, path) {
-    if (!ex || typeof ex !== 'object' || Array.isArray(ex)) {
-      errors.push(path + ': exercise must be an object');
-      return;
+  function validateDose(ex, path, label) {
+    const d = ex.dose;
+    if (!d || typeof d !== 'object') {
+      errors.push(path + ' (' + label + '): dose must be an object'); return;
     }
-    const label = ex.name ? '"' + ex.name + '"' : path;
-    ['name', 'dose', 'goals', 'why'].forEach((f) => {
-      if (!(f in ex)) errors.push(path + ' (' + label + '): missing required field "' + f + '"');
-    });
-    if ('goals' in ex) {
-      if (!Array.isArray(ex.goals) || ex.goals.length === 0) {
-        errors.push(path + ' (' + label + '): goals must be a non-empty array of goal ids');
-      } else {
-        ex.goals.forEach((id) => {
-          if (!knownGoals.includes(id)) errors.push(path + ' (' + label + '): unknown goal "' + id + '"');
-        });
-      }
+    if (!Number.isInteger(d.sets) || d.sets < 1 || d.sets > 6) {
+      errors.push(path + ' (' + label + '): dose.sets must be an integer 1–6 (got ' + JSON.stringify(d.sets) + ')');
     }
-    if ('dose' in ex) {
-      const d = ex.dose;
-      if (!d || typeof d !== 'object') {
-        errors.push(path + ' (' + label + '): dose must be an object');
-      } else {
-        if (!Number.isInteger(d.sets) || d.sets < 1 || d.sets > 6) {
-          errors.push(path + ' (' + label + '): dose.sets must be an integer 1–6 (got ' + JSON.stringify(d.sets) + ')');
-        }
-        if (typeof d.amount !== 'number' || !(d.amount > 0)) {
-          errors.push(path + ' (' + label + '): dose.amount must be a number > 0 (got ' + JSON.stringify(d.amount) + ')');
-        }
-        if ('unit' in d && !UNITS.includes(d.unit)) {
-          errors.push(path + ' (' + label + '): unknown unit "' + d.unit + '" (allowed: ' + UNITS.join(', ') + ')');
-        }
-        if ('weight' in d && !(typeof d.weight === 'number' && d.weight > 0)) {
-          errors.push(path + ' (' + label + '): dose.weight must be a number > 0 (got ' + JSON.stringify(d.weight) + ')');
-        }
-      }
+    if (typeof d.amount !== 'number' || !(d.amount > 0)) {
+      errors.push(path + ' (' + label + '): dose.amount must be a number > 0 (got ' + JSON.stringify(d.amount) + ')');
     }
+    if ('unit' in d && !UNITS.includes(d.unit)) {
+      errors.push(path + ' (' + label + '): unknown unit "' + d.unit + '" (allowed: ' + UNITS.join(', ') + ')');
+    }
+    if ('weight' in d && !(typeof d.weight === 'number' && d.weight > 0)) {
+      errors.push(path + ' (' + label + '): dose.weight must be a number > 0 (got ' + JSON.stringify(d.weight) + ')');
+    }
+  }
+
+  function validateCommon(ex, path, label) {
     if ('rest' in ex && !(Number.isInteger(ex.rest) && ex.rest > 0)) {
       errors.push(path + ' (' + label + '): rest must be a positive integer (seconds)');
     }
-    // v2.5 Auto Superset fields: coarse muscle group + location (+ optional large
-    // equipment) that drive same-location grouping. Free-form, must be strings.
-    ['muscle', 'location', 'largeEquipment'].forEach((k) => {
-      if (k in ex && (typeof ex[k] !== 'string' || !ex[k])) {
-        errors.push(path + ' (' + label + '): ' + k + ' must be a non-empty string');
-      }
-    });
+    if ('muscle' in ex && (typeof ex.muscle !== 'string' || !ex.muscle)) {
+      errors.push(path + ' (' + label + '): muscle must be a non-empty string');
+    }
     if ('progression' in ex) {
       const p = ex.progression;
       if (!p || typeof p !== 'object' || Array.isArray(p)) {
@@ -604,41 +756,91 @@ function validateRoutine(routine) {
     }
   }
 
-  function validateArray(arr, path) {
+  // A "moves" entry: section + goalScores (+ optional care).
+  function validateMove(ex, path) {
+    if (!ex || typeof ex !== 'object' || Array.isArray(ex)) {
+      errors.push(path + ': move must be an object'); return;
+    }
+    const label = ex.name ? '"' + ex.name + '"' : path;
+    ['name', 'dose', 'why', 'section', 'goalScores'].forEach((f) => {
+      if (!(f in ex)) errors.push(path + ' (' + label + '): missing required field "' + f + '"');
+    });
+    if ('section' in ex && SECTIONS.indexOf(ex.section) === -1) {
+      errors.push(path + ' (' + label + '): section must be one of ' + SECTIONS.join(', ') + ' (got ' + JSON.stringify(ex.section) + ')');
+    }
+    if ('goalScores' in ex) {
+      const gs = ex.goalScores;
+      if (!gs || typeof gs !== 'object' || Array.isArray(gs)) {
+        errors.push(path + ' (' + label + '): goalScores must be an object of trainingGoalId -> 0..3');
+      } else {
+        Object.keys(gs).forEach((id) => {
+          if (trainingIds.indexOf(id) === -1) {
+            errors.push(path + ' (' + label + '): goalScores references unknown training goal "' + id + '"');
+          }
+          const v = gs[id];
+          if (!Number.isInteger(v) || v < 0 || v > 3) {
+            errors.push(path + ' (' + label + '): goalScores.' + id + ' must be an integer 0–3 (got ' + JSON.stringify(v) + ')');
+          }
+        });
+      }
+    }
+    if ('care' in ex) {
+      if (!Array.isArray(ex.care)) {
+        errors.push(path + ' (' + label + '): care must be an array of care-goal ids');
+      } else {
+        ex.care.forEach((id) => {
+          if (careIds.indexOf(id) === -1) errors.push(path + ' (' + label + '): care references unknown care goal "' + id + '"');
+        });
+      }
+    }
+    if ('dose' in ex) validateDose(ex, path, label);
+    validateCommon(ex, path, label);
+  }
+
+  // A static (warm-up / cool-down) entry: keeps a `goals` tag array.
+  function validateStatic(ex, path) {
+    if (!ex || typeof ex !== 'object' || Array.isArray(ex)) {
+      errors.push(path + ': exercise must be an object'); return;
+    }
+    const label = ex.name ? '"' + ex.name + '"' : path;
+    ['name', 'dose', 'goals', 'why'].forEach((f) => {
+      if (!(f in ex)) errors.push(path + ' (' + label + '): missing required field "' + f + '"');
+    });
+    if ('goals' in ex) {
+      if (!Array.isArray(ex.goals) || ex.goals.length === 0) {
+        errors.push(path + ' (' + label + '): goals must be a non-empty array of goal ids');
+      } else {
+        ex.goals.forEach((id) => {
+          if (knownGoals.indexOf(id) === -1) errors.push(path + ' (' + label + '): unknown goal "' + id + '"');
+        });
+      }
+    }
+    if ('dose' in ex) validateDose(ex, path, label);
+    validateCommon(ex, path, label);
+  }
+
+  function validateArray(arr, path, validator) {
     if (!Array.isArray(arr)) { errors.push('blocks.' + path + ' must be an array'); return; }
     const seen = new Set();
     arr.forEach((ex, i) => {
-      validateExercise(ex, 'blocks.' + path + '[' + i + ']');
+      validator(ex, 'blocks.' + path + '[' + i + ']');
       if (ex && ex.name) {
-        if (seen.has(ex.name)) {
-          errors.push('blocks.' + path + ': duplicate exercise name "' + ex.name + '"');
-        }
+        if (seen.has(ex.name)) errors.push('blocks.' + path + ': duplicate exercise name "' + ex.name + '"');
         seen.add(ex.name);
       }
     });
   }
 
-  // skill & core: { staples[], varietyPool[] } with >= 1 staple each.
-  ['skill', 'core'].forEach((bk) => {
-    const b = blocks[bk];
-    if (!b || typeof b !== 'object' || Array.isArray(b)) {
-      errors.push('blocks.' + bk + ' must be an object with staples and varietyPool');
-      return;
-    }
-    if (!Array.isArray(b.staples)) {
-      errors.push('blocks.' + bk + '.staples must be an array');
-    } else if (b.staples.length < 1) {
-      errors.push('blocks.' + bk + ' must have at least one staple');
-    } else {
-      validateArray(b.staples, bk + '.staples');
-    }
-    if ('varietyPool' in b) validateArray(b.varietyPool, bk + '.varietyPool');
-  });
+  validateArray(blocks.warmup, 'warmup', validateStatic);
+  validateArray(blocks.cooldown, 'cooldown', validateStatic);
 
-  // Plain array blocks.
-  ['warmup', 'weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown'].forEach((bk) => {
-    if (bk in blocks) validateArray(blocks[bk], bk);
-  });
+  if (!Array.isArray(blocks.moves)) {
+    errors.push('blocks.moves must be an array');
+  } else if (blocks.moves.length < 1) {
+    errors.push('blocks.moves must have at least one move');
+  } else {
+    validateArray(blocks.moves, 'moves', validateMove);
+  }
 
   return { valid: errors.length === 0, errors };
 }
@@ -648,16 +850,7 @@ function validateRoutine(routine) {
 // A on odd sessions, B on even.
 function currentDay(session) { return (session % 2 === 1) ? 'A' : 'B'; }
 
-// Is a goal id currently active? Reads the module-level state.routine (the same
-// coupling selectVariety already relies on; buildSession is always called with
-// st === state, and tests inject a state via module.exports._set).
-function goalActive(id) {
-  const goals = (state && state.routine && state.routine.goals) || [];
-  const g = goals.find((x) => x && x.id === id);
-  return !!(g && g.active);
-}
-
-// Goal lookups for rendering (color chip + label).
+// Goal lookups for rendering (color chip + label) and scoring.
 function goalById(id) {
   const goals = (state && state.routine && state.routine.goals) || [];
   return goals.find((g) => g && g.id === id) || null;
@@ -665,44 +858,83 @@ function goalById(id) {
 function goalColor(id) { const g = goalById(id); return (g && g.colorId) || 'gray'; }
 function goalName(id) { const g = goalById(id); return (g && g.name) || id; }
 
-// dayLock + goal eligibility for pools (Feature A). A move shows only if at
-// least one of its goal tags is currently active.
-function eligible(ex, day) {
-  if (ex.dayLock && ex.dayLock !== day) return false;   // dayLock "A" only shows on A days
-  const goals = ex.goals || [];
-  return goals.some((id) => goalActive(id));
+// v3.0: care goals are always on; a training goal is "active" iff weight > 0.
+function goalActive(id) {
+  const g = goalById(id);
+  if (!g) return false;
+  return g.kind === 'care' ? true : (typeof g.weight === 'number' && g.weight > 0);
 }
 
-/*
- * Variety-slot selection (Phase 4, heuristic #3 — variety guarantee).
- * Picks the `count` LEAST-RECENTLY-COMPLETED eligible items from the pool
- * (from state.log). Never-completed items count as least-recent and are
- * preferred; ties break by pool order (stable). Deterministic for a given
- * (log, pool) so re-renders never reshuffle.
- *
- * Fallback: when the log is empty we keep the documented v1 behaviour —
- * rotate `count` items by session index (window shifts by one each session).
- *
- * Signature is intentionally stable (buildStapleBlock calls it unchanged).
- * The log is read from the module-level `state` — in the app buildSession is
- * always called as buildSession(state), so st === state and this is consistent;
- * tests inject a log via module.exports._set(state).
- */
-function selectVariety(pool, count, session, day) {
-  const elig = pool.filter((ex) => eligible(ex, day));
-  const n = Math.min(Math.max(count, 0), elig.length);
-  const log = (state && state.log) || [];
+// The routine's training goals (kind === "training"). Reads state.routine to
+// stay consistent with buildSession(state); tests inject state via _set.
+function trainingGoals() {
+  return ((state && state.routine && state.routine.goals) || [])
+    .filter((g) => g && g.kind === 'training');
+}
 
-  if (!log.length) {                                  // empty-log fallback: index rotation
-    const out = [];
-    for (let i = 0; i < n; i++) out.push(elig[(session + i) % elig.length]);
-    return out;
+// Index of a goal id within routine.goals (stable tie-break for chips/top-goal).
+function goalOrderIndex(id) {
+  const goals = (state && state.routine && state.routine.goals) || [];
+  const i = goals.findIndex((g) => g && g.id === id);
+  return i < 0 ? 999 : i;
+}
+
+// v3.0 eligibility for the STATIC blocks (warm-up / cool-down): dayLock only.
+// Their care tags are always active, and training moves are filtered by score.
+function eligible(ex, day) {
+  return !ex.dayLock || ex.dayLock === day;
+}
+
+// Base goal-weighted score of a move: Σ over training goals of weight × score.
+// Pure given (move, goals). A move scoring 0 is off for the current weights.
+function scoreMove(move, goals) {
+  const gs = (move && move.goalScores) || {};
+  let total = 0;
+  goals.forEach((g) => {
+    const s = gs[g.id];
+    if (s) total += (g.weight || 0) * s;
+  });
+  return total;
+}
+
+// The training goal id a move leans on most (ties -> earliest in routine.goals);
+// null when the move has no positive score. Drives the primary chip + rest target.
+function topGoalId(move) {
+  const gs = (move && move.goalScores) || {};
+  let best = null;
+  Object.keys(gs).forEach((id) => {
+    if (!(gs[id] > 0)) return;
+    if (best == null || gs[id] > gs[best] ||
+        (gs[id] === gs[best] && goalOrderIndex(id) < goalOrderIndex(best))) {
+      best = id;
+    }
+  });
+  return best;
+}
+
+// Ordered goal ids for a move's chips: positive-scored training goals (score
+// desc, then routine order) followed by care ids. Used by the card renderers.
+function moveChipIds(move) {
+  const gs = (move && move.goalScores) || {};
+  const scored = Object.keys(gs).filter((id) => gs[id] > 0)
+    .sort((a, b) => (gs[b] - gs[a]) || (goalOrderIndex(a) - goalOrderIndex(b)));
+  const ids = scored.slice();
+  (move.care || []).forEach((id) => { if (ids.indexOf(id) === -1) ids.push(id); });
+  return ids;
+}
+
+// Chip ids for any card: v3.0 moves use goalScores + care; static warm-up/
+// cool-down entries keep their `goals` tag array; synthetic cards pass `goals`.
+function cardGoalIds(ex) {
+  if (ex && (ex.goalScores || ex.care)) {
+    const ids = moveChipIds(ex);
+    return ids.length ? ids : ['gym'];
   }
-  return leastRecentlyCompleted(elig, log).slice(0, n);
+  return (ex && ex.goals && ex.goals.length) ? ex.goals : ['recovery'];
 }
 
 // Index of the most recent log entry in which `name` was COMPLETED (done),
-// or -1 if it was never completed (so it sorts first as "least recent").
+// or -1 if it was never completed.
 function lastCompletedIndex(name, log) {
   for (let i = log.length - 1; i >= 0; i--) {
     const hit = (log[i].exercises || []).some((e) => e.name === name && e.done);
@@ -720,25 +952,57 @@ function leastRecentlyCompleted(elig, log) {
     .map((o) => o.ex);
 }
 
-/*
- * A skill/core block (Feature B): `count` = TOTAL items to show. Day/goal
- * eligible staples fill first (in listed order, truncated to count); if there
- * aren't enough staples, variety picks fill the remainder. count 1 -> exactly
- * the first eligible staple.
- */
-function buildStapleBlock(block, count, session, day) {
-  const staples = (block.staples || []).filter((ex) => eligible(ex, day));
-  const n = Math.max(count, 0);
-  if (staples.length >= n) return staples.slice(0, n);
-  const variety = selectVariety(block.varietyPool || [], n - staples.length, session, day);
-  return staples.concat(variety);
-}
+// Per-section diminishing returns: each move already chosen in a section discounts
+// that section's remaining candidates, so a strong section (usually Floor) can't
+// starve Weights/Machines out of the session. Applied multiplicatively per pick.
+const SECTION_DECAY = 0.85;
 
-// weights/machines: show the first N eligible listed exercises (slider = a count).
-function takeN(arr, n, day) {
-  return (arr || [])
-    .filter((ex) => eligible(ex, day))
-    .slice(0, Math.max(n, 0));
+/*
+ * v3.0 move selection (replaces the staple/variety machinery). Pure given `st`.
+ *   1. Pool = blocks.moves eligible for the day (dayLock).
+ *   2. baseScore = Σ training goal weight × goalScore; drop moves scoring 0.
+ *   3. Recency boost: sessionsSince = sessions since the move was last completed
+ *      (never -> 6, capped at 6); effective = base × (1 + 0.1 × sessionsSince).
+ *   4. Greedily take `moves` picks: each pick maximizes
+ *      effective × SECTION_DECAY^(already-picked in that move's section),
+ *      deterministic tie-break by pool order. The decay keeps the session from
+ *      flooding with one section's moves so every populated section stays present.
+ * Returns the selected move objects in their original pool order.
+ */
+function selectMoves(st) {
+  const b = (st.routine && st.routine.blocks) || {};
+  const pool = (b.moves || []).filter((ex) => eligible(ex, currentDay(st.session)));
+  const goals = ((st.routine && st.routine.goals) || []).filter((g) => g && g.kind === 'training');
+  const log = st.log || [];
+  const count = Math.max(st.settings.moves || 0, 0);
+
+  const scored = [];
+  pool.forEach((move, i) => {
+    const base = scoreMove(move, goals);
+    if (base <= 0) return;
+    const last = lastCompletedIndex(move.name, log);
+    const sessionsSince = last < 0 ? 6 : Math.min(log.length - last, 6);
+    scored.push({ move, i, section: move.section || 'floor', effective: base * (1 + 0.1 * sessionsSince) });
+  });
+
+  const remaining = scored.slice();
+  const sectionCount = {};
+  const chosen = [];
+  while (chosen.length < count && remaining.length) {
+    let best = -1, bestVal = -Infinity;
+    for (let k = 0; k < remaining.length; k++) {
+      const c = remaining[k];
+      const val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
+      // Strictly-greater wins; exact ties fall to the earlier pool index (stable).
+      if (val > bestVal || (val === bestVal && c.i < remaining[best].i)) { bestVal = val; best = k; }
+    }
+    const pick = remaining.splice(best, 1)[0];
+    sectionCount[pick.section] = (sectionCount[pick.section] || 0) + 1;
+    chosen.push(pick);
+  }
+
+  chosen.sort((a, b2) => a.i - b2.i);           // back to pool order for stable render
+  return chosen.map((o) => o.move);
 }
 
 /*
@@ -752,31 +1016,72 @@ function buildCooldown(arr, cool, day) {
   return list;
 }
 
+// Section -> block title. Order here is the on-page order of the move blocks.
+const MOVE_SECTIONS = [
+  { key: 'floor', title: 'Floor' },
+  { key: 'weights', title: 'Weights' },
+  { key: 'machines', title: 'Machines' }
+];
+
 // Produce the ordered blocks for a session. Pure given `st`.
+// Order: Warm-up, Floor, Weights, Machines, Cool-down (empty blocks skipped).
 function buildSession(st) {
   const r = st.routine;
   const s = st.settings;
   const session = st.session;
   const day = currentDay(session);
-  const b = r.blocks;
+  const b = r.blocks || {};
   const blocks = [];
 
   if (b.warmup && b.warmup.length) {
     blocks.push({ key: 'warmup', title: 'Warm-up',
       exercises: (b.warmup || []).filter((ex) => eligible(ex, day)) });
   }
-  blocks.push({ key: 'skill', title: 'Skill',
-    exercises: buildStapleBlock(b.skill, s.skill, session, day) });
-  blocks.push({ key: 'core', title: 'Core',
-    exercises: buildStapleBlock(b.core, s.core, session, day) });
-  blocks.push({ key: 'weights', title: 'Weights',
-    exercises: takeN(day === 'A' ? b.weightsA : b.weightsB, s.wts, day) });
-  blocks.push({ key: 'machines', title: 'Machines',
-    exercises: takeN(day === 'A' ? b.machinesA : b.machinesB, s.mach, day) });
-  blocks.push({ key: 'cooldown', title: 'Cool-down',
-    exercises: buildCooldown(b.cooldown, s.cool, day) });
+
+  const selected = selectMoves(st);
+  MOVE_SECTIONS.forEach((sec) => {
+    const exercises = selected.filter((ex) => (ex.section || 'floor') === sec.key);
+    if (exercises.length) blocks.push({ key: sec.key, title: sec.title, exercises: exercises });
+  });
+
+  const cooldown = buildCooldown(b.cooldown, s.cool, day);
+  if (cooldown.length) blocks.push({ key: 'cooldown', title: 'Cool-down', exercises: cooldown });
 
   return { session, day, blocks: applySwaps(blocks, st) };
+}
+
+/*
+ * v3.1 day preview. Build the session `offset` days in the FUTURE, honestly
+ * simulating rotation so the recency boost is right. Pure — never mutates `st`.
+ * offset 0 returns exactly buildSession(st). Otherwise we walk forward on a COPY:
+ * each step builds that session, appends a simulated "completed" log entry (the
+ * same shape finishSession writes, minus dose/intensity — recency only reads
+ * name + done), and advances the session index; the target session is built from
+ * the simulated state. Per-session swaps are dropped in the copy (applySwaps only
+ * applies at offset 0), and intensity levels are NOT advanced (preview doses show
+ * at current intensity — see SPEC.md v3.1).
+ */
+function simulatedLogEntry(sim, build) {
+  const exercises = [];
+  build.blocks.forEach((bl) => {
+    if (bl.key === 'warmup' || bl.key === 'cooldown') return;   // recency only tracks moves
+    bl.exercises.forEach((ex) => exercises.push({ name: ex.name, done: true }));
+  });
+  return { session: sim.session, day: build.day, exercises: exercises };
+}
+
+function buildFutureSession(st, offset) {
+  offset = Math.max(0, offset | 0);
+  if (!offset) return buildSession(st);
+  const sim = deepClone(st);
+  sim.swaps = {};                       // preview ignores per-session swaps
+  sim.log = sim.log ? sim.log.slice() : [];
+  for (let step = 0; step < offset; step++) {
+    const build = buildSession(sim);
+    sim.log.push(simulatedLogEntry(sim, build));
+    sim.session += 1;
+  }
+  return buildSession(sim);
 }
 
 // Find an exercise object anywhere in the routine by name (base, unresolved).
@@ -788,11 +1093,13 @@ function findExerciseByName(routine, name) {
   return null;
 }
 
-// All exercise arrays in the routine (staples + variety pools + flat blocks).
+// All exercise arrays in the routine. Handles BOTH the v3.0 shape (warmup /
+// moves / cooldown) and the pre-v3.0 shape (skill/core staples + variety pools,
+// weightsA/B, machinesA/B) so migration-time lookups and runtime both work.
 function collectPools(routine) {
   const b = (routine && routine.blocks) || {};
   const pools = [];
-  ['warmup', 'weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown']
+  ['warmup', 'moves', 'weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown']
     .forEach((k) => { if (Array.isArray(b[k])) pools.push(b[k]); });
   ['skill', 'core'].forEach((k) => {
     if (b[k]) {
@@ -960,13 +1267,14 @@ function resetOverride(ex) {
 
 /*
  * Rest-clock target seconds (Feature E). Explicit ex.rest wins; else per-block
- * defaults: core 60, skill/weights/machines 90; warmup/cooldown have no timer.
+ * defaults (v3.0): weights/machines 90; floor 90 unless the move's top goal is
+ * core (short abs rest, 60); warm-up/cool-down have no timer.
  */
 function restTarget(ex, blockKey) {
   if (blockKey === 'warmup' || blockKey === 'cooldown') return null;
   if (typeof ex.rest === 'number') return ex.rest;
-  if (blockKey === 'core') return 60;
-  if (blockKey === 'skill' || blockKey === 'weights' || blockKey === 'machines') return 90;
+  if (blockKey === 'weights' || blockKey === 'machines') return 90;
+  if (blockKey === 'floor') return topGoalId(ex) === 'core' ? 60 : 90;
   return null;
 }
 
@@ -990,10 +1298,11 @@ function render() {
     view.innerHTML = renderAsk();
     renderHeader(null, 'Ask');
   } else {
-    const build = buildSession(state);
+    const build = buildFutureSession(state, previewOffset);   // offset 0 = today
     view.innerHTML = renderToday(build);   // populates renderedExercises
-    renderHeader(build);
+    renderHeader(build, inPreview());
   }
+  view.classList.toggle('is-preview', state.view === 'today' && inPreview());
   syncRestTicker();
   window.scrollTo(0, y);
 }
@@ -1034,11 +1343,18 @@ function restClockText(elapsed, target, done) {
   return (done ? 'Go ' : 'Rest ') + mmss(elapsed) + ' / ' + mmss(target);
 }
 
-function renderHeader(build, subtitle) {
+function renderHeader(build, subtitleOrPreview) {
   const h = document.getElementById('app-header');
   if (!build) {
     h.innerHTML = '<div class="title">Tumble Trainer</div><div class="sub">' +
-      escapeHtml(subtitle || 'Settings') + '</div>';
+      escapeHtml(subtitleOrPreview || 'Settings') + '</div>';
+    return;
+  }
+  // Preview mode: session/day only, no live progress bar (read-only future peek).
+  if (subtitleOrPreview === true) {
+    h.innerHTML =
+      '<div class="title">Tumble Trainer</div>' +
+      '<div class="sub">Preview · Session ' + build.session + ' · Day ' + build.day + '</div>';
     return;
   }
   const total = renderedExercises.length;
@@ -1051,6 +1367,21 @@ function renderHeader(build, subtitle) {
     '<div class="progress-text">' + done + '/' + total + ' done</div>';
 }
 
+// v3.1: the day-preview control row at the very top of the Today view.
+function renderPreviewBar(build) {
+  const off = previewOffset;
+  const label = off === 0 ? 'Today'
+    : 'Preview — Session ' + build.session + ' · Day ' + build.day;
+  return '<div class="preview-bar">' +
+    '<button class="btn small ghost prev-day" data-action="prev-day"' +
+      (off <= 0 ? ' disabled' : '') + ' aria-label="Previous day">◀</button>' +
+    '<span class="preview-label">' + escapeHtml(label) + '</span>' +
+    '<button class="btn small ghost next-day" data-action="next-day"' +
+      (off >= PREVIEW_MAX ? ' disabled' : '') + ' aria-label="Next day">▶</button>' +
+    (off > 0 ? '<button class="btn small back-today" data-action="back-to-today">Back to today</button>' : '') +
+    '</div>';
+}
+
 function renderTabs() {
   document.getElementById('tabs').innerHTML = TABS.map((t) =>
     '<button class="tab' + (state.view === t.id ? ' active' : '') +
@@ -1060,17 +1391,21 @@ function renderTabs() {
 
 function renderToday(build) {
   renderedExercises = [];
-  let html = renderSuggestions(build);
+  const preview = inPreview();
+  let html = renderPreviewBar(build);
+  // Suggestions (incl. swap chips) are interactive — hide them while previewing.
+  if (!preview) html += renderSuggestions(build);
 
-  // Feature A safety note: warn only when goal settings emptied the skill block.
-  const skillBlock = build.blocks.find((bl) => bl.key === 'skill');
-  if (skillBlock && !skillBlock.exercises.length) {
-    html += '<p class="muted skill-empty">All skills filtered by goal settings.</p>';
+  // v3.0 safety note: warn when goal weights leave no scored moves to select.
+  const hasMoves = build.blocks.some((bl) =>
+    (bl.key === 'floor' || bl.key === 'weights' || bl.key === 'machines') && bl.exercises.length);
+  if (!hasMoves) {
+    html += '<p class="muted skill-empty">No moves selected — raise a goal weight in Settings.</p>';
   }
 
-  // v2.5: when Auto Superset is on, plan the skill/core supersets up front so a
-  // grouped move renders once (as a combined card at its group's earliest member)
-  // and its other members are skipped wherever they fall (even a later block).
+  // v2.5: when Auto Superset is on, plan the Floor supersets up front so a grouped
+  // move renders once (as a combined card at its group's earliest member) and its
+  // other members are skipped.
   const ssMap = state.autoSuperset ? supersetPlan(build) : null;
 
   build.blocks.forEach((bl) => {
@@ -1090,7 +1425,7 @@ function renderToday(build) {
           inner += renderCard(item.ex, idx, bl.key);
         }
       });
-    } else if (ssMap && (bl.key === 'skill' || bl.key === 'core')) {
+    } else if (ssMap && bl.key === 'floor') {
       // v2.5: grouped moves collapse into one superset card at the anchor
       // (members[0]); non-anchor members are skipped here (rendered at the
       // anchor's block). Ungrouped moves render as normal individual cards.
@@ -1118,7 +1453,7 @@ function renderToday(build) {
     html += '<section class="block"><h2 class="block-title">' + escapeHtml(bl.title) + '</h2>' +
       inner + '</section>';
   });
-  html += renderFinish();
+  if (!preview) html += renderFinish();   // no finishing a future preview
   return html;
 }
 
@@ -1153,9 +1488,10 @@ function warmupGroups(exercises) {
 // compact "Name — dose[, tempoNote]" line per move, and a single group checkbox.
 // No steppers/set-circles (warm-up has no progression UI); no expand affordance.
 function renderWarmupGroupCard(card, idx) {
+  const preview = inPreview();
   const goals = card.goals.length ? card.goals : ['recovery'];
   const mainColor = goalColor(goals[0]);
-  const done = !!state.checks[card.name];
+  const done = !preview && !!state.checks[card.name];
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
       escapeHtml(goalName(id)) + '</span>').join('');
@@ -1164,6 +1500,9 @@ function renderWarmupGroupCard(card, idx) {
     return '<li class="wu-move">' + escapeHtml(m.name) + ' — ' +
       escapeHtml(formatDose(effectiveDose(m))) + tempo + '</li>';
   }).join('');
+  const check = preview ? '' :
+    '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
+      (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.groupName) + ' done">';
 
   return '' +
     '<div class="card cat-' + escapeHtml(mainColor) + (done ? ' is-done' : '') + '">' +
@@ -1173,25 +1512,24 @@ function renderWarmupGroupCard(card, idx) {
           '<div class="card-name">' + escapeHtml(card.groupName) + '</div>' +
           '<ul class="wu-list">' + list + '</ul>' +
         '</div>' +
-        '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
-          (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.groupName) + ' done">' +
+        check +
       '</div>' +
     '</div>';
 }
 
 /* --- v2.5 Auto Superset -------------------------------------------------- *
- * Group same-location skill & core moves into one combined "superset" card so
- * they're trained as alternating rounds. Toggle: state.autoSuperset (default ON;
- * when off the Today view renders every move as its own card, unchanged). Only
- * skill- and core-block moves that carry BOTH `muscle` and `location` ever
- * qualify — weights, machines, warm-up and cool-down never superset.
+ * Group same-location Floor moves into one combined "superset" card so they're
+ * trained as alternating rounds. Toggle: state.autoSuperset (default ON; when off
+ * the Today view renders every move as its own card, unchanged). Only Floor moves
+ * that carry a `muscle` ever qualify — weights, machines, warm-up and cool-down
+ * moves have no `muscle` and never superset.
  */
 
 /*
  * Greedy grouping (pure; exported for tests). `members` is an ordered list of
- * { ex, block } — skill first, then core, in session order, pre-filtered to
- * moves that have both `muscle` and `location`. Within a group, all enforced:
- *   - every member shares the same `location`,
+ * { ex, block } — Floor moves in session order, pre-filtered to those with a
+ * `muscle`. Within a group, all enforced:
+ *   - every member shares the same `location` (defaults to "floor"),
  *   - no two members share the same `muscle`,
  *   - at most one member carries `largeEquipment`.
  * Each move joins the FIRST existing group it doesn't conflict with, else starts
@@ -1201,8 +1539,8 @@ function renderWarmupGroupCard(card, idx) {
 function groupSupersets(members) {
   const groups = [];
   (members || []).forEach((m) => {
-    if (!m || !m.ex || !m.ex.muscle || !m.ex.location) return;
-    const loc = m.ex.location;
+    if (!m || !m.ex || !m.ex.muscle) return;
+    const loc = m.ex.location || 'floor';
     let target = null;
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
@@ -1219,20 +1557,20 @@ function groupSupersets(members) {
 }
 
 /*
- * Render plan for the skill/core blocks when Auto Superset is on. Returns a Map
- * from each grouped exercise OBJECT to its superset card, ONLY for groups of
- * size >= 2 (size-1 groups are omitted so those moves render as normal cards).
- * The card carries a stable synthetic `name` (state.checks / progress / the
- * single global rest clock all key off it), its ordered members with their block
- * (needed for restTarget), the union of member goals, and a Superset/Giant-set
- * label. The card renders once, at its earliest member (members[0], the anchor).
+ * Render plan for the Floor block when Auto Superset is on. Returns a Map from
+ * each grouped exercise OBJECT to its superset card, ONLY for groups of size >= 2
+ * (size-1 groups are omitted so those moves render as normal cards). The card
+ * carries a stable synthetic `name` (state.checks / progress / the single global
+ * rest clock all key off it), its ordered members with their block (needed for
+ * restTarget), the union of member goal chips, and a Superset/Giant-set label.
+ * The card renders once, at its earliest member (members[0], the anchor).
  */
 function supersetPlan(build) {
   const members = [];
   (build.blocks || []).forEach((bl) => {
-    if (bl.key !== 'skill' && bl.key !== 'core') return;
+    if (bl.key !== 'floor') return;
     bl.exercises.forEach((ex) => {
-      if (ex && ex.muscle && ex.location) members.push({ ex: ex, block: bl.key });
+      if (ex && ex.muscle) members.push({ ex: ex, block: bl.key });
     });
   });
   const map = new Map();
@@ -1240,7 +1578,7 @@ function supersetPlan(build) {
     if (g.members.length < 2) return;
     const moves = g.members.map((m) => m.ex);
     const goals = [];
-    moves.forEach((ex) => (ex.goals || []).forEach((id) => { if (!goals.includes(id)) goals.push(id); }));
+    moves.forEach((ex) => cardGoalIds(ex).forEach((id) => { if (!goals.includes(id)) goals.push(id); }));
     const card = {
       name: 'superset:' + moves.map((ex) => ex.name).join('|'),
       isSuperset: true,
@@ -1277,6 +1615,7 @@ function supersetRounds(card) {
 // Live rest clock owned by a superset card (mirrors renderRestClock). The single
 // global rest clock is aimed at the card's synthetic name on each round tap.
 function renderSupersetRestClock(card) {
+  if (inPreview()) return '';                // read-only preview: no rest timer
   const r = state.rest;
   if (!r || r.name !== card.name || !r.startedAt) return '';
   if ((state.setsDone[card.name] || 0) >= supersetRounds(card)) return '';   // hide once all rounds done
@@ -1294,10 +1633,11 @@ function renderSupersetRestClock(card) {
 // carries its own per-move progression via effectiveDose), an alternate-rounds
 // hint, and a single group check-off. No steppers/set-circles (like warm-up).
 function renderSupersetCard(card, idx) {
-  const goals = card.goals.length ? card.goals : ['str'];
+  const preview = inPreview();
+  const goals = card.goals.length ? card.goals : ['gym'];
   const mainColor = goalColor(goals[0]);
-  const done = !!state.checks[card.name];
-  const expanded = ui.expanded.has(card.name);
+  const done = !preview && !!state.checks[card.name];
+  const expanded = !preview && ui.expanded.has(card.name);
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
       escapeHtml(goalName(id)) + '</span>').join('');
@@ -1309,11 +1649,15 @@ function renderSupersetCard(card, idx) {
       '<span class="ss-move-dose">' + escapeHtml(formatDose(effectiveDose(ex))) + '</span>' +
       '</li>';
   }).join('');
+  const mainAttrs = preview ? '' : ' data-action="expand" data-idx="' + idx + '"';
+  const check = preview ? '' :
+    '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
+      (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.label) + ' done">';
 
   return '' +
     '<div class="card ss-card cat-' + escapeHtml(mainColor) +
       (done ? ' is-done' : '') + (expanded ? ' is-open' : '') + '">' +
-      '<div class="card-main" data-action="expand" data-idx="' + idx + '">' +
+      '<div class="card-main"' + mainAttrs + '>' +
         '<div class="card-body">' +
           '<div class="chips">' + chips + '</div>' +
           '<div class="card-name"><span class="ss-label">' + escapeHtml(card.label) + '</span></div>' +
@@ -1322,8 +1666,7 @@ function renderSupersetCard(card, idx) {
           renderRoundDots(card, idx) +
           renderSupersetRestClock(card) +
         '</div>' +
-        '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
-          (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.label) + ' done">' +
+        check +
       '</div>' +
       (expanded ? renderSupersetProgression(card, idx) : '') +
     '</div>';
@@ -1332,6 +1675,7 @@ function renderSupersetCard(card, idx) {
 // Whole-superset round dots (mirror renderSetCircles): one tappable dot per round,
 // filled up to the card's round counter (state.setsDone[card.name]).
 function renderRoundDots(card, idx) {
+  if (inPreview()) return '';               // read-only preview: no set/round tracking
   const total = supersetRounds(card);
   if (total < 1) return '';
   const done = state.setsDone[card.name] || 0;
@@ -1356,22 +1700,27 @@ function renderSupersetProgression(card, idx) {
 }
 
 function renderCard(ex, idx, blockKey) {
+  const preview = inPreview();
   const eff = effectiveDose(ex);
-  const goals = (ex.goals && ex.goals.length) ? ex.goals : ['str'];
+  const goals = cardGoalIds(ex);
   const mainColor = goalColor(goals[0]);
-  const done = !!state.checks[ex.name];
+  const done = !preview && !!state.checks[ex.name];
   const overridden = currentLevel(ex) > 0;
-  const expanded = ui.expanded.has(ex.name);
+  const expanded = !preview && ui.expanded.has(ex.name);
   const showProg = expanded && blockKey !== 'warmup' && blockKey !== 'cooldown';
 
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
       escapeHtml(goalName(id)) + '</span>').join('');
+  const mainAttrs = preview ? '' : ' data-action="expand" data-idx="' + idx + '"';
+  const check = preview ? '' :
+    '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
+      (done ? ' checked' : '') + ' aria-label="Mark done">';
 
   return '' +
     '<div class="card cat-' + escapeHtml(mainColor) +
       (done ? ' is-done' : '') + (expanded ? ' is-open' : '') + '">' +
-      '<div class="card-main" data-action="expand" data-idx="' + idx + '">' +
+      '<div class="card-main"' + mainAttrs + '>' +
         '<div class="card-body">' +
           '<div class="chips">' + chips + '</div>' +
           '<div class="card-name">' + escapeHtml(ex.name) +
@@ -1380,8 +1729,7 @@ function renderCard(ex, idx, blockKey) {
           renderSetCircles(ex, idx, blockKey, eff) +
           renderRestClock(ex, blockKey, eff) +
         '</div>' +
-        '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
-          (done ? ' checked' : '') + ' aria-label="Mark done">' +
+        check +
       '</div>' +
       (showProg ? renderProgression(ex, idx) : '') +
     '</div>';
@@ -1390,6 +1738,7 @@ function renderCard(ex, idx, blockKey) {
 // Per-set tracking circles (Feature E). Warm-up shows them only for multi-set
 // moves (e.g. the slow-eccentric calf raise); single-set warm-ups just check.
 function renderSetCircles(ex, idx, blockKey, eff) {
+  if (inPreview()) return '';               // read-only preview: no set tracking
   const total = eff.sets;
   if (blockKey === 'warmup' && total <= 1) return '';
   if (total < 1) return '';
@@ -1405,6 +1754,7 @@ function renderSetCircles(ex, idx, blockKey, eff) {
 
 // Live rest clock — only on the card that owns the active global rest timer.
 function renderRestClock(ex, blockKey, eff) {
+  if (inPreview()) return '';                // read-only preview: no rest timer
   const r = state.rest;
   if (!r || r.name !== ex.name || !r.startedAt) return '';
   if ((state.setsDone[ex.name] || 0) >= eff.sets) return '';
@@ -1494,33 +1844,43 @@ function renderSettings() {
 
   let html = '<div class="settings">';
 
-  // Session knobs
+  // Session knobs (v3.0: one unified "moves" slider + cool-down + auto superset).
   html += '<section class="panel"><h3>Session</h3>' +
-    slider('skill', 'Skill slots') +
-    slider('core', 'Core slots') +
-    slider('wts', 'Weights exercises') +
-    slider('mach', 'Machine exercises') +
+    slider('moves', 'Number of moves') +
     slider('cool', 'Cool-down (1 = short, 2 = full)') +
     '<div class="field toggle">' +
       '<label for="auto-superset">Auto superset</label>' +
       '<input type="checkbox" id="auto-superset" data-action="toggle-superset"' +
         (state.autoSuperset ? ' checked' : '') + '>' +
     '</div>' +
-    '<p class="muted">Groups same-location skill &amp; core moves into supersets — ' +
+    '<p class="muted">Groups same-muscle-free Floor moves into supersets — ' +
       'one card, alternate the moves, rest after each round.</p>' +
     '</section>';
 
-  // Goals (Feature A) — toggle each goal; a move drops out when all its tags are off.
+  // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
+  // are always on (they live in the static warm-up / cool-down) and get no slider.
+  const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training');
+  const care = (state.routine.goals || []).filter((g) => g && g.kind === 'care');
   html += '<section class="panel"><h3>Goals</h3>' +
-    (state.routine.goals || []).map((g) =>
-      '<div class="field toggle">' +
-        '<label for="goal-' + escapeHtml(g.id) + '">' +
-          '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span>' +
-        '</label>' +
-        '<input type="checkbox" id="goal-' + escapeHtml(g.id) + '" data-action="toggle-goal" ' +
-          'data-goal="' + escapeHtml(g.id) + '"' + (g.active ? ' checked' : '') + '>' +
-      '</div>').join('') +
-    '<p class="muted">Turning a goal off removes its moves from rotation.</p>' +
+    training.map((g) => {
+      const w = clamp(typeof g.weight === 'number' ? g.weight : 0, 0, 10);
+      return '<div class="field">' +
+        '<label>' +
+          '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span> ' +
+          '<span class="val">' + w + '</span></label>' +
+        '<input type="range" data-action="goal-weight" data-goal="' + escapeHtml(g.id) + '" ' +
+          'min="0" max="10" step="1" value="' + w + '">' +
+      '</div>';
+    }).join('') +
+    '<p class="muted">Higher weight pulls a goal\'s moves in more often. 0 turns it off.</p>' +
+    '</section>';
+
+  // Care goals — always covered in the static warm-up & cool-down (no controls).
+  html += '<section class="panel"><h3>Always covered in warm-up &amp; cool-down</h3>' +
+    '<div class="care-chips">' + care.map((g) =>
+      '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span>'
+    ).join(' ') + '</div>' +
+    '<p class="muted">These are always on — no need to weight them.</p>' +
     '</section>';
 
   // AI routine editing (Phase 5) — password key + model toggle. Optional:
@@ -1608,6 +1968,10 @@ function onClick(e) {
     case 'cancel-finish': ui.finishing = false; render(); break;
     case 'confirm-finish': doFinish(); break;
     case 'tab': setView(el.dataset.view); break;
+    // v3.1 day preview (transient — never persisted).
+    case 'prev-day': setPreviewOffset(previewOffset - 1); break;
+    case 'next-day': setPreviewOffset(previewOffset + 1); break;
+    case 'back-to-today': setPreviewOffset(0); break;
     case 'export': exportState(); break;
     case 'clear': clearData(); break;
     case 'rollback': rollback(+el.dataset.hidx); break;
@@ -1661,9 +2025,9 @@ function onChange(e) {
     state.settings[el.dataset.key] = +el.value;
     saveState();
     render();
-  } else if (action === 'toggle-goal') {
+  } else if (action === 'goal-weight') {
     const g = (state.routine.goals || []).find((x) => x && x.id === el.dataset.goal);
-    if (g) g.active = el.checked;
+    if (g && g.kind === 'training') g.weight = clamp(+el.value, 0, 10);
     saveState();
     render();
   } else if (action === 'toggle-superset') {
@@ -1804,6 +2168,13 @@ function setView(v) {
   render();
 }
 
+// v3.1 day preview: clamp to [0, PREVIEW_MAX] and re-render. Transient — never
+// saved (no saveState), so a refresh returns to today.
+function setPreviewOffset(n) {
+  previewOffset = clamp(n, 0, PREVIEW_MAX);
+  render();
+}
+
 // Finish: log the session (Phase 2), advance index, clear checks.
 function finishSession(note) {
   const built = buildSession(state);
@@ -1848,6 +2219,7 @@ function finishSession(note) {
   state.setsDone = {};           // Feature E: per-session, cleared on finish
   state.rest = { name: null, startedAt: null };
   state.lastFinished = entry.date;
+  previewOffset = 0;             // v3.1: finishing returns the Today view to today
   saveState();
 }
 
@@ -1958,12 +2330,11 @@ function saveRoutineFromEditor() {
  */
 
 const DISMISS_COOLDOWN = 3;                    // sessions to suppress an identical dismissed key
-const ALL_KNOBS = ['skill', 'core', 'wts', 'mach', 'cool'];
-// Raise candidates + tie-break order. Weights first so the canonical
-// "raise weights to 3?" wins ties (matches the spec example). mach/cool are
-// structural, not effort knobs, so they're never *raised* by the nudge.
-const RAISE_KNOBS = ['wts', 'skill', 'core'];
-const KNOB_LABEL = { skill: 'skill slots', core: 'core slots', wts: 'weights', mach: 'machines', cool: 'cool-down' };
+// v3.0: two knobs remain — the unified moves count and the cool-down length.
+const ALL_KNOBS = ['moves', 'cool'];
+// Only "moves" is an effort knob the nudge raises; cool-down is structural.
+const RAISE_KNOBS = ['moves'];
+const KNOB_LABEL = { moves: 'number of moves', cool: 'cool-down' };
 
 function sliderRanges(routine) {
   return (routine && routine.structure && routine.structure.sliders) || DEFAULT_RANGES;
@@ -1976,16 +2347,19 @@ function sessionCompletion(entry) {
   return ex.filter((e) => e.done).length / ex.length;
 }
 
-// name -> knob (block slider) map, derived from the routine so old logs work.
+// name -> knob map, derived from the routine so old logs still resolve. v3.0:
+// every selectable move maps to the single "moves" knob; cool-down to "cool".
 function buildKnobMap(routine) {
   const b = (routine && routine.blocks) || {};
   const map = {};
   const add = (arr, knob) => (arr || []).forEach((ex) => { if (ex && ex.name) map[ex.name] = knob; });
-  if (b.skill) { add(b.skill.staples, 'skill'); add(b.skill.varietyPool, 'skill'); }
-  if (b.core) { add(b.core.staples, 'core'); add(b.core.varietyPool, 'core'); }
-  add(b.weightsA, 'wts'); add(b.weightsB, 'wts');
-  add(b.machinesA, 'mach'); add(b.machinesB, 'mach');
-  add(b.cooldown, 'cool');   // warmup intentionally omitted (user-managed, no knob)
+  add(b.moves, 'moves');
+  add(b.cooldown, 'cool');   // warmup intentionally omitted (static, no knob)
+  // Tolerate pre-v3.0 logs whose names still live under the old block shape.
+  if (b.skill) { add(b.skill.staples, 'moves'); add(b.skill.varietyPool, 'moves'); }
+  if (b.core) { add(b.core.staples, 'moves'); add(b.core.varietyPool, 'moves'); }
+  add(b.weightsA, 'moves'); add(b.weightsB, 'moves');
+  add(b.machinesA, 'moves'); add(b.machinesB, 'moves');
   return map;
 }
 
@@ -2085,26 +2459,34 @@ function skippedRecently(name, log) {
   return apps.filter((a) => !a.done).length >= 2;
 }
 
+// All goal/care ids a move touches — training goals it scores on, plus care tags.
+function moveGoalIds(ex) {
+  return Object.keys((ex && ex.goalScores) || {}).concat((ex && ex.care) || []);
+}
+
 /*
- * Pick a replacement for a skipped exercise. Candidates share at least one goal
- * tag with the skipped move, are eligible for the day/goal state, not currently
- * shown, not already proposed, not itself. Ranked least-recently-completed
- * (consistent with the variety guarantee), tie-break pool order.
+ * Pick a replacement for a skipped move (v3.0). Candidates come from blocks.moves,
+ * share at least one goal/care id with the skipped move, are day-eligible, have a
+ * positive goal-weighted score, and aren't already shown/proposed/itself. Ranked
+ * least-recently-completed (consistent with the variety guarantee), pool order.
  */
 function pickReplacement(name, st, shownNames, proposed, day) {
   const routine = st.routine;
   const base = findExerciseByName(routine, name);
   if (!base) return null;
-  const baseGoals = base.goals || [];
+  const baseIds = moveGoalIds(base);
   const log = st.log || [];
+  const goals = ((routine && routine.goals) || []).filter((g) => g && g.kind === 'training');
+  const pool = (routine.blocks && routine.blocks.moves) || [];
   const cands = [];
-  collectPools(routine).forEach((pool) => pool.forEach((ex) => {
+  pool.forEach((ex) => {
     if (!ex || ex.name === name) return;
-    if (!(ex.goals || []).some((g) => baseGoals.includes(g))) return;
+    if (!moveGoalIds(ex).some((g) => baseIds.indexOf(g) !== -1)) return;
     if (!eligible(ex, day)) return;
+    if (scoreMove(ex, goals) <= 0) return;
     if (shownNames.has(ex.name) || proposed.has(ex.name)) return;
     if (!cands.some((c) => c.name === ex.name)) cands.push(ex);
-  }));
+  });
   if (!cands.length) return null;
   return leastRecentlyCompleted(cands, log)[0].name;
 }
@@ -2207,19 +2589,20 @@ let LLM_RETRY_MS = 1500;   // delay before the single 429/529 retry (0 in tests)
 
 // Constraints/goals blurb sent with every 5a edit (from the spec + seed).
 const GOALS_BLURB =
-  '2–3 sessions/week, alternating A/B day structure. Training is organized around ' +
-  'toggleable goals; each move is tagged with one or more goal ids and drops out of ' +
-  'rotation when all of its goals are turned off. Goals: core (general core strength) ' +
-  'and flip (backflip power) are the primary drivers; aerial is a lower-weight optional ' +
-  'goal (off by default); str (general strength); splits (front-splits flexibility — ' +
-  'hip and hamstring end-range); and health/care goals that must be ' +
-  'respected — plantar (plantar fasciitis: keep impact conservative, keep slow calf ' +
+  '2–3 sessions/week, alternating A/B day structure. Training goals are weighted: ' +
+  'flip (backflip power & endurance), core (stronger core), and gym (general gymnastics) ' +
+  'are the primary drivers; aerial is optional (weight 0 = off by default). Each move ' +
+  'carries goalScores (a training-goal id -> 0..3), and the session picks the highest ' +
+  'goal-weighted-scoring moves (with per-section diminishing returns so Floor, Weights and ' +
+  'Machines each stay represented), so raising a goal\'s weight pulls its moves in. Care goals ' +
+  'are always on and live in the STATIC warm-up and cool-down — splits (hip/hamstring ' +
+  'end-range), plantar (plantar fasciitis: keep impact conservative, keep slow calf ' +
   'loading), cubital (cubital tunnel: no aggressive elbow-lockout pressing volume), ' +
   'posture (keep the pulling / row work), sciatic (gentle nerve mobility, lives in the ' +
-  'splits routine), and recovery (joint-friendly recovery from tumbling). The user ' +
-  'already stims by jumping (extra daily impact through the feet), so added ' +
-  'plyometric/impact volume should stay conservative. The warm-up block is real, ' +
-  'editable data — only change it when the user explicitly asks.';
+  'splits routine), and recovery (joint-friendly recovery). A move may also list `care` ' +
+  'ids it happens to serve (display only). The user already stims by jumping (extra daily ' +
+  'impact through the feet), so added plyometric/impact volume should stay conservative. ' +
+  'The warm-up and cool-down are static — only change them when the user explicitly asks.';
 
 // 5a system prompt: ONLY-JSON output, the full schema, and every guardrail.
 const EDIT_SYSTEM_PROMPT =
@@ -2235,30 +2618,27 @@ const EDIT_SYSTEM_PROMPT =
   'exactly as given.\n\n' +
   'ROUTINE SCHEMA:\n' +
   '- Top level: { version:int, goals:[...], blocks:{...}, structure?:{...} }\n' +
-  '- goals: array of { id:string, name:string, weight:number, active:boolean, colorId:string }. ' +
-  'colorId is one of: purple, teal, coral, pink, gray, green, amber, blue, slate, orange. Every id in an ' +
-  'exercise.goals array MUST be a goal id defined here.\n' +
-  '- blocks:\n' +
-  '    skill: { staples:[exercise...], varietyPool:[exercise...] }\n' +
-  '    core:  { staples:[exercise...], varietyPool:[exercise...] }\n' +
-  '    weightsA, weightsB, machinesA, machinesB, cooldown, warmup: [exercise...]\n' +
-  '  skill and core must each keep at least one staple. No duplicate exercise names within a ' +
-  'single array.\n' +
-  '- exercise: {\n' +
-  '    name: string (unique within its array),\n' +
-  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"sec/side"|"reps"|"reps/side"|"min", weight?:number },  // weight is lb, weighted (barbell/machine) moves only\n' +
-  '    goals: non-empty array of goal ids defined above (the FIRST id drives the card color/label),\n' +
+  '- goals: array of { id:string, name:string, kind:"training"|"care", colorId:string, weight?:number }. ' +
+  'Training goals carry a numeric weight 0–10 (0 = off); care goals have NO weight and are always on. ' +
+  'colorId is one of: purple, teal, coral, pink, gray, green, amber, blue, slate, orange.\n' +
+  '- blocks: { warmup:[static...], moves:[move...], cooldown:[static...] }.\n' +
+  '  `moves` is ONE unified pool; the app scores and picks from it. `moves` must be non-empty. ' +
+  'No duplicate names within a block.\n' +
+  '- move (an entry in blocks.moves): {\n' +
+  '    name: string (unique),\n' +
+  '    section: "floor" | "weights" | "machines",   // which on-page group it renders in\n' +
+  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"sec/side"|"reps"|"reps/side"|"min", weight?:number },  // weight is lb, loaded moves only\n' +
+  '    goalScores: { <trainingGoalId>: 0..3, ... },  // 3 = primary driver, 2 = strong, 1 = supportive; omit zero entries; the top-scoring goal drives the card color\n' +
+  '    care?: [ <careGoalId>, ... ],   // care goals this move also serves (display chips only)\n' +
   '    why: short string explaining the purpose,\n' +
-  '    group?: string                 // display grouping (e.g. for warm-up sub-headers)\n' +
-  '    rest?: int                     // rest-clock target in seconds (optional)\n' +
-  '    progression?: { step:number, max:number, maxSets:number, weightStep?:number }  // optional ladder overrides\n' +
-  '    dayLock?: "A" | "B"             // item only appears on that day\n' +
-  '    muscle?: string                 // coarse muscle group; skill/core moves only — drives Auto Superset grouping, preserve it\n' +
-  '    location?: string               // where the move happens, e.g. "floor" / "wall"; skill/core moves only — drives Auto Superset grouping, preserve it\n' +
-  '    largeEquipment?: string         // optional bulky station the move needs; at most one per superset — preserve it\n' +
+  '    rest?: int,                     // rest-clock target in seconds\n' +
+  '    progression?: { step:number, max:number, maxSets:number, weightStep?:number },\n' +
+  '    dayLock?: "A" | "B",            // move only appears on that day\n' +
+  '    muscle?: string                 // coarse muscle group; Floor moves only — drives Auto Superset grouping, preserve it\n' +
   '  }\n' +
-  '  Auto Superset groups skill/core moves that share a location (with distinct muscles) into one card — keep ' +
-  'each skill/core move\'s muscle and location fields when you edit it.\n' +
+  '- static (an entry in blocks.warmup / blocks.cooldown): { name, dose, goals:[goalId...], why, group?, progression?, alwaysInShort? }. ' +
+  'These keep a plain `goals` tag array (care ids); do NOT give them goalScores.\n' +
+  '  Auto Superset groups Floor moves with distinct muscles into one card — keep each Floor move\'s muscle field when you edit it.\n' +
   '  Double progression (weighted moves): reps climb from dose.amount to progression.max by step, ' +
   'then the weight rises by weightStep (lb) and reps reset — set weight + weightStep together on loaded lifts.\n\n' +
   'GUARDRAILS (follow strictly):\n' +
@@ -2269,13 +2649,12 @@ const EDIT_SYSTEM_PROMPT =
   '- Respect known issues: no aggressive elbow-lockout pressing volume (cubital tunnel); keep impact / ' +
   'plyometric volume conservative (plantar fasciitis, joint recovery); the user already gets daily ' +
   'impact from jumping.\n' +
-  '- The warm-up block is real, editable data — only add, edit, or remove warm-up items when the user ' +
-  'explicitly asks.\n' +
-  '- When adding a new goal, give it an explicit id, weight, and colorId, and rebalance the variety ' +
-  'pools so their emphasis roughly matches the active goal weights.\n' +
+  '- The warm-up and cool-down are static — only add, edit, or remove their items when the user explicitly asks.\n' +
+  '- When adding a new training goal, give it an explicit id, kind:"training", weight, and colorId, and ' +
+  'set goalScores on the moves that serve it so the generator can pick them.\n' +
   '- For anything symptom- or pain-related, adjust conservatively and add a warning recommending the ' +
   'user see a physical therapist rather than prescribing rehab.\n' +
-  '- Keep dayLock semantics intact on items you keep.';
+  '- Keep dayLock semantics intact on moves you keep.';
 
 // 5b system prompt: technique/planning assistant, not medical advice.
 const ASK_SYSTEM_PROMPT =
@@ -2445,11 +2824,17 @@ function doseKey(d) {
   return [d.sets, d.amount, d.unit, d.weight == null ? '' : d.weight].join('|');
 }
 
-// Order-insensitive goal-tag equality.
+// Order-insensitive goal-tag equality (used for static warm-up/cool-down tags).
 function goalsEqual(a, b) {
   const x = (a || []).slice().sort();
   const y = (b || []).slice().sort();
   return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+// Canonical string for a goalScores map (order-insensitive) and a care list.
+function goalScoresKey(gs) {
+  gs = gs || {};
+  return Object.keys(gs).sort().map((k) => k + ':' + gs[k]).join(',');
 }
 
 // Progression identity string.
@@ -2459,33 +2844,35 @@ function progKey(p) {
     p.weightStep == null ? '' : p.weightStep].join('|');
 }
 
-// modified = same name, different dose / goals / why / group / rest / progression /
-// dayLock / muscle / location / largeEquipment (v2.5 fields compared like why/goals).
+// modified = same name, different dose / goalScores / care / goals / why / section /
+// group / rest / progression / dayLock / muscle.
 function exerciseEqual(a, b) {
   return doseKey(a.dose) === doseKey(b.dose) &&
+    goalScoresKey(a.goalScores) === goalScoresKey(b.goalScores) &&
+    goalsEqual(a.care, b.care) &&
     goalsEqual(a.goals, b.goals) &&
     a.why === b.why &&
+    (a.section || '') === (b.section || '') &&
     (a.group || '') === (b.group || '') &&
     (a.rest == null ? '' : a.rest) === (b.rest == null ? '' : b.rest) &&
     progKey(a.progression) === progKey(b.progression) &&
     (a.dayLock || null) === (b.dayLock || null) &&
-    (a.muscle || '') === (b.muscle || '') &&
-    (a.location || '') === (b.location || '') &&
-    (a.largeEquipment || '') === (b.largeEquipment || '');
+    (a.muscle || '') === (b.muscle || '');
 }
 
 function diffGoals(oldGoals, newGoals) {
   const changes = [];
+  const desc = (g) => g.kind === 'care' ? 'care' : ('weight ' + (g.weight != null ? g.weight : 0));
   const o = {}; (oldGoals || []).forEach((g) => { if (g && g.name) o[g.name] = g; });
   const n = {}; (newGoals || []).forEach((g) => { if (g && g.name) n[g.name] = g; });
   Object.keys(n).forEach((name) => {
     const ng = n[name], og = o[name];
     if (!og) {
-      changes.push('Added goal: ' + name + ' (weight ' + ng.weight + ', ' + (ng.active ? 'active' : 'inactive') + ')');
-    } else if (og.weight !== ng.weight || !!og.active !== !!ng.active) {
+      changes.push('Added goal: ' + name + ' (' + desc(ng) + ')');
+    } else if ((og.weight || 0) !== (ng.weight || 0) || (og.kind || '') !== (ng.kind || '')) {
       let c = 'Changed goal: ' + name;
-      if (og.weight !== ng.weight) c += ' — weight ' + og.weight + ' → ' + ng.weight;
-      if (!!og.active !== !!ng.active) c += ' — ' + (ng.active ? 'activated' : 'deactivated');
+      if ((og.weight || 0) !== (ng.weight || 0)) c += ' — weight ' + (og.weight || 0) + ' → ' + (ng.weight || 0);
+      if ((og.kind || '') !== (ng.kind || '')) c += ' — ' + og.kind + ' → ' + ng.kind;
       changes.push(c);
     }
   });
@@ -2608,9 +2995,11 @@ function compactRoutine(r) {
   const b = (r && r.blocks) || {};
   const names = (arr) => (arr || []).map((ex) => ex.name);
   const out = { goals: (r && r.goals) || [], blocks: {} };
-  out.blocks.skill = { staples: names(b.skill && b.skill.staples), varietyPool: names(b.skill && b.skill.varietyPool) };
-  out.blocks.core = { staples: names(b.core && b.core.staples), varietyPool: names(b.core && b.core.varietyPool) };
-  ['weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown'].forEach((k) => { out.blocks[k] = names(b[k]); });
+  out.blocks.warmup = names(b.warmup);
+  ['floor', 'weights', 'machines'].forEach((sec) => {
+    out.blocks[sec] = (b.moves || []).filter((ex) => (ex.section || 'floor') === sec).map((ex) => ex.name);
+  });
+  out.blocks.cooldown = names(b.cooldown);
   return out;
 }
 
@@ -2619,9 +3008,10 @@ function buildAskContext(st) {
   const today = [];
   build.blocks.forEach((bl) => bl.exercises.forEach((ex) => today.push(ex.name)));
   const notes = (st.log || []).slice(-5).filter((e) => e.note).map((e) => '- ' + e.note);
-  const goals = (st.routine.goals || []).filter((g) => g.active).map((g) => g.name + ' (w' + g.weight + ')');
+  const goals = (st.routine.goals || []).filter((g) => g && g.kind === 'training' && g.weight > 0)
+    .map((g) => g.name + ' (w' + g.weight + ')');
   return 'CONTEXT (for your reference):\n' +
-    'Active goals: ' + (goals.join(', ') || 'none') + '\n' +
+    'Active training goals: ' + (goals.join(', ') || 'none') + '\n' +
     'Today is Session ' + build.session + ', Day ' + build.day + '. Today\'s exercises: ' +
       (today.join(', ') || 'none') + '\n' +
     'Recent session notes:\n' + (notes.join('\n') || '(none)') + '\n' +
@@ -2752,9 +3142,19 @@ function renderDiff(p) {
 }
 
 function exLine(ex) {
+  // v3.0 moves carry goalScores + care; static warm-up/cool-down keep `goals`.
+  let tags;
+  if (ex.goalScores || ex.care) {
+    const scores = Object.keys(ex.goalScores || {}).map((id) => id + ' ' + ex.goalScores[id]);
+    const care = (ex.care || []).map((id) => id + ' (care)');
+    tags = scores.concat(care).join(', ');
+  } else {
+    tags = (ex.goals || []).join(', ');
+  }
+  const section = ex.section ? ex.section + ' · ' : '';
   return '<div class="dx-name">' + escapeHtml(ex.name) + '</div>' +
-    '<div class="dx-meta">' + escapeHtml(formatDose(ex.dose)) + ' · ' +
-      escapeHtml((ex.goals || []).join(', ')) + '</div>' +
+    '<div class="dx-meta">' + escapeHtml(section + formatDose(ex.dose)) + ' · ' +
+      escapeHtml(tags) + '</div>' +
     '<div class="dx-why">' + escapeHtml(ex.why || '') + '</div>';
 }
 
@@ -2884,6 +3284,7 @@ if (typeof window !== 'undefined') {
   window.TumbleTrainer = {
     validateRoutine,
     buildSession: () => buildSession(state),
+    buildFutureSession: (offset) => buildFutureSession(state, offset),
     getState: () => state
   };
 }
@@ -2891,12 +3292,13 @@ if (typeof window !== 'undefined') {
 // Node smoke-test hook (kept out of the browser path).
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    validateRoutine, formatDose, effectiveDose, buildSession, selectVariety,
+    validateRoutine, formatDose, effectiveDose, buildSession, buildFutureSession,
     migrateFromV1, freshState, currentDay,
-    // v2.3 — goals, slots, ladders, migration (pure where noted)
-    eligible, goalActive, buildStapleBlock, takeN, buildCooldown,
+    // v3.0 — goal-weighted generator (pure)
+    eligible, goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
+    cardGoalIds, moveChipIds, moveGoalIds, buildCooldown,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
     // v2.5 Auto Superset (pure grouping + plan)
     groupSupersets, supersetPlan, supersetRestTarget,
     // Phase 4 heuristics (pure — take log/state as args)

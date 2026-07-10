@@ -358,6 +358,80 @@ model still stores every move individually, and session logging is unchanged.
   index). No data-model or `finishSession` change. `sw.js` CACHE bumps to
   `tumble-trainer-v2.5.2`.
 
+## v3.0 — goal-weighted generator
+Shipped on top of v2.5. Storage stays `tumbleTrainer.v2`; a version-gated
+migration (`migrateRoutineV6`, run from `normalizeState` on `routine.version < 6`)
+upgrades stored routines in place. `routine.version` is now 6; `sw.js` CACHE is
+`tumble-trainer-v3.0.0`.
+
+- **Two kinds of goal.** `routine.goals` entries gain a `kind`. **Training** goals
+  (`flip`, `aerial`, `core`, `gym`) carry a 0–10 `weight` (0 = off) set by a slider
+  in Settings; the old per-goal checkboxes and the `active` field are gone. **Care**
+  goals (`splits`, `plantar`, `cubital`, `posture`, `sciatic`, `recovery`) are always
+  on, have no slider, and live in the static warm-up / cool-down. The old `str` goal
+  is removed; `gym` (general gymnastics — handstands, bridges, handspring shapes,
+  rolls) is added.
+
+- **One unified `moves` block.** `blocks` becomes `{ warmup[], moves[], cooldown[] }`.
+  Every former skill/core/weights/machines exercise now lives in `moves`, each with a
+  `section` (`"floor"|"weights"|"machines"`), a `goalScores` map (trainingGoalId → 0..3,
+  zero entries omitted), and an optional `care` id array (display chips). `location` is
+  dropped (Floor is implicitly one location); `muscle` stays on Floor moves for Auto
+  Superset. Warm-up / cool-down entries keep their `goals` tag array.
+
+- **Goal-weighted selection (`scoreMove` / `selectMoves`).** Pure, deterministic, no
+  RNG/Date. Pool = `blocks.moves` filtered by `dayLock`. `baseScore = Σ trainingGoal.weight
+  × goalScore`; moves scoring 0 are excluded. A recency boost `effective = base ×
+  (1 + 0.1 × min(sessionsSince, 6))` (never-completed → 6) favours variety. `settings.moves`
+  picks are then taken **greedily with per-section diminishing returns**: each pick maximizes
+  `effective × SECTION_DECAY^(already-picked in that move's section)` (`SECTION_DECAY = 0.85`),
+  tie-broken by pool order. The decay stops the highest-scoring section (usually Floor) from
+  flooding the session so every populated section stays represented. Picks are grouped by
+  `section`; page order: **Warm-up, Floor, Weights, Machines, Cool-down** (empty skipped).
+
+- **Settings.** The four block sliders collapse into one **Number of moves** slider
+  (`settings.moves`, range `[3,15]`, default 10) beside the cool-down slider and Auto
+  Superset toggle. Goals panel shows a 0–10 weight slider per training goal; a static
+  panel lists the six care chips. `restTarget` for Floor is 90 s unless the move's top
+  goal is `core` (60 s); weights/machines 90 s.
+
+- **v6 migration.** Generic so user edits survive: rebuilds goals (drops `str`, adds `gym`;
+  training weight = its default flip 8 / core 6 / gym 5 unless the old goal was *explicitly*
+  inactive — missing `active` counts as on, so a v1-legacy routine never migrates to an
+  all-zero empty session; aerial 0), flattens skill/core → Floor, weightsA/B → Weights,
+  machinesA/B → Machines (dedupe by name, prefer A). Since v5 alternated whole weight/machine
+  blocks (no per-move dayLock), the A/B parity is **synthesized**: an A-only move gets
+  `dayLock:"A"`, a B-only move `"B"`, a name in both (Leg curl) none; an existing dayLock
+  wins. Old tags → goalScores (`flip→{flip:3}`, `aerial→{aerial:3}`, `core→{core:2}`,
+  `str→{flip:2,gym:1}`) or the seed's hand-authored scores by name; care tags → `care`;
+  empty → `{gym:1}`. `settings.moves` = clamp(skill+core+wts+mach, 3, 15). Falls back to the
+  fresh seed wholesale if it throws.
+
+## v3.1 — day preview
+Shipped on top of v3.0. No storage or schema change; `sw.js` CACHE is
+`tumble-trainer-v3.1.0`.
+
+- **Peek ahead from Today.** A control row (◀ / label / ▶ + "Back to today") at the top
+  of the Today view steps a transient `previewOffset` (module-level, 0–13; **never
+  persisted, never migrated**). 0 = today (live, editable); ◀ is disabled at 0 (no past
+  preview). A refresh or finishing a session resets the offset to 0 (`finishSession`).
+
+- **Honest rotation (`buildFutureSession(st, offset)`).** Pure, no mutation of real state.
+  `offset 0` returns exactly `buildSession(st)`. Otherwise it walks a deep-cloned state
+  forward: each step builds the session, appends a *simulated* completed-log entry (same
+  shape `finishSession` writes, marking that session's selected moves done — recency only
+  reads name + done), and advances the session index, so the recency boost that drives
+  `selectMoves` is correct for the target day. Per-session swaps are dropped in the copy
+  (`applySwaps` only applies at offset 0). Exported on `module.exports` and
+  `window.TumbleTrainer`.
+
+- **Read-only rendering.** In preview the normal block/card rendering is reused with all
+  interaction suppressed: no checkboxes, set/round dots, rest timers, expand/progression,
+  swap-suggestion chips, or Finish button; the header shows "Preview · Session N · Day X"
+  with no progress bar, and `#view` gets an `is-preview` class. Preview doses render at the
+  **current** intensity level — the forward simulation does not advance progression ladders,
+  so a previewed weighted move shows today's load, not a projected one.
+
 ## Non-goals
 - No accounts, no server, no analytics
 - No LLM calls without explicit user action (cost + privacy)

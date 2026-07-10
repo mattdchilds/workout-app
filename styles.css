@@ -611,3 +611,28 @@ input[type="password"] {
   color: var(--text);
 }
 .init-error pre { padding: 10px 12px; overflow-x: auto; }
+
+/* --- v3.1 day preview --- */
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.preview-bar .btn.small { min-height: 32px; padding: 4px 12px; }
+.preview-bar .prev-day, .preview-bar .next-day { min-width: 40px; font-size: 15px; }
+.preview-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.preview-bar .back-today { flex: 0 0 auto; color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+/* Preview cards read as inert (no interaction affordances). */
+.is-preview .card-main { cursor: default; }
