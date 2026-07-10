@@ -1,0 +1,50 @@
+HOW TO RUN — Tumble Trainer
+===========================
+
+The app must be served over HTTP. Opening index.html directly (file://)
+will NOT work — the browser blocks the routine-seed.json fetch and the
+service worker, and you'll see an init error page instead of the app.
+
+Quick start
+-----------
+1. Open a terminal in this folder (h:\Projects\Workout App).
+2. Start a local web server. Any of these works:
+
+     python -m http.server 8080
+     npx serve -l 8080
+     php -S localhost:8080
+
+3. Open http://localhost:8080 in your browser.
+
+On your phone (same Wi-Fi)
+--------------------------
+1. Start the server as above.
+2. Find this PC's local IP:  ipconfig  (look for "IPv4 Address").
+3. On the phone, browse to http://<that-ip>:8080
+4. Optional: use the browser's "Add to Home Screen" to install it
+   as a PWA (works offline afterwards thanks to the service worker).
+
+If changes don't show up
+------------------------
+The service worker caches everything for offline use. After code or
+data changes:
+  - The cache name in sw.js (CACHE = 'tumble-trainer-vX.Y.Z') must be
+    bumped — this is already done for each release.
+  - Then hard-refresh (Ctrl+Shift+R), or refresh twice: the first load
+    installs the new worker, the second serves the new files.
+  - Nuclear option: DevTools > Application > Service Workers >
+    Unregister, then Clear storage > Clear site data (NOTE: clearing
+    site data also wipes your saved routine/log in localStorage —
+    export a backup first from the Settings tab).
+
+Your data
+---------
+Everything (routine, session log, progression levels, API key) lives in
+this browser's localStorage under the key "tumbleTrainer.v2". Use the
+export/import options in the Settings tab to back up or move devices.
+
+Dev notes
+---------
+- No build step, no dependencies: plain HTML/CSS/JS.
+- Headless smoke checks: node --check app.js  (app.js also exposes a
+  module.exports hook so pure functions can be required from Node).

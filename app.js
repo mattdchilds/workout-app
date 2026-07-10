@@ -29,11 +29,17 @@
 const V1_KEY = 'tumbleTrainer.v1';
 const V2_KEY = 'tumbleTrainer.v2';
 
-// Units whose amount can be stepped. "as usual" (warmup) is intentionally not.
-const STEPPABLE = ['sec', 'min', 'reps', 'reps/side'];
+// Amount units the app understands. "sec/side" behaves like "sec".
+const UNITS = ['sec', 'sec/side', 'reps', 'reps/side', 'min'];
 
 // Fallback slider ranges if the routine omits structure.sliders.
-const DEFAULT_RANGES = { skill: [1, 3], core: [1, 3], wts: [1, 3], mach: [0, 2], cool: [1, 2] };
+const DEFAULT_RANGES = { skill: [1, 5], core: [1, 5], wts: [1, 3], mach: [0, 2], cool: [1, 2] };
+
+// v1 category id -> new goal id(s), for migrating LLM-added / hand-edited moves
+// that don't match a seed move by name (Feature A migration, step 2).
+const CATEGORY_TO_GOALS = {
+  gen: ['core'], flip: ['flip'], aerial: ['aerial'], str: ['str'], health: ['recovery']
+};
 
 // Generic tab registry. Later phases just push more entries.
 const TABS = [
@@ -89,47 +95,400 @@ function freshState(routine) {
     version: 2,
     session: 1,                   // Session 1 = Day A (A on odd sessions)
     view: 'today',
-    settings: { skill: 2, core: 2, wts: 2, mach: 1, cool: 2, aerial: false },
+    // Skill/core sliders are now TOTAL items per block (Feature B); 4 preserves
+    // the old effective volume (~2 staples + 2 variety).
+    settings: { skill: 4, core: 4, wts: 2, mach: 1, cool: 2 },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
-    intensity: {},                // { [exerciseName]: { sets, amount } } — survives sessions
+    intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
+    setsDone: {},                 // Feature E: { [exerciseName]: int } — per-session, cleared on finish
+    rest: { name: null, startedAt: null }, // Feature E: single global rest clock
     routine: routine,
     routineHistory: [],           // [{ timestamp, routine }] most-recent first, max 10
     log: [],                      // Phase 2 session log
     lastFinished: null,
     dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
     swaps: {},                    // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
+    autoSuperset: true,           // v2.5: group same-location skill/core moves into supersets (default ON)
     apiKey: '',                   // Phase 5: BYO Anthropic key. Device-only; never committed, never sent anywhere but api.anthropic.com
     model: DEFAULT_MODEL          // Phase 5: model toggle
   };
 }
 
-// One-time v1 -> v2 migration: carry session index, slider settings, and aerial flag.
+// One-time v1 -> v2 migration: carry session index, slider settings, aerial goal.
 function migrateFromV1(v1, routine) {
   const s = freshState(routine);
   if (v1 && typeof v1.session === 'number') s.session = v1.session;
-  ['skill', 'core', 'wts', 'mach', 'cool'].forEach((k) => {
+  ['wts', 'mach', 'cool'].forEach((k) => {
     if (v1 && typeof v1[k] === 'number') s.settings[k] = v1[k];
   });
-  if (v1 && typeof v1.aerial === 'boolean') s.settings.aerial = v1.aerial;
+  // v1 skill/core were VARIETY counts; new sliders are TOTAL items (+2, clamp 1..5).
+  ['skill', 'core'].forEach((k) => {
+    if (v1 && typeof v1[k] === 'number') s.settings[k] = clamp(v1[k] + 2, 1, 5);
+  });
+  if (v1 && v1.aerial === true) {
+    const a = (s.routine.goals || []).find((g) => g && g.id === 'aerial');
+    if (a) a.active = true;
+  }
   return s;
 }
 
-// Fill in any missing fields so old/imported states can't crash the renderer.
+// Detect a pre-v2.3 routine (v1 goals/categories/category tags).
+function isLegacyRoutine(routine) {
+  if (!routine || typeof routine !== 'object') return false;
+  if (routine.version == null || routine.version < 2) return true;
+  if ('categories' in routine) return true;
+  const goals = routine.goals;
+  if (Array.isArray(goals) && goals.length && goals[0] && goals[0].id == null) return true; // old goals had no id
+  return collectPools(routine).some((pool) => pool.some((ex) => ex && 'category' in ex));
+}
+
+// Feature A migration, step 1/2: retag one move by name-match against the new
+// seed, else map its old category (+ aerialAlt/aerialOnly) to goal ids.
+function migrateMove(ex, seedMap) {
+  if (!ex || typeof ex !== 'object') return;
+  const seedEx = ex.name && seedMap[ex.name];
+  if (seedEx && Array.isArray(seedEx.goals)) {
+    ex.goals = seedEx.goals.slice();
+    if (seedEx.progression) ex.progression = deepClone(seedEx.progression);
+    if (typeof seedEx.rest === 'number') ex.rest = seedEx.rest;
+    if (seedEx.group) ex.group = seedEx.group;
+  } else if (!Array.isArray(ex.goals)) {
+    let goals;
+    if (ex.aerialOnly) {
+      goals = ['aerial'];
+    } else {
+      goals = (CATEGORY_TO_GOALS[ex.category] || ['core']).slice();
+      if (ex.aerialAlt && ex.aerialAlt.category) {
+        (CATEGORY_TO_GOALS[ex.aerialAlt.category] || []).forEach((id) => {
+          if (!goals.includes(id)) goals.push(id);
+        });
+      }
+    }
+    ex.goals = goals;
+  }
+  delete ex.category;
+  delete ex.aerialOnly;
+  delete ex.aerialAlt;
+}
+
+// Feature A migration, step 3: rebuild routine.goals from the seed, carrying
+// over active flags matched by name plus the old settings.aerial flag.
+function buildMigratedGoals(seed, oldGoals, oldSettings) {
+  const base = deepClone((seed && seed.goals) || []);
+  const oldByName = {};
+  (oldGoals || []).forEach((g) => { if (g && g.name) oldByName[g.name] = g; });
+  base.forEach((g) => {
+    const og = oldByName[g.name];
+    if (og && typeof og.active === 'boolean') g.active = og.active;
+  });
+  if (oldSettings && oldSettings.aerial === true) {
+    const a = base.find((g) => g.id === 'aerial');
+    if (a) a.active = true;
+  }
+  return base;
+}
+
+/*
+ * Feature A migration (pure, exported for the smoke test). Converts a pre-v2.3
+ * routine (categories + category/aerialOnly/aerialAlt tags) into the unified
+ * goal-tag schema, using `seed` as the source of truth for goals and for
+ * retagging known moves by name. Returns a new routine object.
+ */
+function migrateRoutine(routine, seed, oldSettings) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (!isLegacyRoutine(routine)) return routine;
+  const r = deepClone(routine);
+  const seedMap = {};
+  collectPools(seed).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.name) seedMap[ex.name] = ex;
+  }));
+  collectPools(r).forEach((pool) => pool.forEach((ex) => migrateMove(ex, seedMap)));
+  r.goals = buildMigratedGoals(seed, routine.goals, oldSettings);
+  delete r.categories;
+  r.version = 2;
+  return r;
+}
+
+// Insert a named seed move into a pool if it isn't already present by name.
+// blockPath is ['machinesA'] for a flat block or ['skill','varietyPool'] for a
+// staple/variety sub-pool.
+function insertSeedMove(routine, seed, name, blockPath) {
+  if (findExerciseByName(routine, name)) return;
+  const seedEx = findExerciseByName(seed, name);
+  if (!seedEx) return;
+  const b = routine.blocks || (routine.blocks = {});
+  let target;
+  if (blockPath.length === 2) {
+    b[blockPath[0]] = b[blockPath[0]] || {};
+    target = b[blockPath[0]][blockPath[1]] = b[blockPath[0]][blockPath[1]] || [];
+  } else {
+    target = b[blockPath[0]] = b[blockPath[0]] || [];
+  }
+  target.push(deepClone(seedEx));
+}
+
+/*
+ * v2.3 -> v2.4 migration (Feature: weights + splits goal). Runs on any stored
+ * routine whose version is < 3 — including a v2.3 routine already stamped
+ * version 2 — because seed edits alone never reach devices that persist their
+ * own routine. Pure; returns a new routine object with version 3.
+ *
+ * Steps: adopt dose.weight + weightStep progression from the seed by name
+ * (keeping any user sets/amount override), add the splits goal + its tags,
+ * insert the three new seed moves, adopt the real warm-up block if the device
+ * still has the old placeholder, and drop the slow-eccentric calf raise from
+ * the machine pools (it lives in the warm-up now).
+ */
+function migrateRoutineV3(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 3) return routine;
+  const r = deepClone(routine);
+  const seedMap = {};
+  collectPools(seed).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.name) seedMap[ex.name] = ex;
+  }));
+
+  // Moves the seed now loads get the seed's full dose — the v3 seed encodes the
+  // user's actual gym numbers, and stored doses on these moves are just stale
+  // pre-v3 defaults (in-app progression lives in intensity levels, not here).
+  // A dose that already carries a weight was set post-v3; leave it alone.
+  collectPools(r).forEach((pool) => pool.forEach((ex) => {
+    const seedEx = ex && ex.name && seedMap[ex.name];
+    if (!seedEx || !seedEx.dose) return;
+    if (typeof seedEx.dose.weight === 'number' && ex.dose && typeof ex.dose.weight !== 'number') {
+      ex.dose = deepClone(seedEx.dose);
+      if (seedEx.progression) ex.progression = deepClone(seedEx.progression);
+    }
+  }));
+
+  // Add the splits goal if the device predates it.
+  const goals = r.goals || (r.goals = []);
+  if (!goals.some((g) => g && g.id === 'splits')) {
+    const seedSplits = (seed.goals || []).find((g) => g && g.id === 'splits');
+    if (seedSplits) goals.push(deepClone(seedSplits));
+  }
+
+  // Retag the two moves the seed now associates with splits (first id drives the
+  // card color, so splits leads on the splits routine).
+  const tagSplits = (name, first) => {
+    const ex = findExerciseByName(r, name);
+    if (!ex) return;
+    ex.goals = ex.goals || [];
+    if (!ex.goals.includes('splits')) { first ? ex.goals.unshift('splits') : ex.goals.push('splits'); }
+  };
+  tagSplits('Splits routine (incl. sciatic floss)', true);
+  tagSplits('Bulgarian split squat', false);
+
+  // Insert the three new seed moves into their pools if absent by name.
+  insertSeedMove(r, seed, 'Cossack squat', ['skill', 'varietyPool']);
+  insertSeedMove(r, seed, 'Leg extension', ['machinesA']);
+
+  // Adopt the real warm-up block if the device still shows the old placeholder
+  // (the pre-v2.3 single-card warmup). A customized new-style warmup (which has
+  // the Chin tucks staple) is left untouched.
+  const b = r.blocks || (r.blocks = {});
+  const warmup = b.warmup;
+  const hasNewWarmup = Array.isArray(warmup) && warmup.some((ex) => ex && ex.name === 'Chin tucks');
+  if (!hasNewWarmup && (!Array.isArray(warmup) || warmup.length <= 2)) {
+    b.warmup = deepClone((seed.blocks && seed.blocks.warmup) || []);
+  }
+
+  // The slow-eccentric calf raise moved to the warm-up; drop any stale copy from
+  // the machine pools (tolerant of minor naming variants).
+  const isSlowCalf = (ex) => {
+    const n = (ex && ex.name || '').toLowerCase();
+    return n.indexOf('calf raise') !== -1 && n.indexOf('eccentric') !== -1;
+  };
+  ['machinesA', 'machinesB'].forEach((k) => {
+    if (Array.isArray(b[k])) b[k] = b[k].filter((ex) => !isSlowCalf(ex));
+  });
+
+  r.version = 3;
+  return r;
+}
+
+/*
+ * v2.4 -> v2.5 migration (dose ranges removed, "Couch stretch" retired). Runs on
+ * any stored routine whose version is < 4 — seed edits alone never reach devices
+ * that persist their own routine. Pure; returns a new routine object with
+ * version 4. Idempotent.
+ *
+ * Steps: drop the now-gone dose.range band from every move (moves rely on
+ * explicit progression.max or the computed default instead); give the L-sit hold
+ * an explicit progression preserving its old range ceiling if it lacks one;
+ * remove the retired "Couch stretch" from the cooldown block; and adopt the new
+ * Auto Superset fields (muscle / location / optional largeEquipment) onto stored
+ * skill & core moves from the seed by name.
+ */
+function migrateRoutineV4(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 4) return routine;
+  const r = deepClone(routine);
+
+  // Strip the retired range band from every move in every block.
+  collectPools(r).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.dose && 'range' in ex.dose) delete ex.dose.range;
+  }));
+
+  // The L-sit hold used its range as a progression ceiling; adopt the seed's
+  // explicit progression so that ceiling survives (only if it lacks one).
+  const lsit = findExerciseByName(r, 'L-sit or tuck sit hold');
+  if (lsit && (!lsit.progression || typeof lsit.progression.max !== 'number')) {
+    const seedLsit = seed && findExerciseByName(seed, 'L-sit or tuck sit hold');
+    if (seedLsit && seedLsit.progression) lsit.progression = deepClone(seedLsit.progression);
+  }
+
+  // Remove the retired "Couch stretch" from the cooldown block.
+  const b = r.blocks || (r.blocks = {});
+  if (Array.isArray(b.cooldown)) {
+    b.cooldown = b.cooldown.filter((ex) => !(ex && ex.name === 'Couch stretch'));
+  }
+
+  // v2.5 Auto Superset: adopt muscle / location (+ optional largeEquipment) onto
+  // stored skill & core moves from the seed by name. Only fills fields the stored
+  // move is missing, so a user's own value survives; idempotent.
+  if (seed && seed.blocks) {
+    const sMap = {};
+    ['skill', 'core'].forEach((bk) => {
+      const sb = seed.blocks[bk];
+      if (!sb) return;
+      [].concat(sb.staples || [], sb.varietyPool || []).forEach((ex) => {
+        if (ex && ex.name) sMap[ex.name] = ex;
+      });
+    });
+    ['skill', 'core'].forEach((bk) => {
+      const rb = b[bk];
+      if (!rb) return;
+      [].concat(rb.staples || [], rb.varietyPool || []).forEach((ex) => {
+        const s = ex && ex.name && sMap[ex.name];
+        if (!s) return;
+        if (s.muscle && ex.muscle == null) ex.muscle = s.muscle;
+        if (s.location && ex.location == null) ex.location = s.location;
+        if (s.largeEquipment && ex.largeEquipment == null) ex.largeEquipment = s.largeEquipment;
+      });
+    });
+  }
+
+  r.version = 4;
+  return r;
+}
+
+/*
+ * v2.5.1 Auto Superset: the "wall" location is merged into "floor" so the three
+ * wall-tagged skill/core moves (Handstand wall hold, Wall handstand shoulder
+ * taps, Wall-sit hollow press) can superset with floor moves. Over every move in
+ * every pool, rewrites location "wall" -> "floor". Idempotent; runs for any
+ * routine.version < 5, including a routine already stamped version 4 (which is
+ * where the loaded app currently sits, with location "wall" in localStorage).
+ */
+function migrateRoutineV5(routine) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 5) return routine;
+  const r = deepClone(routine);
+
+  collectPools(r).forEach((pool) => pool.forEach((ex) => {
+    if (ex && ex.location === 'wall') ex.location = 'floor';
+  }));
+
+  r.version = 5;
+  return r;
+}
+
+/*
+ * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
+ * normalizeState — gated on the group VALUE, not routine.version, because some
+ * devices were already stamped version 3 before this rename existed. Mutates the
+ * routine in place. "Feet" -> "Plantar fasciitis".
+ */
+function renameWarmupGroups(routine) {
+  const wu = routine && routine.blocks && routine.blocks.warmup;
+  if (!Array.isArray(wu)) return;
+  wu.forEach((ex) => { if (ex && ex.group === 'Feet') ex.group = 'Plantar fasciitis'; });
+}
+
+// Feature D migration: old { sets, amount } overrides -> ladder { level }.
+function migrateIntensity(oldIntensity, routine) {
+  const out = {};
+  Object.keys(oldIntensity || {}).forEach((name) => {
+    const ov = oldIntensity[name];
+    if (!ov) return;
+    if (typeof ov.level === 'number') { out[name] = { level: ov.level }; return; }
+    const ex = findExerciseByName(routine, name);
+    if (!ex || typeof ov.sets !== 'number' || typeof ov.amount !== 'number') return;
+    const ladder = progressionLadder(ex);
+    let best = 0, bestDist = Infinity;
+    ladder.forEach((entry, i) => {
+      const dist = Math.abs(entry.sets - ov.sets) * 1000 + Math.abs(entry.amount - ov.amount);
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    });
+    if (best > 0) out[name] = { level: best };
+  });
+  return out;
+}
+
+// Fill in any missing fields so old/imported states can't crash the renderer,
+// and run the one-time v2 -> v2.3 migration (goals, slots, ladders).
 function normalizeState(obj) {
-  const base = freshState(obj.routine || (SEED_ROUTINE ? deepClone(SEED_ROUTINE) : {}));
-  return Object.assign(base, obj, {
+  const seed = SEED_ROUTINE ? deepClone(SEED_ROUTINE) : null;
+  let routine = obj.routine || (seed ? deepClone(seed) : {});
+  const legacy = isLegacyRoutine(routine);
+  if (legacy && seed) routine = migrateRoutine(routine, seed, obj.settings);
+  // v2.3 -> v2.4: runs whenever the stored routine.version is < 3, so a routine
+  // already stamped version 2 by the v2.3 migration still picks up weights, the
+  // splits goal, the real warm-up block, and the calf-raise cleanup.
+  if (seed) routine = migrateRoutineV3(routine, seed);
+  // v2.4 -> v2.5: runs whenever the stored routine.version is < 4, so a routine
+  // already stamped version 3 still drops dose ranges and the retired
+  // "Couch stretch".
+  if (seed) routine = migrateRoutineV4(routine, seed);
+  // v2.5 -> v2.5.1: runs whenever the stored routine.version is < 5, so a routine
+  // already stamped version 4 (with location "wall" stored) merges wall into floor.
+  routine = migrateRoutineV5(routine);
+  renameWarmupGroups(routine);   // v2.4.1 warm-up group rename (see below)
+
+  const base = freshState(routine);
+  const merged = Object.assign(base, obj, {
     settings: Object.assign({}, base.settings, obj.settings || {}),
     checks: obj.checks || {},
     intensity: obj.intensity || {},
+    setsDone: obj.setsDone || {},
+    rest: obj.rest && typeof obj.rest === 'object' ? obj.rest : { name: null, startedAt: null },
     routineHistory: obj.routineHistory || [],
     log: obj.log || [],
     dismissed: obj.dismissed || {},
     swaps: obj.swaps || {},
+    // v2.5 Auto Superset — state-level toggle, default ON (NOT part of the routine migration).
+    autoSuperset: typeof obj.autoSuperset === 'boolean' ? obj.autoSuperset : true,
     apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : base.apiKey,
     model: obj.model || base.model,
-    routine: obj.routine || base.routine,
+    routine: routine,
     view: obj.view || 'today'
   });
+  delete merged.settings.aerial;   // obsolete — aerial is now a goal
+
+  if (legacy) {
+    // v2 skill/core were VARIETY counts; new sliders are TOTAL items (+2, clamp 1..5).
+    ['skill', 'core'].forEach((k) => {
+      if (obj.settings && typeof obj.settings[k] === 'number') {
+        merged.settings[k] = clamp(obj.settings[k] + 2, 1, 5);
+      }
+    });
+    merged.intensity = migrateIntensity(obj.intensity || {}, routine);
+    merged.routineHistory = [];   // old history is v1-shaped; clearing is acceptable per spec
+  }
+
+  // Clamp stored ladder levels to the current ladder length — a routine edit (or
+  // the v2.4 weight reshape) can change a ladder's size under a saved override.
+  Object.keys(merged.intensity || {}).forEach((name) => {
+    const ov = merged.intensity[name];
+    if (!ov || typeof ov.level !== 'number') return;
+    const ex = findExerciseByName(routine, name);
+    if (!ex) return;
+    const lvl = clamp(ov.level, 0, progressionLadder(ex).length - 1);
+    if (lvl <= 0) delete merged.intensity[name];
+    else merged.intensity[name] = { level: lvl };
+  });
+  return merged;
 }
 
 function saveState() {
@@ -143,11 +502,12 @@ async function loadSeed() {
   return res.json();
 }
 
-/* --- 3. Routine schema validator (Phase 3) -------------------------------- *
+/* --- 3. Routine schema validator (Phase 3, updated v2.3) ------------------- *
  * Standalone, no deps. Returns { valid, errors[] } with human-readable paths.
- * Reused verbatim by the manual JSON editor and (later) the LLM edit flow.
- * Extra seed fields (userManaged, aerialAlt, aerialOnly, dayLock, range,
- * tempoNote, alwaysInShort, warmup block, structure) are allowed silently.
+ * Reused verbatim by the manual JSON editor and the LLM edit flow.
+ * Extra seed fields (group, rest, progression, dayLock, tempoNote,
+ * alwaysInShort, muscle, location, largeEquipment, structure) are allowed
+ * silently (muscle/location/largeEquipment drive v2.5 Auto Superset grouping).
  */
 function validateRoutine(routine) {
   const errors = [];
@@ -155,21 +515,27 @@ function validateRoutine(routine) {
     return { valid: false, errors: ['Routine must be a JSON object'] };
   }
 
-  ['version', 'goals', 'categories', 'blocks'].forEach((f) => {
+  ['version', 'goals', 'blocks'].forEach((f) => {
     if (!(f in routine)) errors.push('Missing required top-level field: ' + f);
   });
   if ('version' in routine && typeof routine.version !== 'number') {
     errors.push('version must be a number');
   }
-  if ('goals' in routine && !Array.isArray(routine.goals)) {
-    errors.push('goals must be an array');
-  }
 
-  const cats = routine.categories;
-  if (!cats || typeof cats !== 'object' || Array.isArray(cats)) {
-    errors.push('categories must be an object of { label, colorId }');
+  if (!Array.isArray(routine.goals)) {
+    errors.push('goals must be an array of { id, name, weight, active, colorId }');
+  } else {
+    routine.goals.forEach((g, i) => {
+      if (!g || typeof g !== 'object' || Array.isArray(g)) {
+        errors.push('goals[' + i + '] must be an object'); return;
+      }
+      if (typeof g.id !== 'string' || !g.id) errors.push('goals[' + i + '] missing string "id"');
+      if (typeof g.name !== 'string' || !g.name) errors.push('goals[' + i + '] missing string "name"');
+      if (typeof g.active !== 'boolean') errors.push('goals[' + i + '] (' + (g.id || i) + ') "active" must be boolean');
+    });
   }
-  const knownCats = (cats && typeof cats === 'object' && !Array.isArray(cats)) ? Object.keys(cats) : [];
+  const knownGoals = Array.isArray(routine.goals)
+    ? routine.goals.filter((g) => g && typeof g.id === 'string').map((g) => g.id) : [];
 
   const blocks = routine.blocks;
   if (!blocks || typeof blocks !== 'object' || Array.isArray(blocks)) {
@@ -183,11 +549,17 @@ function validateRoutine(routine) {
       return;
     }
     const label = ex.name ? '"' + ex.name + '"' : path;
-    ['name', 'dose', 'category', 'why'].forEach((f) => {
+    ['name', 'dose', 'goals', 'why'].forEach((f) => {
       if (!(f in ex)) errors.push(path + ' (' + label + '): missing required field "' + f + '"');
     });
-    if (ex.category && !knownCats.includes(ex.category)) {
-      errors.push(path + ' (' + label + '): unknown category "' + ex.category + '"');
+    if ('goals' in ex) {
+      if (!Array.isArray(ex.goals) || ex.goals.length === 0) {
+        errors.push(path + ' (' + label + '): goals must be a non-empty array of goal ids');
+      } else {
+        ex.goals.forEach((id) => {
+          if (!knownGoals.includes(id)) errors.push(path + ' (' + label + '): unknown goal "' + id + '"');
+        });
+      }
     }
     if ('dose' in ex) {
       const d = ex.dose;
@@ -200,6 +572,34 @@ function validateRoutine(routine) {
         if (typeof d.amount !== 'number' || !(d.amount > 0)) {
           errors.push(path + ' (' + label + '): dose.amount must be a number > 0 (got ' + JSON.stringify(d.amount) + ')');
         }
+        if ('unit' in d && !UNITS.includes(d.unit)) {
+          errors.push(path + ' (' + label + '): unknown unit "' + d.unit + '" (allowed: ' + UNITS.join(', ') + ')');
+        }
+        if ('weight' in d && !(typeof d.weight === 'number' && d.weight > 0)) {
+          errors.push(path + ' (' + label + '): dose.weight must be a number > 0 (got ' + JSON.stringify(d.weight) + ')');
+        }
+      }
+    }
+    if ('rest' in ex && !(Number.isInteger(ex.rest) && ex.rest > 0)) {
+      errors.push(path + ' (' + label + '): rest must be a positive integer (seconds)');
+    }
+    // v2.5 Auto Superset fields: coarse muscle group + location (+ optional large
+    // equipment) that drive same-location grouping. Free-form, must be strings.
+    ['muscle', 'location', 'largeEquipment'].forEach((k) => {
+      if (k in ex && (typeof ex[k] !== 'string' || !ex[k])) {
+        errors.push(path + ' (' + label + '): ' + k + ' must be a non-empty string');
+      }
+    });
+    if ('progression' in ex) {
+      const p = ex.progression;
+      if (!p || typeof p !== 'object' || Array.isArray(p)) {
+        errors.push(path + ' (' + label + '): progression must be an object');
+      } else {
+        ['step', 'max', 'maxSets', 'weightStep'].forEach((k) => {
+          if (k in p && !(typeof p[k] === 'number' && p[k] > 0)) {
+            errors.push(path + ' (' + label + '): progression.' + k + ' must be a number > 0');
+          }
+        });
       }
     }
   }
@@ -248,19 +648,29 @@ function validateRoutine(routine) {
 // A on odd sessions, B on even.
 function currentDay(session) { return (session % 2 === 1) ? 'A' : 'B'; }
 
-// dayLock + aerial eligibility for pools.
-function eligible(ex, day, aerial) {
-  if (ex.dayLock && ex.dayLock !== day) return false;   // dayLock "A" only shows on A days
-  if (ex.aerialOnly && !aerial) return false;           // aerial-only leaves rotation when off
-  return true;
+// Is a goal id currently active? Reads the module-level state.routine (the same
+// coupling selectVariety already relies on; buildSession is always called with
+// st === state, and tests inject a state via module.exports._set).
+function goalActive(id) {
+  const goals = (state && state.routine && state.routine.goals) || [];
+  const g = goals.find((x) => x && x.id === id);
+  return !!(g && g.active);
 }
 
-// Apply aerial swap to a display copy (category tag + why text).
-function resolveExercise(ex, aerial) {
-  if (aerial && ex.aerialAlt) {
-    return Object.assign({}, ex, { category: ex.aerialAlt.category, why: ex.aerialAlt.why });
-  }
-  return ex;
+// Goal lookups for rendering (color chip + label).
+function goalById(id) {
+  const goals = (state && state.routine && state.routine.goals) || [];
+  return goals.find((g) => g && g.id === id) || null;
+}
+function goalColor(id) { const g = goalById(id); return (g && g.colorId) || 'gray'; }
+function goalName(id) { const g = goalById(id); return (g && g.name) || id; }
+
+// dayLock + goal eligibility for pools (Feature A). A move shows only if at
+// least one of its goal tags is currently active.
+function eligible(ex, day) {
+  if (ex.dayLock && ex.dayLock !== day) return false;   // dayLock "A" only shows on A days
+  const goals = ex.goals || [];
+  return goals.some((id) => goalActive(id));
 }
 
 /*
@@ -278,8 +688,8 @@ function resolveExercise(ex, aerial) {
  * always called as buildSession(state), so st === state and this is consistent;
  * tests inject a log via module.exports._set(state).
  */
-function selectVariety(pool, count, session, day, aerial) {
-  const elig = pool.filter((ex) => eligible(ex, day, aerial));
+function selectVariety(pool, count, session, day) {
+  const elig = pool.filter((ex) => eligible(ex, day));
   const n = Math.min(Math.max(count, 0), elig.length);
   const log = (state && state.log) || [];
 
@@ -310,22 +720,25 @@ function leastRecentlyCompleted(elig, log) {
     .map((o) => o.ex);
 }
 
-// A skill/core block = eligible staples (dayLock-filtered) + N variety slots.
-function buildStapleBlock(block, varietyCount, session, day, aerial) {
-  const staples = block.staples
-    .filter((ex) => eligible(ex, day, aerial))
-    .map((ex) => resolveExercise(ex, aerial));
-  const variety = selectVariety(block.varietyPool || [], varietyCount, session, day, aerial)
-    .map((ex) => resolveExercise(ex, aerial));
+/*
+ * A skill/core block (Feature B): `count` = TOTAL items to show. Day/goal
+ * eligible staples fill first (in listed order, truncated to count); if there
+ * aren't enough staples, variety picks fill the remainder. count 1 -> exactly
+ * the first eligible staple.
+ */
+function buildStapleBlock(block, count, session, day) {
+  const staples = (block.staples || []).filter((ex) => eligible(ex, day));
+  const n = Math.max(count, 0);
+  if (staples.length >= n) return staples.slice(0, n);
+  const variety = selectVariety(block.varietyPool || [], n - staples.length, session, day);
   return staples.concat(variety);
 }
 
 // weights/machines: show the first N eligible listed exercises (slider = a count).
-function takeN(arr, n, day, aerial) {
+function takeN(arr, n, day) {
   return (arr || [])
-    .filter((ex) => eligible(ex, day, aerial))
-    .slice(0, Math.max(n, 0))
-    .map((ex) => resolveExercise(ex, aerial));
+    .filter((ex) => eligible(ex, day))
+    .slice(0, Math.max(n, 0));
 }
 
 /*
@@ -333,10 +746,10 @@ function takeN(arr, n, day, aerial) {
  * slider range is [1,2] over three items, so a count doesn't map cleanly.
  * Choice: cool === 1 -> "short" (only alwaysInShort items); cool >= 2 -> full list.
  */
-function buildCooldown(arr, cool, day, aerial) {
-  let list = (arr || []).filter((ex) => eligible(ex, day, aerial));
+function buildCooldown(arr, cool, day) {
+  let list = (arr || []).filter((ex) => eligible(ex, day));
   if (cool <= 1) list = list.filter((ex) => ex.alwaysInShort);
-  return list.map((ex) => resolveExercise(ex, aerial));
+  return list;
 }
 
 // Produce the ordered blocks for a session. Pure given `st`.
@@ -349,19 +762,19 @@ function buildSession(st) {
   const blocks = [];
 
   if (b.warmup && b.warmup.length) {
-    blocks.push({ key: 'warmup', title: 'Warm-up', info: true,
-      exercises: b.warmup.map((ex) => resolveExercise(ex, s.aerial)) });
+    blocks.push({ key: 'warmup', title: 'Warm-up',
+      exercises: (b.warmup || []).filter((ex) => eligible(ex, day)) });
   }
   blocks.push({ key: 'skill', title: 'Skill',
-    exercises: buildStapleBlock(b.skill, s.skill, session, day, s.aerial) });
+    exercises: buildStapleBlock(b.skill, s.skill, session, day) });
   blocks.push({ key: 'core', title: 'Core',
-    exercises: buildStapleBlock(b.core, s.core, session, day, s.aerial) });
+    exercises: buildStapleBlock(b.core, s.core, session, day) });
   blocks.push({ key: 'weights', title: 'Weights',
-    exercises: takeN(day === 'A' ? b.weightsA : b.weightsB, s.wts, day, s.aerial) });
+    exercises: takeN(day === 'A' ? b.weightsA : b.weightsB, s.wts, day) });
   blocks.push({ key: 'machines', title: 'Machines',
-    exercises: takeN(day === 'A' ? b.machinesA : b.machinesB, s.mach, day, s.aerial) });
+    exercises: takeN(day === 'A' ? b.machinesA : b.machinesB, s.mach, day) });
   blocks.push({ key: 'cooldown', title: 'Cool-down',
-    exercises: buildCooldown(b.cooldown, s.cool, day, s.aerial) });
+    exercises: buildCooldown(b.cooldown, s.cool, day) });
 
   return { session, day, blocks: applySwaps(blocks, st) };
 }
@@ -400,12 +813,12 @@ function applySwaps(blocks, st) {
   const swaps = st.swaps || {};
   if (!Object.keys(swaps).length) return blocks;
   return blocks.map((bl) => ({
-    key: bl.key, title: bl.title, info: bl.info,
+    key: bl.key, title: bl.title,
     exercises: bl.exercises.map((ex) => {
       const repName = swaps[ex.name];
       if (!repName) return ex;
       const rep = findExerciseByName(st.routine, repName);
-      return rep ? resolveExercise(rep, st.settings.aerial) : ex;
+      return rep || ex;
     })
   }));
 }
@@ -413,51 +826,128 @@ function applySwaps(blocks, st) {
 /* --- 5. Doses & intensity overrides (Phase 1) ----------------------------- */
 
 /*
- * Effective dose = base dose, with per-exercise override applied if present.
- * Override display choice: when the amount is overridden we DROP the range
- * (a single explicit number is clearer than a shifted band). Overrides carry
- * both sets & amount so the card always shows a concrete pair.
+ * Progression ladder (Feature D). Each move has an implicit ladder of
+ * { sets, amount } steps. Params come from ex.progression when present, else
+ * are computed from the base dose:
+ *   step: sec/sec/side -> 5, min -> 1, reps-type -> (base >= 12 ? 2 : 1)
+ *   max:  sec-type -> base+30; reps-type ->
+ *         max(round(base*1.5), base + step*2); min -> base+3
+ *   maxSets: dose.sets + 1, clamped to 6
+ * Weighted moves (dose.weight present) additionally carry:
+ *   weight:     the base physical load (lb)
+ *   weightStep: progression.weightStep, else 5 if base weight < 100 else 10
+ */
+function progressionParams(ex) {
+  const d = ex.dose || {};
+  const u = d.unit;
+  const base = d.amount;
+  const p = ex.progression || {};
+  const isSec = (u === 'sec' || u === 'sec/side');
+  const isMin = (u === 'min');
+  let step;
+  if (typeof p.step === 'number') step = p.step;
+  else if (isSec) step = 5;
+  else if (isMin) step = 1;
+  else step = base >= 12 ? 2 : 1;
+  let max;
+  if (typeof p.max === 'number') max = p.max;
+  else if (isSec) max = base + 30;
+  else if (isMin) max = base + 3;
+  else max = Math.max(Math.round(base * 1.5), base + step * 2);
+  let maxSets;
+  if (typeof p.maxSets === 'number') maxSets = p.maxSets;
+  else maxSets = clamp(d.sets + 1, 1, 6);
+  const out = { step: step, max: max, maxSets: maxSets };
+  if (typeof d.weight === 'number' && d.weight > 0) {
+    out.weight = d.weight;
+    out.weightStep = (typeof p.weightStep === 'number' && p.weightStep > 0)
+      ? p.weightStep : (d.weight < 100 ? 5 : 10);
+  }
+  return out;
+}
+
+/*
+ * Build the ordered ladder of { sets, amount } pairs. Starts at the base dose,
+ * climbs amount by `step` until it reaches `max`, then adds a set and resets
+ * the amount to base, repeating until { maxSets, max }. Pure. Exported.
+ *
+ * Weighted moves use DOUBLE progression instead: reps climb from base amount to
+ * `max` by `step` at a fixed set count, then the weight bumps by `weightStep`
+ * and reps reset — four weight tiers beyond the base (five total, so ladder
+ * length = repLevels × 5). Sets stay at the base count (maxSets is ignored).
+ * Each entry is { sets, amount, weight }.
+ */
+function progressionLadder(ex) {
+  const d = ex.dose || {};
+  const startAmt = d.amount;
+  const params = progressionParams(ex);
+  const { step, max } = params;
+
+  if (params.weight != null) {
+    const ladder = [];
+    for (let tier = 0; tier < 5; tier++) {
+      const weight = params.weight + tier * params.weightStep;
+      let amount = startAmt;
+      ladder.push({ sets: d.sets, amount: amount, weight: weight });
+      while (amount < max && step > 0) {
+        amount = Math.min(max, amount + step);
+        ladder.push({ sets: d.sets, amount: amount, weight: weight });
+      }
+    }
+    return ladder;
+  }
+
+  const maxSets = params.maxSets;
+  const ladder = [];
+  let sets = d.sets;
+  const topSets = Math.max(sets, maxSets);
+  while (true) {
+    let amount = startAmt;
+    ladder.push({ sets: sets, amount: amount });
+    while (amount < max && step > 0) {
+      amount = Math.min(max, amount + step);
+      ladder.push({ sets: sets, amount: amount });
+    }
+    if (sets >= topSets) break;
+    sets += 1;
+  }
+  return ladder;
+}
+
+// Current ladder level for a move (0 = base).
+function currentLevel(ex) {
+  const ov = state.intensity[ex.name];
+  return ov && typeof ov.level === 'number' ? ov.level : 0;
+}
+
+/*
+ * Effective dose = ladder[level]. Level 0 shows the base dose; any higher level
+ * shows a single concrete pair and flags overridden.
  */
 function effectiveDose(ex) {
   const d = ex.dose;
-  const ov = state.intensity[ex.name];
-  if (ov) return { sets: ov.sets, amount: ov.amount, unit: d.unit, overridden: true };
-  return { sets: d.sets, amount: d.amount, unit: d.unit, range: d.range };
+  const level = currentLevel(ex);
+  if (!level) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
+  const ladder = progressionLadder(ex);
+  const entry = ladder[clamp(level, 0, ladder.length - 1)];
+  return { sets: entry.sets, amount: entry.amount, unit: d.unit, weight: entry.weight, overridden: true };
 }
 
-// "3 × 30–45 sec" / "3 × 15 reps/side" / warmup "As usual".
+// "3 × 30 sec" / "3 × 15 reps/side" / "1 × 20 sec/side" / "3 × 8 reps @ 180 lb".
 function formatDose(eff) {
-  if (eff.unit === 'as usual') return 'As usual';
-  const amt = eff.range ? (eff.amount + '–' + eff.range) : String(eff.amount);
-  return eff.sets + ' × ' + amt + ' ' + eff.unit;
+  return eff.sets + ' × ' + eff.amount + ' ' + eff.unit +
+    (eff.weight != null ? ' @ ' + eff.weight + ' lb' : '');
 }
 
-// Amount step: ±5 sec, ±1 min, ±1 rep, ±2 for high-rep (default amount >= 12).
-function amountStep(ex) {
-  const u = ex.dose.unit;
-  if (u === 'sec') return 5;
-  if (u === 'min') return 1;
-  return ex.dose.amount >= 12 ? 2 : 1;  // reps / reps/side
-}
-
-function amountLabel(unit) {
-  if (unit === 'sec') return 'Seconds';
-  if (unit === 'min') return 'Minutes';
-  return 'Reps';
-}
-
-function ensureOverride(ex) {
-  if (!state.intensity[ex.name]) {
-    const eff = effectiveDose(ex);
-    state.intensity[ex.name] = { sets: eff.sets, amount: eff.amount };
-  }
-  return state.intensity[ex.name];
-}
-
-function stepOverride(ex, field, dir) {
-  const ov = ensureOverride(ex);
-  if (field === 'sets') ov.sets = clamp(ov.sets + dir, 1, 6);
-  else ov.amount = Math.max(1, ov.amount + amountStep(ex) * dir);
+// Move up (dir +1 = harder) or down the ladder; level 0 clears the override.
+function stepLevel(ex, dir) {
+  const ladder = progressionLadder(ex);
+  // Clamp the stored level first so a stale out-of-range override (from a
+  // routine edit that shortened the ladder) doesn't swallow the first press.
+  const cur = clamp(currentLevel(ex), 0, ladder.length - 1);
+  const next = clamp(cur + dir, 0, ladder.length - 1);
+  if (next <= 0) delete state.intensity[ex.name];
+  else state.intensity[ex.name] = { level: next };
   saveState();
   render();
 }
@@ -466,6 +956,18 @@ function resetOverride(ex) {
   delete state.intensity[ex.name];
   saveState();
   render();
+}
+
+/*
+ * Rest-clock target seconds (Feature E). Explicit ex.rest wins; else per-block
+ * defaults: core 60, skill/weights/machines 90; warmup/cooldown have no timer.
+ */
+function restTarget(ex, blockKey) {
+  if (blockKey === 'warmup' || blockKey === 'cooldown') return null;
+  if (typeof ex.rest === 'number') return ex.rest;
+  if (blockKey === 'core') return 60;
+  if (blockKey === 'skill' || blockKey === 'weights' || blockKey === 'machines') return 90;
+  return null;
 }
 
 /* --- 6. Rendering --------------------------------------------------------- */
@@ -492,7 +994,44 @@ function render() {
     view.innerHTML = renderToday(build);   // populates renderedExercises
     renderHeader(build);
   }
+  syncRestTicker();
   window.scrollTo(0, y);
+}
+
+/* --- Rest clock ticker (Feature E) --------------------------------------- *
+ * A single 1s interval that ONLY rewrites the #rest-timer text node — never a
+ * full re-render. The element carries data-started / data-target so the tick
+ * needs no state lookup; render() starts/stops the interval by presence. */
+let restTicker = null;
+
+function tickRest() {
+  if (typeof document === 'undefined') return;
+  const el = document.getElementById('rest-timer');
+  if (!el) { stopRestTicker(); return; }
+  const started = +el.dataset.started;
+  const target = +el.dataset.target;
+  const elapsed = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  const done = elapsed >= target;
+  el.className = 'rest-clock' + (done ? ' rest-done' : '');
+  el.textContent = restClockText(elapsed, target, done);
+}
+
+function startRestTicker() { if (!restTicker) restTicker = setInterval(tickRest, 1000); }
+function stopRestTicker() { if (restTicker) { clearInterval(restTicker); restTicker = null; } }
+
+function syncRestTicker() {
+  if (typeof document === 'undefined') return;
+  if (document.getElementById('rest-timer')) startRestTicker();
+  else stopRestTicker();
+}
+
+// m:ss formatting and the "Rest 0:47 / 1:30" / "Go 1:35 / 1:30" label.
+function mmss(sec) {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + (s < 10 ? '0' + s : s);
+}
+function restClockText(elapsed, target, done) {
+  return (done ? 'Go ' : 'Rest ') + mmss(elapsed) + ' / ' + mmss(target);
 }
 
 function renderHeader(build, subtitle) {
@@ -522,64 +1061,392 @@ function renderTabs() {
 function renderToday(build) {
   renderedExercises = [];
   let html = renderSuggestions(build);
+
+  // Feature A safety note: warn only when goal settings emptied the skill block.
+  const skillBlock = build.blocks.find((bl) => bl.key === 'skill');
+  if (skillBlock && !skillBlock.exercises.length) {
+    html += '<p class="muted skill-empty">All skills filtered by goal settings.</p>';
+  }
+
+  // v2.5: when Auto Superset is on, plan the skill/core supersets up front so a
+  // grouped move renders once (as a combined card at its group's earliest member)
+  // and its other members are skipped wherever they fall (even a later block).
+  const ssMap = state.autoSuperset ? supersetPlan(build) : null;
+
   build.blocks.forEach((bl) => {
     if (!bl.exercises.length) return;   // skip empty blocks (e.g. machines at count 0)
-    html += '<section class="block"><h2 class="block-title">' + escapeHtml(bl.title) + '</h2>';
-    bl.exercises.forEach((ex) => {
-      const idx = renderedExercises.length;
-      renderedExercises.push(ex);
-      html += renderCard(ex, idx, bl.key === 'warmup');
-    });
-    html += '</section>';
+    let inner = '';
+    if (bl.key === 'warmup') {
+      // v2.4.1: collapse the warm-up block's RENDERING to one card per contiguous
+      // group (data model is untouched — moves still live individually in the
+      // routine). A move with no group renders as its own card, unchanged.
+      warmupGroups(bl.exercises).forEach((item) => {
+        const idx = renderedExercises.length;
+        if (item.kind === 'group') {
+          renderedExercises.push(item.card);
+          inner += renderWarmupGroupCard(item.card, idx);
+        } else {
+          renderedExercises.push(item.ex);
+          inner += renderCard(item.ex, idx, bl.key);
+        }
+      });
+    } else if (ssMap && (bl.key === 'skill' || bl.key === 'core')) {
+      // v2.5: grouped moves collapse into one superset card at the anchor
+      // (members[0]); non-anchor members are skipped here (rendered at the
+      // anchor's block). Ungrouped moves render as normal individual cards.
+      bl.exercises.forEach((ex) => {
+        const card = ssMap.get(ex);
+        if (card) {
+          if (card.members[0].ex !== ex) return;      // already rendered at the anchor
+          const idx = renderedExercises.length;
+          renderedExercises.push(card);
+          inner += renderSupersetCard(card, idx);
+        } else {
+          const idx = renderedExercises.length;
+          renderedExercises.push(ex);
+          inner += renderCard(ex, idx, bl.key);
+        }
+      });
+    } else {
+      bl.exercises.forEach((ex) => {
+        const idx = renderedExercises.length;
+        renderedExercises.push(ex);
+        inner += renderCard(ex, idx, bl.key);
+      });
+    }
+    if (!inner) return;   // every move here was absorbed into a superset anchored elsewhere
+    html += '<section class="block"><h2 class="block-title">' + escapeHtml(bl.title) + '</h2>' +
+      inner + '</section>';
   });
   html += renderFinish();
   return html;
 }
 
-function renderCard(ex, idx, isInfo) {
-  const eff = effectiveDose(ex);
-  const cat = state.routine.categories[ex.category] || { label: ex.category, colorId: 'gray' };
-  const done = !!state.checks[ex.name];
-  const overridden = !!state.intensity[ex.name];
-  const expanded = ui.expanded.has(ex.name);
-  const steppable = !isInfo && STEPPABLE.includes(ex.dose.unit);
+/*
+ * v2.4.1: fold the warm-up block's moves into render items — one per contiguous
+ * run of moves sharing a `group`, plus standalone items for ungrouped moves.
+ * Pure; exported for tests. Each group item carries a synthetic `card` object
+ * whose stable key is 'warmup:' + group (so state.checks / progress key off the
+ * group, not the individual moves) and whose goals are the union of its moves'
+ * tags (first-appearance order; first tag drives the card color).
+ */
+function warmupGroups(exercises) {
+  const items = [];
+  let cur = null;
+  (exercises || []).forEach((ex) => {
+    const g = ex && ex.group;
+    if (!g) { cur = null; items.push({ kind: 'single', ex: ex }); return; }
+    if (cur && cur.groupName === g) { cur.moves.push(ex); return; }
+    cur = { kind: 'group', groupName: g, moves: [ex] };
+    items.push(cur);
+  });
+  items.forEach((it) => {
+    if (it.kind !== 'group') return;
+    const goals = [];
+    it.moves.forEach((m) => (m.goals || []).forEach((id) => { if (!goals.includes(id)) goals.push(id); }));
+    it.card = { name: 'warmup:' + it.groupName, isWarmupGroup: true, groupName: it.groupName, moves: it.moves, goals: goals };
+  });
+  return items;
+}
+
+// One card for a whole warm-up group: union chips, group name as the title, a
+// compact "Name — dose[, tempoNote]" line per move, and a single group checkbox.
+// No steppers/set-circles (warm-up has no progression UI); no expand affordance.
+function renderWarmupGroupCard(card, idx) {
+  const goals = card.goals.length ? card.goals : ['recovery'];
+  const mainColor = goalColor(goals[0]);
+  const done = !!state.checks[card.name];
+  const chips = goals.map((id, i) =>
+    '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
+      escapeHtml(goalName(id)) + '</span>').join('');
+  const list = card.moves.map((m) => {
+    const tempo = (m.dose && m.dose.tempoNote) ? ', ' + escapeHtml(m.dose.tempoNote) : '';
+    return '<li class="wu-move">' + escapeHtml(m.name) + ' — ' +
+      escapeHtml(formatDose(effectiveDose(m))) + tempo + '</li>';
+  }).join('');
 
   return '' +
-    '<div class="card cat-' + escapeHtml(cat.colorId) +
+    '<div class="card cat-' + escapeHtml(mainColor) + (done ? ' is-done' : '') + '">' +
+      '<div class="card-main">' +
+        '<div class="card-body">' +
+          '<div class="chips">' + chips + '</div>' +
+          '<div class="card-name">' + escapeHtml(card.groupName) + '</div>' +
+          '<ul class="wu-list">' + list + '</ul>' +
+        '</div>' +
+        '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
+          (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.groupName) + ' done">' +
+      '</div>' +
+    '</div>';
+}
+
+/* --- v2.5 Auto Superset -------------------------------------------------- *
+ * Group same-location skill & core moves into one combined "superset" card so
+ * they're trained as alternating rounds. Toggle: state.autoSuperset (default ON;
+ * when off the Today view renders every move as its own card, unchanged). Only
+ * skill- and core-block moves that carry BOTH `muscle` and `location` ever
+ * qualify — weights, machines, warm-up and cool-down never superset.
+ */
+
+/*
+ * Greedy grouping (pure; exported for tests). `members` is an ordered list of
+ * { ex, block } — skill first, then core, in session order, pre-filtered to
+ * moves that have both `muscle` and `location`. Within a group, all enforced:
+ *   - every member shares the same `location`,
+ *   - no two members share the same `muscle`,
+ *   - at most one member carries `largeEquipment`.
+ * Each move joins the FIRST existing group it doesn't conflict with, else starts
+ * a new group. No size cap (giant sets allowed). Size-1 groups are returned too;
+ * the caller renders those as normal individual cards.
+ */
+function groupSupersets(members) {
+  const groups = [];
+  (members || []).forEach((m) => {
+    if (!m || !m.ex || !m.ex.muscle || !m.ex.location) return;
+    const loc = m.ex.location;
+    let target = null;
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi];
+      if (g.location !== loc) continue;
+      if (g.members.some((x) => x.ex.muscle === m.ex.muscle)) continue;          // muscle clash
+      const large = g.members.filter((x) => x.ex.largeEquipment).length + (m.ex.largeEquipment ? 1 : 0);
+      if (large > 1) continue;                                                   // >1 large equipment
+      target = g; break;
+    }
+    if (target) target.members.push(m);
+    else groups.push({ location: loc, members: [m] });
+  });
+  return groups;
+}
+
+/*
+ * Render plan for the skill/core blocks when Auto Superset is on. Returns a Map
+ * from each grouped exercise OBJECT to its superset card, ONLY for groups of
+ * size >= 2 (size-1 groups are omitted so those moves render as normal cards).
+ * The card carries a stable synthetic `name` (state.checks / progress / the
+ * single global rest clock all key off it), its ordered members with their block
+ * (needed for restTarget), the union of member goals, and a Superset/Giant-set
+ * label. The card renders once, at its earliest member (members[0], the anchor).
+ */
+function supersetPlan(build) {
+  const members = [];
+  (build.blocks || []).forEach((bl) => {
+    if (bl.key !== 'skill' && bl.key !== 'core') return;
+    bl.exercises.forEach((ex) => {
+      if (ex && ex.muscle && ex.location) members.push({ ex: ex, block: bl.key });
+    });
+  });
+  const map = new Map();
+  groupSupersets(members).forEach((g) => {
+    if (g.members.length < 2) return;
+    const moves = g.members.map((m) => m.ex);
+    const goals = [];
+    moves.forEach((ex) => (ex.goals || []).forEach((id) => { if (!goals.includes(id)) goals.push(id); }));
+    const card = {
+      name: 'superset:' + moves.map((ex) => ex.name).join('|'),
+      isSuperset: true,
+      location: g.location,
+      members: g.members,                                   // [{ ex, block }] ordered; anchor = members[0]
+      moves: moves,
+      goals: goals,
+      label: moves.length >= 3 ? 'Giant set' : 'Superset'
+    };
+    g.members.forEach((m) => map.set(m.ex, card));
+  });
+  return map;
+}
+
+// Max of the members' individual rest targets (each in its own block's terms).
+// null if none of the members carry a rest target.
+function supersetRestTarget(card) {
+  let max = null;
+  card.members.forEach((m) => {
+    const t = restTarget(m.ex, m.block);
+    if (typeof t === 'number' && (max == null || t > max)) max = t;
+  });
+  return max;
+}
+
+// Rounds for a superset card = the most sets any member does (members may differ,
+// e.g. a 2× move paired with two 3× moves). One round taps every member once.
+function supersetRounds(card) {
+  let max = 0;
+  card.moves.forEach((ex) => { const s = effectiveDose(ex).sets; if (s > max) max = s; });
+  return max;
+}
+
+// Live rest clock owned by a superset card (mirrors renderRestClock). The single
+// global rest clock is aimed at the card's synthetic name on each round tap.
+function renderSupersetRestClock(card) {
+  const r = state.rest;
+  if (!r || r.name !== card.name || !r.startedAt) return '';
+  if ((state.setsDone[card.name] || 0) >= supersetRounds(card)) return '';   // hide once all rounds done
+  const target = supersetRestTarget(card);
+  if (target == null) return '';
+  const elapsed = Math.max(0, Math.floor((Date.now() - r.startedAt) / 1000));
+  const done = elapsed >= target;
+  return '<div class="rest-clock' + (done ? ' rest-done' : '') + '" id="rest-timer" ' +
+    'data-started="' + r.startedAt + '" data-target="' + target + '">' +
+    escapeHtml(restClockText(elapsed, target, done)) + '</div>';
+}
+
+// One combined card for a superset group (mirrors renderWarmupGroupCard): union
+// chips, a Superset/Giant-set label, one "Name — dose" row per member (each
+// carries its own per-move progression via effectiveDose), an alternate-rounds
+// hint, and a single group check-off. No steppers/set-circles (like warm-up).
+function renderSupersetCard(card, idx) {
+  const goals = card.goals.length ? card.goals : ['str'];
+  const mainColor = goalColor(goals[0]);
+  const done = !!state.checks[card.name];
+  const expanded = ui.expanded.has(card.name);
+  const chips = goals.map((id, i) =>
+    '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
+      escapeHtml(goalName(id)) + '</span>').join('');
+  const rows = card.moves.map((ex) => {
+    const over = currentLevel(ex) > 0;
+    return '<li class="ss-move">' +
+      '<span class="ss-move-name">' + escapeHtml(ex.name) +
+        (over ? ' <span class="mod">modified</span>' : '') + '</span>' +
+      '<span class="ss-move-dose">' + escapeHtml(formatDose(effectiveDose(ex))) + '</span>' +
+      '</li>';
+  }).join('');
+
+  return '' +
+    '<div class="card ss-card cat-' + escapeHtml(mainColor) +
       (done ? ' is-done' : '') + (expanded ? ' is-open' : '') + '">' +
       '<div class="card-main" data-action="expand" data-idx="' + idx + '">' +
-        '<span class="tag">' + escapeHtml(cat.label) + '</span>' +
         '<div class="card-body">' +
+          '<div class="chips">' + chips + '</div>' +
+          '<div class="card-name"><span class="ss-label">' + escapeHtml(card.label) + '</span></div>' +
+          '<ul class="ss-list">' + rows + '</ul>' +
+          '<div class="ss-hint">Alternate moves, rest after each round</div>' +
+          renderRoundDots(card, idx) +
+          renderSupersetRestClock(card) +
+        '</div>' +
+        '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
+          (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.label) + ' done">' +
+      '</div>' +
+      (expanded ? renderSupersetProgression(card, idx) : '') +
+    '</div>';
+}
+
+// Whole-superset round dots (mirror renderSetCircles): one tappable dot per round,
+// filled up to the card's round counter (state.setsDone[card.name]).
+function renderRoundDots(card, idx) {
+  const total = supersetRounds(card);
+  if (total < 1) return '';
+  const done = state.setsDone[card.name] || 0;
+  let dots = '';
+  for (let k = 0; k < total; k++) {
+    dots += '<button class="set-dot' + (k < done ? ' filled' : '') + '" ' +
+      'data-action="round-done" data-idx="' + idx + '" data-round="' + k + '" ' +
+      'aria-label="Round ' + (k + 1) + '"></button>';
+  }
+  return '<div class="sets-row">' + dots + '</div>';
+}
+
+// Per-member progression controls, shown when the superset card is expanded.
+// Reuses renderProgression (with a member index so the shared prog/reset handlers
+// resolve the member off the card), one indented block per member.
+function renderSupersetProgression(card, idx) {
+  return '<div class="ss-prog">' + card.members.map((m, i) =>
+    '<div class="ss-prog-move">' +
+      '<div class="ss-prog-name">' + escapeHtml(m.ex.name) + '</div>' +
+      renderProgression(m.ex, idx, i) +
+    '</div>').join('') + '</div>';
+}
+
+function renderCard(ex, idx, blockKey) {
+  const eff = effectiveDose(ex);
+  const goals = (ex.goals && ex.goals.length) ? ex.goals : ['str'];
+  const mainColor = goalColor(goals[0]);
+  const done = !!state.checks[ex.name];
+  const overridden = currentLevel(ex) > 0;
+  const expanded = ui.expanded.has(ex.name);
+  const showProg = expanded && blockKey !== 'warmup' && blockKey !== 'cooldown';
+
+  const chips = goals.map((id, i) =>
+    '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
+      escapeHtml(goalName(id)) + '</span>').join('');
+
+  return '' +
+    '<div class="card cat-' + escapeHtml(mainColor) +
+      (done ? ' is-done' : '') + (expanded ? ' is-open' : '') + '">' +
+      '<div class="card-main" data-action="expand" data-idx="' + idx + '">' +
+        '<div class="card-body">' +
+          '<div class="chips">' + chips + '</div>' +
           '<div class="card-name">' + escapeHtml(ex.name) +
             (overridden ? ' <span class="mod">modified</span>' : '') + '</div>' +
           '<div class="dose">' + escapeHtml(formatDose(eff)) + '</div>' +
-          '<div class="why">' + escapeHtml(ex.why) + '</div>' +
+          renderSetCircles(ex, idx, blockKey, eff) +
+          renderRestClock(ex, blockKey, eff) +
         '</div>' +
         '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
           (done ? ' checked' : '') + ' aria-label="Mark done">' +
       '</div>' +
-      (expanded && steppable ? renderSteppers(ex, idx, overridden) : '') +
+      (showProg ? renderProgression(ex, idx) : '') +
     '</div>';
 }
 
-function renderSteppers(ex, idx, overridden) {
-  const eff = effectiveDose(ex);
-  // Phase 4, heuristic #4: subtle "ready to add?" marker when this exercise has
-  // been completed 4+ times at the current effective intensity.
-  const ready = progressionReady(ex.name, eff, state.log || []);
-  const row = (label, field, val) =>
-    '<div class="stepper">' +
-      '<span class="stepper-label">' + escapeHtml(label) + '</span>' +
-      '<button data-action="step" data-idx="' + idx + '" data-field="' + field + '" data-dir="-1" aria-label="Decrease ' + field + '">−</button>' +
-      '<span class="stepper-val">' + val + '</span>' +
-      '<button data-action="step" data-idx="' + idx + '" data-field="' + field + '" data-dir="1" aria-label="Increase ' + field + '">+</button>' +
-    '</div>';
-  return '<div class="steppers">' +
-      row('Sets', 'sets', eff.sets) +
-      row(amountLabel(ex.dose.unit), 'amount', eff.amount) +
-      (ready ? '<span class="prog-hint" title="Completed 4+ times at this intensity">ready to add?</span>' : '') +
-      (overridden ? '<button class="reset" data-action="reset" data-idx="' + idx + '">Reset to default</button>' : '') +
-    '</div>';
+// Per-set tracking circles (Feature E). Warm-up shows them only for multi-set
+// moves (e.g. the slow-eccentric calf raise); single-set warm-ups just check.
+function renderSetCircles(ex, idx, blockKey, eff) {
+  const total = eff.sets;
+  if (blockKey === 'warmup' && total <= 1) return '';
+  if (total < 1) return '';
+  const done = state.setsDone[ex.name] || 0;
+  let dots = '';
+  for (let k = 0; k < total; k++) {
+    dots += '<button class="set-dot' + (k < done ? ' filled' : '') + '" ' +
+      'data-action="set-done" data-idx="' + idx + '" data-set="' + k + '" ' +
+      'data-block="' + escapeHtml(blockKey) + '" aria-label="Set ' + (k + 1) + '"></button>';
+  }
+  return '<div class="sets-row">' + dots + '</div>';
+}
+
+// Live rest clock — only on the card that owns the active global rest timer.
+function renderRestClock(ex, blockKey, eff) {
+  const r = state.rest;
+  if (!r || r.name !== ex.name || !r.startedAt) return '';
+  if ((state.setsDone[ex.name] || 0) >= eff.sets) return '';
+  const target = restTarget(ex, blockKey);
+  if (target == null) return '';
+  const elapsed = Math.max(0, Math.floor((Date.now() - r.startedAt) / 1000));
+  const done = elapsed >= target;
+  return '<div class="rest-clock' + (done ? ' rest-done' : '') + '" id="rest-timer" ' +
+    'data-started="' + r.startedAt + '" data-target="' + target + '">' +
+    escapeHtml(restClockText(elapsed, target, done)) + '</div>';
+}
+
+// Progression ladder controls (Feature D) — behind expand, hidden for warmup/cooldown.
+function renderProgression(ex, idx, memberIdx) {
+  const ladder = progressionLadder(ex);
+  const level = clamp(currentLevel(ex), 0, ladder.length - 1);
+  const atTop = level >= ladder.length - 1;
+  const atBottom = level <= 0;
+  const ready = progressionReady(ex.name, effectiveDose(ex), state.log || []);
+  const upReady = ready && !atTop;
+  // On a superset card the buttons carry the member index so the shared prog/reset
+  // handlers resolve the member off the card (members aren't in renderedExercises).
+  const mAttr = memberIdx != null ? ' data-member="' + memberIdx + '"' : '';
+
+  let h = '<div class="progression">';
+  h += '<div class="prog-controls">';
+  h += '<button class="btn small prog-btn" data-action="prog" data-idx="' + idx + '"' + mAttr + ' data-dir="-1"' +
+    (atBottom ? ' disabled' : '') + '>▼ Easier</button>';
+  h += '<button class="btn small prog-btn prog-up' + (upReady ? ' ready' : '') + '" ' +
+    'data-action="prog" data-idx="' + idx + '"' + mAttr + ' data-dir="1"' + (atTop ? ' disabled' : '') + '>' +
+    '▲ Progress' + (upReady ? '<span class="ready-pip" title="Completed 4+ times at this intensity"></span>' : '') +
+    '</button>';
+  if (!atBottom) h += '<button class="btn small ghost reset" data-action="reset" data-idx="' + idx + '"' + mAttr + '>Reset</button>';
+  h += '</div>';
+  // For weighted moves, echo the effective dose so weight bumps are visible as
+  // you step (non-weighted keeps the plain "Step X of Y" position line).
+  const weighted = ex.dose && typeof ex.dose.weight === 'number';
+  h += '<div class="prog-pos">' + (atTop
+    ? 'Ladder complete — ask Coach for the next move'
+    : 'Step ' + (level + 1) + ' of ' + ladder.length +
+      (weighted ? ' · ' + escapeHtml(formatDose(effectiveDose(ex))) : '')) + '</div>';
+  return h + '</div>';
 }
 
 // Render the suggestion banners (Phase 4) at the very top of the Today view.
@@ -629,15 +1496,32 @@ function renderSettings() {
 
   // Session knobs
   html += '<section class="panel"><h3>Session</h3>' +
-    slider('skill', 'Skill variety slots') +
-    slider('core', 'Core variety slots') +
+    slider('skill', 'Skill slots') +
+    slider('core', 'Core slots') +
     slider('wts', 'Weights exercises') +
     slider('mach', 'Machine exercises') +
     slider('cool', 'Cool-down (1 = short, 2 = full)') +
     '<div class="field toggle">' +
-      '<label for="aerial">Aerial mode</label>' +
-      '<input type="checkbox" id="aerial" data-action="toggle-aerial"' + (s.aerial ? ' checked' : '') + '>' +
-    '</div></section>';
+      '<label for="auto-superset">Auto superset</label>' +
+      '<input type="checkbox" id="auto-superset" data-action="toggle-superset"' +
+        (state.autoSuperset ? ' checked' : '') + '>' +
+    '</div>' +
+    '<p class="muted">Groups same-location skill &amp; core moves into supersets — ' +
+      'one card, alternate the moves, rest after each round.</p>' +
+    '</section>';
+
+  // Goals (Feature A) — toggle each goal; a move drops out when all its tags are off.
+  html += '<section class="panel"><h3>Goals</h3>' +
+    (state.routine.goals || []).map((g) =>
+      '<div class="field toggle">' +
+        '<label for="goal-' + escapeHtml(g.id) + '">' +
+          '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span>' +
+        '</label>' +
+        '<input type="checkbox" id="goal-' + escapeHtml(g.id) + '" data-action="toggle-goal" ' +
+          'data-goal="' + escapeHtml(g.id) + '"' + (g.active ? ' checked' : '') + '>' +
+      '</div>').join('') +
+    '<p class="muted">Turning a goal off removes its moves from rotation.</p>' +
+    '</section>';
 
   // AI routine editing (Phase 5) — password key + model toggle. Optional:
   // everything else in the app works fully with no key set.
@@ -708,12 +1592,18 @@ function onClick(e) {
   const action = el.dataset.action;
   const idx = el.dataset.idx != null ? +el.dataset.idx : null;
   const ex = idx != null ? renderedExercises[idx] : null;
+  // Superset member actions carry data-member; resolve the member off the card
+  // (members aren't in renderedExercises — only the synthetic card is).
+  const memberIdx = el.dataset.member != null ? +el.dataset.member : null;
+  const progEx = (memberIdx != null && ex && ex.members) ? ex.members[memberIdx].ex : ex;
 
   switch (action) {
     case 'check': return;                       // handled by onChange
     case 'expand': toggleExpand(ex); break;
-    case 'step': stepOverride(ex, el.dataset.field, +el.dataset.dir); break;
-    case 'reset': resetOverride(ex); break;
+    case 'prog': stepLevel(progEx, +el.dataset.dir); break;
+    case 'set-done': setDone(ex, el.dataset.block, +el.dataset.set); break;
+    case 'round-done': roundDone(ex, +el.dataset.round); break;
+    case 'reset': resetOverride(progEx); break;
     case 'finish': ui.finishing = true; render(); break;
     case 'cancel-finish': ui.finishing = false; render(); break;
     case 'confirm-finish': doFinish(); break;
@@ -741,15 +1631,43 @@ function onChange(e) {
   const action = el.dataset.action;
   if (action === 'check') {
     const ex = renderedExercises[+el.dataset.idx];
-    if (el.checked) state.checks[ex.name] = true; else delete state.checks[ex.name];
+    // v2.5: a superset card is one check-off covering every member — replicate a
+    // per-move check for each, then (on check) start the shared rest clock.
+    if (ex && ex.isSuperset) {
+      toggleSuperset(ex, el.checked);
+      saveState();
+      render();
+      return;
+    }
+    // v2.4.1: warm-up group cards are a single check unit with no set circles —
+    // skip the setsDone/rest bookkeeping (and don't call effectiveDose on the
+    // doseless synthetic card).
+    if (el.checked) {
+      state.checks[ex.name] = true;
+      if (!ex.isWarmupGroup) {
+        state.setsDone[ex.name] = effectiveDose(ex).sets;  // sync circles with the manual check
+        if (state.rest && state.rest.name === ex.name) state.rest = { name: null, startedAt: null };
+      }
+    } else {
+      delete state.checks[ex.name];
+      if (!ex.isWarmupGroup) {
+        state.setsDone[ex.name] = 0;                // un-checking resets set progress
+        if (state.rest && state.rest.name === ex.name) state.rest = { name: null, startedAt: null };
+      }
+    }
     saveState();
     render();
   } else if (action === 'setting') {
     state.settings[el.dataset.key] = +el.value;
     saveState();
     render();
-  } else if (action === 'toggle-aerial') {
-    state.settings.aerial = el.checked;
+  } else if (action === 'toggle-goal') {
+    const g = (state.routine.goals || []).find((x) => x && x.id === el.dataset.goal);
+    if (g) g.active = el.checked;
+    saveState();
+    render();
+  } else if (action === 'toggle-superset') {
+    state.autoSuperset = el.checked;   // v2.5 Auto Superset on/off
     saveState();
     render();
   } else if (action === 'import') {
@@ -764,10 +1682,119 @@ function onChange(e) {
   }
 }
 
+/*
+ * v2.5: check/uncheck a whole superset card. Replicates a normal card check-off
+ * for EACH member (state.checks + setsDone sync + clearing that member's rest
+ * clock), and keeps the synthetic card key in state.checks so the progress bar
+ * and the card's own done state count it as one unit. finishSession still logs
+ * each member individually by name (it reads the raw build, not the card). On
+ * check-off it (re)starts the single global rest clock aimed at the card, with
+ * target = max of the members' rest targets (Feature E; "rest after each round").
+ */
+function toggleSuperset(card, checked) {
+  const clearIf = (name) => {
+    if (state.rest && state.rest.name === name) state.rest = { name: null, startedAt: null };
+  };
+  if (checked) {
+    state.checks[card.name] = true;
+    state.setsDone[card.name] = supersetRounds(card);      // round dots all filled
+    card.moves.forEach((ex) => {
+      state.checks[ex.name] = true;
+      state.setsDone[ex.name] = effectiveDose(ex).sets;   // sync set circles as a manual check does
+      clearIf(ex.name);
+    });
+    const target = supersetRestTarget(card);
+    if (target != null && target > 0) state.rest = { name: card.name, startedAt: Date.now() };
+  } else {
+    delete state.checks[card.name];
+    state.setsDone[card.name] = 0;                         // clear round counter
+    card.moves.forEach((ex) => {
+      delete state.checks[ex.name];
+      state.setsDone[ex.name] = 0;                         // un-checking resets set progress
+      clearIf(ex.name);
+    });
+    clearIf(card.name);
+  }
+}
+
+/*
+ * Tap a whole-superset round dot (mirrors setDone). Tapping the next dot completes
+ * a round: bumps the card's round counter and each member's setsDone (capped at
+ * that member's own sets), then (re)starts the shared rest clock aimed at the card.
+ * Tapping the last-filled dot undoes: decrements the counter and every member whose
+ * setsDone equals the round being undone (exact reverse of the cap-aware bump).
+ * Completing the final round auto-checks the whole card (as the checkbox would);
+ * dropping below complete unchecks it.
+ */
+function roundDone(card, k) {
+  if (!card || !card.isSuperset) return;
+  const rounds = supersetRounds(card);
+  const cur = state.setsDone[card.name] || 0;
+  if (k === cur) {
+    state.setsDone[card.name] = cur + 1;
+    card.moves.forEach((ex) => {
+      const s = effectiveDose(ex).sets;
+      if ((state.setsDone[ex.name] || 0) < s) state.setsDone[ex.name] = (state.setsDone[ex.name] || 0) + 1;
+    });
+    const target = supersetRestTarget(card);
+    if (target != null) state.rest = { name: card.name, startedAt: Date.now() };
+  } else if (k === cur - 1) {
+    state.setsDone[card.name] = cur - 1;
+    card.moves.forEach((ex) => {
+      if ((state.setsDone[ex.name] || 0) === cur) state.setsDone[ex.name] = cur - 1;
+    });
+  } else {
+    return;
+  }
+  const now = state.setsDone[card.name];
+  if (now >= rounds) {
+    // Final round done — behave exactly as a manual check-off, but no post-round
+    // rest clock (matching setDone stopping the clock on the final set).
+    state.checks[card.name] = true;
+    card.moves.forEach((ex) => { state.checks[ex.name] = true; state.setsDone[ex.name] = effectiveDose(ex).sets; });
+    if (state.rest && state.rest.name === card.name) state.rest = { name: null, startedAt: null };
+  } else if (state.checks[card.name]) {
+    delete state.checks[card.name];                        // dropped below complete — unmark
+    card.moves.forEach((ex) => { delete state.checks[ex.name]; });
+  }
+  saveState();
+  render();
+}
+
 function toggleExpand(ex) {
   if (!ex) return;
   if (ui.expanded.has(ex.name)) ui.expanded.delete(ex.name);
   else ui.expanded.add(ex.name);
+  render();
+}
+
+/*
+ * Feature E: tap a set circle. Tapping the next unfilled circle completes a set
+ * and (re)starts the single global rest clock aimed at this move; tapping the
+ * last-filled circle undoes it. Completing the final set auto-checks the move
+ * and stops its clock.
+ */
+function setDone(ex, blockKey, k) {
+  if (!ex) return;
+  const eff = effectiveDose(ex);
+  const cur = state.setsDone[ex.name] || 0;
+  if (k === cur) {
+    state.setsDone[ex.name] = cur + 1;
+    const target = restTarget(ex, blockKey);   // warmup/cooldown => null => no clock
+    if (target != null) state.rest = { name: ex.name, startedAt: Date.now() };
+  } else if (k === cur - 1) {
+    state.setsDone[ex.name] = cur - 1;
+  } else {
+    return;
+  }
+  const now = state.setsDone[ex.name];
+  if (now >= eff.sets) {
+    state.checks[ex.name] = true;
+    if (state.rest && state.rest.name === ex.name) state.rest = { name: null, startedAt: null };
+  } else if (state.checks[ex.name]) {
+    delete state.checks[ex.name];               // dropped below complete — unmark
+  }
+  saveState();
   render();
 }
 
@@ -787,21 +1814,39 @@ function finishSession(note) {
     settings: Object.assign({}, state.settings),
     exercises: []
   };
-  built.blocks.forEach((bl) => bl.exercises.forEach((ex) => {
-    const eff = effectiveDose(ex);
-    entry.exercises.push({
-      name: ex.name,
-      category: ex.category,
-      dose: { sets: eff.sets, amount: eff.amount, unit: eff.unit },  // EFFECTIVE dose
-      done: !!state.checks[ex.name]
+  built.blocks.forEach((bl) => {
+    // v2.4.1: the warm-up logs one entry per group card (name = group, no dose),
+    // matching how it now renders/checks. Ungrouped warm-up moves log per move.
+    if (bl.key === 'warmup') {
+      warmupGroups(bl.exercises).forEach((item) => {
+        if (item.kind === 'group') {
+          entry.exercises.push({ name: item.groupName, category: 'warmup', done: !!state.checks[item.card.name] });
+        } else {
+          entry.exercises.push({ name: item.ex.name, goals: (item.ex.goals || []).slice(), done: !!state.checks[item.ex.name] });
+        }
+      });
+      return;
+    }
+    bl.exercises.forEach((ex) => {
+      const eff = effectiveDose(ex);
+      const dose = { sets: eff.sets, amount: eff.amount, unit: eff.unit };  // EFFECTIVE dose
+      if (eff.weight != null) dose.weight = eff.weight;                     // carry physical load
+      entry.exercises.push({
+        name: ex.name,
+        goals: (ex.goals || []).slice(),
+        dose: dose,
+        done: !!state.checks[ex.name]
+      });
     });
-  }));
+  });
   if (note) entry.note = note;
 
   state.log.push(entry);
   state.session += 1;
   state.checks = {};
   state.swaps = {};              // Phase 4: swaps are per-session trials — clear on finish
+  state.setsDone = {};           // Feature E: per-session, cleared on finish
+  state.rest = { name: null, startedAt: null };
   state.lastFinished = entry.date;
   saveState();
 }
@@ -918,7 +1963,7 @@ const ALL_KNOBS = ['skill', 'core', 'wts', 'mach', 'cool'];
 // "raise weights to 3?" wins ties (matches the spec example). mach/cool are
 // structural, not effort knobs, so they're never *raised* by the nudge.
 const RAISE_KNOBS = ['wts', 'skill', 'core'];
-const KNOB_LABEL = { skill: 'skill variety', core: 'core variety', wts: 'weights', mach: 'machines', cool: 'cool-down' };
+const KNOB_LABEL = { skill: 'skill slots', core: 'core slots', wts: 'weights', mach: 'machines', cool: 'cool-down' };
 
 function sliderRanges(routine) {
   return (routine && routine.structure && routine.structure.sliders) || DEFAULT_RANGES;
@@ -1041,23 +2086,22 @@ function skippedRecently(name, log) {
 }
 
 /*
- * Pick a same-category replacement for a skipped exercise. Candidates: same
- * BASE category (looked up in the routine, so aerial resolution doesn't
- * confuse it), eligible for the day/aerial state, not currently shown, not
- * already proposed, not itself. Ranked least-recently-completed (consistent
- * with the variety guarantee), tie-break pool order.
+ * Pick a replacement for a skipped exercise. Candidates share at least one goal
+ * tag with the skipped move, are eligible for the day/goal state, not currently
+ * shown, not already proposed, not itself. Ranked least-recently-completed
+ * (consistent with the variety guarantee), tie-break pool order.
  */
 function pickReplacement(name, st, shownNames, proposed, day) {
   const routine = st.routine;
   const base = findExerciseByName(routine, name);
   if (!base) return null;
-  const cat = base.category;
-  const aerial = st.settings.aerial;
+  const baseGoals = base.goals || [];
   const log = st.log || [];
   const cands = [];
   collectPools(routine).forEach((pool) => pool.forEach((ex) => {
-    if (!ex || ex.name === name || ex.category !== cat) return;
-    if (!eligible(ex, day, aerial)) return;
+    if (!ex || ex.name === name) return;
+    if (!(ex.goals || []).some((g) => baseGoals.includes(g))) return;
+    if (!eligible(ex, day)) return;
     if (shownNames.has(ex.name) || proposed.has(ex.name)) return;
     if (!cands.some((c) => c.name === ex.name)) cands.push(ex);
   }));
@@ -1095,14 +2139,15 @@ function skipSuggestions(st, build) {
 
 /*
  * Heuristic #4 predicate: exercise completed 4+ times at the CURRENT effective
- * intensity (sets+amount+unit). Bumping the dose changes `cur`, so the count
- * naturally resets at the new level.
+ * intensity (sets+amount+unit+weight). Bumping reps OR weight changes `cur`, so
+ * the count naturally resets at the new level.
  */
 function progressionReady(name, cur, log) {
   let n = 0;
   (log || []).forEach((entry) => (entry.exercises || []).forEach((e) => {
     if (e.name === name && e.done && e.dose &&
-        e.dose.sets === cur.sets && e.dose.amount === cur.amount && e.dose.unit === cur.unit) {
+        e.dose.sets === cur.sets && e.dose.amount === cur.amount && e.dose.unit === cur.unit &&
+        (e.dose.weight || null) === (cur.weight || null)) {
       n++;
     }
   }));
@@ -1162,15 +2207,19 @@ let LLM_RETRY_MS = 1500;   // delay before the single 429/529 retry (0 in tests)
 
 // Constraints/goals blurb sent with every 5a edit (from the spec + seed).
 const GOALS_BLURB =
-  '2–3 sessions/week, alternating A/B day structure. Primary goals: general core ' +
-  'strength and successive backflips; aerial work is a lower-weight optional goal. ' +
-  'Health constraints that must be respected: plantar fasciitis (keep impact ' +
-  'conservative, keep slow calf loading), cubital tunnel (no aggressive elbow-lockout ' +
-  'pressing volume), posture (keep the pulling / row work), sciatic nerve mobility ' +
-  '(gentle flossing lives in the user\'s splits routine), and joint-friendly recovery ' +
-  'from tumbling. The user already stims by jumping (extra daily impact through the ' +
-  'feet), so added plyometric/impact volume should stay conservative. Warm-up is ' +
-  'user-managed.';
+  '2–3 sessions/week, alternating A/B day structure. Training is organized around ' +
+  'toggleable goals; each move is tagged with one or more goal ids and drops out of ' +
+  'rotation when all of its goals are turned off. Goals: core (general core strength) ' +
+  'and flip (backflip power) are the primary drivers; aerial is a lower-weight optional ' +
+  'goal (off by default); str (general strength); splits (front-splits flexibility — ' +
+  'hip and hamstring end-range); and health/care goals that must be ' +
+  'respected — plantar (plantar fasciitis: keep impact conservative, keep slow calf ' +
+  'loading), cubital (cubital tunnel: no aggressive elbow-lockout pressing volume), ' +
+  'posture (keep the pulling / row work), sciatic (gentle nerve mobility, lives in the ' +
+  'splits routine), and recovery (joint-friendly recovery from tumbling). The user ' +
+  'already stims by jumping (extra daily impact through the feet), so added ' +
+  'plyometric/impact volume should stay conservative. The warm-up block is real, ' +
+  'editable data — only change it when the user explicitly asks.';
 
 // 5a system prompt: ONLY-JSON output, the full schema, and every guardrail.
 const EDIT_SYSTEM_PROMPT =
@@ -1185,11 +2234,10 @@ const EDIT_SYSTEM_PROMPT =
   'Return the ENTIRE routine, not a diff. Copy every field you are not changing ' +
   'exactly as given.\n\n' +
   'ROUTINE SCHEMA:\n' +
-  '- Top level: { version:int, goals:[...], categories:{...}, blocks:{...}, structure?:{...} }\n' +
-  '- goals: array of { name:string, weight:number, active:boolean }\n' +
-  '- categories: object mapping a short id -> { label:string, colorId:string }. colorId ' +
-  'is one of: purple, teal, coral, pink, gray. Every exercise.category MUST be one of the ' +
-  'category ids you define here.\n' +
+  '- Top level: { version:int, goals:[...], blocks:{...}, structure?:{...} }\n' +
+  '- goals: array of { id:string, name:string, weight:number, active:boolean, colorId:string }. ' +
+  'colorId is one of: purple, teal, coral, pink, gray, green, amber, blue, slate, orange. Every id in an ' +
+  'exercise.goals array MUST be a goal id defined here.\n' +
   '- blocks:\n' +
   '    skill: { staples:[exercise...], varietyPool:[exercise...] }\n' +
   '    core:  { staples:[exercise...], varietyPool:[exercise...] }\n' +
@@ -1198,14 +2246,21 @@ const EDIT_SYSTEM_PROMPT =
   'single array.\n' +
   '- exercise: {\n' +
   '    name: string (unique within its array),\n' +
-  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"reps"|"reps/side"|"min", range?:number },\n' +
-  '    category: one of the category ids above,\n' +
+  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"sec/side"|"reps"|"reps/side"|"min", weight?:number },  // weight is lb, weighted (barbell/machine) moves only\n' +
+  '    goals: non-empty array of goal ids defined above (the FIRST id drives the card color/label),\n' +
   '    why: short string explaining the purpose,\n' +
-  '    aerialAlt?: { category, why }   // used when the user turns aerial mode on\n' +
-  '    aerialOnly?: boolean            // item only appears when aerial mode is on\n' +
+  '    group?: string                 // display grouping (e.g. for warm-up sub-headers)\n' +
+  '    rest?: int                     // rest-clock target in seconds (optional)\n' +
+  '    progression?: { step:number, max:number, maxSets:number, weightStep?:number }  // optional ladder overrides\n' +
   '    dayLock?: "A" | "B"             // item only appears on that day\n' +
+  '    muscle?: string                 // coarse muscle group; skill/core moves only — drives Auto Superset grouping, preserve it\n' +
+  '    location?: string               // where the move happens, e.g. "floor" / "wall"; skill/core moves only — drives Auto Superset grouping, preserve it\n' +
+  '    largeEquipment?: string         // optional bulky station the move needs; at most one per superset — preserve it\n' +
   '  }\n' +
-  '  (Warm-up items may carry unit "as usual" and userManaged:true.)\n\n' +
+  '  Auto Superset groups skill/core moves that share a location (with distinct muscles) into one card — keep ' +
+  'each skill/core move\'s muscle and location fields when you edit it.\n' +
+  '  Double progression (weighted moves): reps climb from dose.amount to progression.max by step, ' +
+  'then the weight rises by weightStep (lb) and reps reset — set weight + weightStep together on loaded lifts.\n\n' +
   'GUARDRAILS (follow strictly):\n' +
   '- Preserve the A/B day structure and the block shapes unless the user explicitly asks to change them.\n' +
   '- Never remove health/rehab items (slow calf work, nerve/sciatic care, rows/pulling, tibialis ' +
@@ -1214,12 +2269,13 @@ const EDIT_SYSTEM_PROMPT =
   '- Respect known issues: no aggressive elbow-lockout pressing volume (cubital tunnel); keep impact / ' +
   'plyometric volume conservative (plantar fasciitis, joint recovery); the user already gets daily ' +
   'impact from jumping.\n' +
-  '- Warm-up is user-managed — NEVER add, edit, or remove warmup items.\n' +
-  '- When adding a new goal, give it an explicit weight, and rebalance the variety pools so their ' +
-  'emphasis roughly matches the active goal weights.\n' +
+  '- The warm-up block is real, editable data — only add, edit, or remove warm-up items when the user ' +
+  'explicitly asks.\n' +
+  '- When adding a new goal, give it an explicit id, weight, and colorId, and rebalance the variety ' +
+  'pools so their emphasis roughly matches the active goal weights.\n' +
   '- For anything symptom- or pain-related, adjust conservatively and add a warning recommending the ' +
   'user see a physical therapist rather than prescribing rehab.\n' +
-  '- Keep dayLock, aerialAlt, and aerialOnly semantics intact on items you keep.';
+  '- Keep dayLock semantics intact on items you keep.';
 
 // 5b system prompt: technique/planning assistant, not medical advice.
 const ASK_SYSTEM_PROMPT =
@@ -1386,17 +2442,36 @@ function flattenExercises(routine) {
 // Dose identity string for equality checks.
 function doseKey(d) {
   d = d || {};
-  return [d.sets, d.amount, d.range == null ? '' : d.range, d.unit].join('|');
+  return [d.sets, d.amount, d.unit, d.weight == null ? '' : d.weight].join('|');
 }
 
-// modified = same name, different dose / category / why / flags.
+// Order-insensitive goal-tag equality.
+function goalsEqual(a, b) {
+  const x = (a || []).slice().sort();
+  const y = (b || []).slice().sort();
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+// Progression identity string.
+function progKey(p) {
+  if (!p) return '';
+  return [p.step == null ? '' : p.step, p.max == null ? '' : p.max, p.maxSets == null ? '' : p.maxSets,
+    p.weightStep == null ? '' : p.weightStep].join('|');
+}
+
+// modified = same name, different dose / goals / why / group / rest / progression /
+// dayLock / muscle / location / largeEquipment (v2.5 fields compared like why/goals).
 function exerciseEqual(a, b) {
   return doseKey(a.dose) === doseKey(b.dose) &&
-    a.category === b.category &&
+    goalsEqual(a.goals, b.goals) &&
     a.why === b.why &&
-    JSON.stringify(a.aerialAlt || null) === JSON.stringify(b.aerialAlt || null) &&
-    !!a.aerialOnly === !!b.aerialOnly &&
-    (a.dayLock || null) === (b.dayLock || null);
+    (a.group || '') === (b.group || '') &&
+    (a.rest == null ? '' : a.rest) === (b.rest == null ? '' : b.rest) &&
+    progKey(a.progression) === progKey(b.progression) &&
+    (a.dayLock || null) === (b.dayLock || null) &&
+    (a.muscle || '') === (b.muscle || '') &&
+    (a.location || '') === (b.location || '') &&
+    (a.largeEquipment || '') === (b.largeEquipment || '');
 }
 
 function diffGoals(oldGoals, newGoals) {
@@ -1418,19 +2493,7 @@ function diffGoals(oldGoals, newGoals) {
   return changes;
 }
 
-function diffCategories(oldC, newC) {
-  const changes = [];
-  oldC = oldC || {}; newC = newC || {};
-  Object.keys(newC).forEach((id) => {
-    if (!(id in oldC)) changes.push('Added category: ' + id + ' (' + (newC[id].label || '') + ')');
-    else if (oldC[id].label !== newC[id].label || oldC[id].colorId !== newC[id].colorId)
-      changes.push('Changed category "' + id + '": ' + (oldC[id].label || '') + ' → ' + (newC[id].label || ''));
-  });
-  Object.keys(oldC).forEach((id) => { if (!(id in newC)) changes.push('Removed category: ' + id); });
-  return changes;
-}
-
-// Computed diff: added / removed / modified exercises + goal & category changes.
+// Computed diff: added / removed / modified exercises + goal changes.
 function computeDiff(oldR, newR) {
   const o = flattenExercises(oldR);
   const n = flattenExercises(newR);
@@ -1442,8 +2505,7 @@ function computeDiff(oldR, newR) {
   Object.keys(o).forEach((name) => { if (!(name in n)) removed.push(o[name]); });
   return {
     added: added, removed: removed, modified: modified,
-    goalChanges: diffGoals(oldR && oldR.goals, newR && newR.goals),
-    catChanges: diffCategories(oldR && oldR.categories, newR && newR.categories)
+    goalChanges: diffGoals(oldR && oldR.goals, newR && newR.goals)
   };
 }
 
@@ -1691,7 +2753,8 @@ function renderDiff(p) {
 
 function exLine(ex) {
   return '<div class="dx-name">' + escapeHtml(ex.name) + '</div>' +
-    '<div class="dx-meta">' + escapeHtml(formatDose(ex.dose)) + ' · ' + escapeHtml(ex.category) + '</div>' +
+    '<div class="dx-meta">' + escapeHtml(formatDose(ex.dose)) + ' · ' +
+      escapeHtml((ex.goals || []).join(', ')) + '</div>' +
     '<div class="dx-why">' + escapeHtml(ex.why || '') + '</div>';
 }
 
@@ -1699,9 +2762,6 @@ function renderComputedDiff(d) {
   let h = '<div class="computed-diff">';
   if (d.goalChanges.length) {
     h += '<h4>Goals</h4><ul class="diff-list">' + d.goalChanges.map((g) => '<li>' + escapeHtml(g) + '</li>').join('') + '</ul>';
-  }
-  if (d.catChanges.length) {
-    h += '<h4>Categories</h4><ul class="diff-list">' + d.catChanges.map((g) => '<li>' + escapeHtml(g) + '</li>').join('') + '</ul>';
   }
   if (d.added.length) {
     h += '<h4>Added exercises</h4>' + d.added.map((ex) =>
@@ -1718,7 +2778,7 @@ function renderComputedDiff(d) {
         '<div class="dx-col dx-new"><span class="dx-tag">now</span>' + exLine(m.to) + '</div>' +
       '</div>').join('');
   }
-  if (!d.added.length && !d.removed.length && !d.modified.length && !d.goalChanges.length && !d.catChanges.length) {
+  if (!d.added.length && !d.removed.length && !d.modified.length && !d.goalChanges.length) {
     h += '<p class="muted">No structural differences detected.</p>';
   }
   return h + '</div>';
@@ -1771,16 +2831,17 @@ function registerSW() {
 }
 
 async function init() {
+  // Load the seed up front so normalizeState's v2->v2.3 migration can retag
+  // stored moves by name and rebuild routine.goals from it.
+  SEED_ROUTINE = await loadSeed();
   const raw = localStorage.getItem(V2_KEY);
   if (raw) {
     try { state = normalizeState(JSON.parse(raw)); }
-    catch (e) { SEED_ROUTINE = await loadSeed(); state = freshState(deepClone(SEED_ROUTINE)); }
+    catch (e) { state = freshState(deepClone(SEED_ROUTINE)); }
     if (!state.routine || !state.routine.blocks) {
-      SEED_ROUTINE = await loadSeed();
       state.routine = deepClone(SEED_ROUTINE);
     }
   } else {
-    SEED_ROUTINE = await loadSeed();
     const v1raw = localStorage.getItem(V1_KEY);
     if (v1raw) {
       try { state = migrateFromV1(JSON.parse(v1raw), deepClone(SEED_ROUTINE)); }
@@ -1831,7 +2892,13 @@ if (typeof window !== 'undefined') {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     validateRoutine, formatDose, effectiveDose, buildSession, selectVariety,
-    migrateFromV1, freshState, currentDay, amountStep,
+    migrateFromV1, freshState, currentDay,
+    // v2.3 — goals, slots, ladders, migration (pure where noted)
+    eligible, goalActive, buildStapleBlock, takeN, buildCooldown,
+    progressionParams, progressionLadder, currentLevel, restTarget,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    // v2.5 Auto Superset (pure grouping + plan)
+    groupSupersets, supersetPlan, supersetRestTarget,
     // Phase 4 heuristics (pure — take log/state as args)
     leastRecentlyCompleted, lastCompletedIndex, sessionCompletion, buildKnobMap,
     volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
@@ -1840,8 +2907,10 @@ if (typeof module !== 'undefined' && module.exports) {
     // Phase 5 (LLM flow) — for the smoke test.
     callClaude, extractText, stripFences, tryParseProposal, computeDiff, buildProposal,
     runEditRequest, applyProposal, discardProposal, buildEditUserMessage, buildLogSummary,
+    exerciseEqual, goalsEqual,
     _ui: ui,
     _setRetryDelay: (ms) => { LLM_RETRY_MS = ms; },
-    _set: (s) => { state = s; }
+    _set: (s) => { state = s; },
+    _setSeed: (s) => { SEED_ROUTINE = s; }
   };
 }

@@ -1,89 +1,99 @@
 {
-  "version": 1,
+  "version": 5,
   "goals": [
-    { "name": "General core strength", "weight": 100, "active": true },
-    { "name": "Successive backflips", "weight": 100, "active": true },
-    { "name": "Aerial", "weight": 15, "active": false },
-    { "name": "Plantar fasciitis care", "weight": 100, "active": true },
-    { "name": "Cubital tunnel care", "weight": 100, "active": true },
-    { "name": "Posture", "weight": 100, "active": true },
-    { "name": "Sciatic nerve mobility", "weight": 100, "active": true },
-    { "name": "Joint-friendly recovery from tumbling", "weight": 100, "active": true }
+    { "id": "core", "name": "General core strength", "weight": 100, "active": true, "colorId": "purple" },
+    { "id": "flip", "name": "Backflip power", "weight": 100, "active": true, "colorId": "teal" },
+    { "id": "aerial", "name": "Aerial", "weight": 15, "active": false, "colorId": "coral" },
+    { "id": "str", "name": "Strength", "weight": 100, "active": true, "colorId": "gray" },
+    { "id": "splits", "name": "Splits", "weight": 100, "active": true, "colorId": "orange" },
+    { "id": "plantar", "name": "Plantar fasciitis care", "weight": 100, "active": true, "colorId": "green" },
+    { "id": "cubital", "name": "Cubital tunnel care", "weight": 100, "active": true, "colorId": "amber" },
+    { "id": "posture", "name": "Posture", "weight": 100, "active": true, "colorId": "pink" },
+    { "id": "sciatic", "name": "Sciatic nerve mobility", "weight": 100, "active": true, "colorId": "blue" },
+    { "id": "recovery", "name": "Joint-friendly recovery", "weight": 100, "active": true, "colorId": "slate" }
   ],
-  "categories": {
-    "gen": { "label": "General core", "colorId": "purple" },
-    "flip": { "label": "Backflip power", "colorId": "teal" },
-    "aerial": { "label": "Aerial prep", "colorId": "coral" },
-    "health": { "label": "Health / rehab", "colorId": "pink" },
-    "str": { "label": "Strength", "colorId": "gray" }
-  },
   "blocks": {
     "warmup": [
-      { "name": "Your warmup routine", "dose": { "sets": 1, "amount": 1, "unit": "as usual" }, "category": "health", "why": "Bike, plantar fasciitis / posture / cubital tunnel moves, muscle warmups", "userManaged": true }
+      { "name": "Wall neck stretch", "group": "Wall", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["posture"], "why": "Releases the neck before overhead and inverted work" },
+      { "name": "Chin tucks", "group": "Wall", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Resets forward-head posture before loading" },
+      { "name": "Wall angels", "group": "Wall", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Opens the shoulders and grooves overhead position" },
+      { "name": "Shin raises (back against wall)", "group": "Wall", "dose": { "sets": 1, "amount": 15, "unit": "reps" }, "goals": ["plantar", "recovery"], "why": "Wakes tibialis for landings and shin health" },
+      { "name": "Arch curls (foot doming)", "group": "Plantar fasciitis", "dose": { "sets": 1, "amount": 15, "unit": "reps/side" }, "goals": ["plantar"], "why": "Wakes the foot arch — plantar fascia's support crew" },
+      { "name": "Calf raise (slow eccentric)", "group": "Plantar fasciitis", "dose": { "sets": 3, "amount": 10, "unit": "reps", "tempoNote": "3 sec down" }, "goals": ["plantar"], "why": "Slow loading primes the fascia — different job than your jumping", "progression": { "step": 2, "max": 15, "maxSets": 3 } },
+      { "name": "Ulnar nerve glides", "group": "Nerves", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["cubital"], "why": "Cubital tunnel care — glide, never stretch to pain" },
+      { "name": "Arm circles (small→large, both ways)", "group": "Circles", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Blood into the shoulders through full range" },
+      { "name": "Standing calf stretch", "group": "Standing", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["plantar"], "why": "Lengthens the calf before impact work" },
+      { "name": "Knee clocks", "group": "Standing", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["recovery"], "why": "Knee tracking control through full circles" },
+      { "name": "Wrist stretch", "group": "Wrists", "dose": { "sets": 1, "amount": 20, "unit": "sec" }, "goals": ["recovery", "cubital"], "why": "Preps the wrists for any hand-loading" },
+      { "name": "Wrist lifts", "group": "Wrists", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["recovery"], "why": "Wakes the forearms and wrist extensors" },
+      { "name": "Curl-ups", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Switches on the deep core before hollow work" },
+      { "name": "Leg lifts", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Lower-ab activation before the main core block" },
+      { "name": "Curl + leg lift combo", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Ties upper and lower core together before hollow work" }
     ],
     "skill": {
       "staples": [
-        { "name": "Handstand wall hold", "dose": { "sets": 3, "amount": 30, "range": 45, "unit": "sec" }, "category": "gen", "why": "Shoulder stack and balance (soft elbows, no hard lockout)", "dayLock": "A" },
-        { "name": "Jump tucks", "dose": { "sets": 3, "amount": 6, "unit": "reps" }, "category": "flip", "why": "B days only — plyo power without extra joint cost", "dayLock": "B" },
-        { "name": "Hip abduction (band walks or side-lying)", "dose": { "sets": 2, "amount": 15, "unit": "reps/side" }, "category": "str", "why": "Glute med — landing control and knee tracking", "aerialAlt": { "category": "aerial", "why": "Glute med — drives the aerial takeoff, landing control" } }
+        { "name": "Handstand wall hold", "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "goals": ["core"], "muscle": "shoulders", "location": "floor", "why": "Shoulder stack and balance (soft elbows, no hard lockout)", "dayLock": "A", "progression": { "step": 5, "max": 60, "maxSets": 3 } },
+        { "name": "Jump tucks", "dose": { "sets": 3, "amount": 6, "unit": "reps" }, "goals": ["flip"], "muscle": "legs", "location": "floor", "why": "B days only — plyo power without extra joint cost", "dayLock": "B", "progression": { "step": 1, "max": 10, "maxSets": 4 } },
+        { "name": "Hip abduction (band walks or side-lying)", "dose": { "sets": 2, "amount": 15, "unit": "reps/side" }, "goals": ["str", "aerial"], "muscle": "glutes", "location": "floor", "why": "Glute med — landing control and knee tracking" }
       ],
       "varietyPool": [
-        { "name": "Bridge push-ups", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "gen", "why": "Bridge strength for walkovers and handsprings" },
-        { "name": "Single-leg glute bridge", "dose": { "sets": 3, "amount": 10, "unit": "reps/side" }, "category": "str", "why": "One-leg hip drive, zero impact", "aerialAlt": { "category": "aerial", "why": "One-leg hip drive, zero impact" } },
-        { "name": "Wall handstand shoulder taps", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "gen", "why": "Handstand stability under shift" },
-        { "name": "Candlestick to stand", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "flip", "why": "Rebound and landing mechanics" },
-        { "name": "Broad jump stick landing", "dose": { "sets": 3, "amount": 5, "unit": "reps" }, "category": "flip", "why": "Quiet, absorbed landings — joint-friendly power" },
-        { "name": "Wall-sit hollow press", "dose": { "sets": 3, "amount": 20, "unit": "sec" }, "category": "flip", "why": "Rib-down position for the set" }
+        { "name": "Bridge push-ups", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "goals": ["core"], "muscle": "shoulders", "location": "floor", "why": "Bridge strength for walkovers and handsprings" },
+        { "name": "Single-leg glute bridge", "dose": { "sets": 3, "amount": 10, "unit": "reps/side" }, "goals": ["str", "aerial"], "muscle": "glutes", "location": "floor", "why": "One-leg hip drive, zero impact" },
+        { "name": "Wall handstand shoulder taps", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "goals": ["core"], "muscle": "shoulders", "location": "floor", "why": "Handstand stability under shift" },
+        { "name": "Candlestick to stand", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "goals": ["flip"], "muscle": "legs", "location": "floor", "why": "Rebound and landing mechanics" },
+        { "name": "Broad jump stick landing", "dose": { "sets": 3, "amount": 5, "unit": "reps" }, "goals": ["flip"], "muscle": "legs", "location": "floor", "why": "Quiet, absorbed landings — joint-friendly power", "progression": { "step": 1, "max": 8, "maxSets": 3 } },
+        { "name": "Wall-sit hollow press", "dose": { "sets": 3, "amount": 20, "unit": "sec" }, "goals": ["flip"], "muscle": "core", "location": "floor", "why": "Rib-down position for the set" },
+        { "name": "Cossack squat", "dose": { "sets": 2, "amount": 8, "unit": "reps/side" }, "goals": ["splits", "str"], "muscle": "legs", "location": "floor", "why": "Adductor and hamstring range under load — strength at the end range splits need" }
       ]
     },
     "core": {
       "staples": [
-        { "name": "Hollow rocks", "dose": { "sets": 3, "amount": 20, "unit": "reps" }, "category": "flip", "why": "Staple A — hollow under momentum", "dayLock": "A" },
-        { "name": "Tuck-ups (fast)", "dose": { "sets": 4, "amount": 12, "unit": "reps" }, "category": "flip", "why": "Staple B — explosive knee snap", "dayLock": "B" },
-        { "name": "Hollow body hold", "dose": { "sets": 3, "amount": 30, "range": 45, "unit": "sec" }, "category": "gen", "why": "Every-session staple — the shape behind every skill" }
+        { "name": "Hollow rocks", "dose": { "sets": 3, "amount": 20, "unit": "reps" }, "goals": ["flip"], "muscle": "core", "location": "floor", "why": "Staple A — hollow under momentum", "dayLock": "A" },
+        { "name": "Tuck-ups (fast)", "dose": { "sets": 4, "amount": 12, "unit": "reps" }, "goals": ["flip"], "muscle": "core", "location": "floor", "why": "Staple B — explosive knee snap", "dayLock": "B" },
+        { "name": "Hollow body hold", "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "goals": ["core"], "muscle": "core", "location": "floor", "why": "Every-session staple — the shape behind every skill", "progression": { "step": 5, "max": 60, "maxSets": 4 } }
       ],
       "varietyPool": [
-        { "name": "V-ups", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "flip", "why": "Fast hip flexion for rotation speed" },
-        { "name": "Side plank hip dips", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "category": "aerial", "why": "Oblique strength for sideways rotation", "aerialOnly": true },
-        { "name": "Arch (superman) hold", "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "category": "gen", "why": "Back tension for handsprings" },
-        { "name": "L-sit or tuck sit hold", "dose": { "sets": 4, "amount": 15, "range": 20, "unit": "sec" }, "category": "gen", "why": "Compression strength" },
-        { "name": "Single-leg V-up", "dose": { "sets": 3, "amount": 8, "unit": "reps/side" }, "category": "aerial", "why": "One-leg drive like the aerial kick", "aerialOnly": true },
-        { "name": "Straight jump to fast tuck", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "flip", "why": "Set + tuck timing" },
-        { "name": "Dead bug", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "category": "gen", "why": "Core stability with moving limbs" }
+        { "name": "V-ups", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "goals": ["flip"], "muscle": "core", "location": "floor", "why": "Fast hip flexion for rotation speed" },
+        { "name": "Side plank hip dips", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "goals": ["aerial"], "muscle": "core", "location": "floor", "why": "Oblique strength for sideways rotation" },
+        { "name": "Arch (superman) hold", "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "goals": ["core"], "muscle": "back", "location": "floor", "why": "Back tension for handsprings" },
+        { "name": "L-sit or tuck sit hold", "dose": { "sets": 4, "amount": 15, "unit": "sec" }, "goals": ["core"], "muscle": "core", "location": "floor", "why": "Compression strength", "progression": { "step": 5, "max": 20, "maxSets": 4 } },
+        { "name": "Single-leg V-up", "dose": { "sets": 3, "amount": 8, "unit": "reps/side" }, "goals": ["aerial"], "muscle": "core", "location": "floor", "why": "One-leg drive like the aerial kick" },
+        { "name": "Straight jump to fast tuck", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "goals": ["flip"], "muscle": "legs", "location": "floor", "why": "Set + tuck timing" },
+        { "name": "Dead bug", "dose": { "sets": 3, "amount": 12, "unit": "reps/side" }, "goals": ["core"], "muscle": "core", "location": "floor", "why": "Core stability with moving limbs" }
       ]
     },
     "weightsA": [
-      { "name": "Hex bar deadlift", "dose": { "sets": 3, "amount": 5, "unit": "reps" }, "category": "str", "why": "Tumbling power; loads feet in a fascia-friendly way" },
-      { "name": "Overhead press", "dose": { "sets": 3, "amount": 8, "unit": "reps" }, "category": "str", "why": "Neutral wrists, don't slam elbow lockout (cubital tunnel)" },
-      { "name": "Face pulls or band pull-aparts", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "category": "health", "why": "Posture — balances all the pressing" }
+      { "name": "Hex bar deadlift", "dose": { "sets": 3, "amount": 10, "unit": "reps", "weight": 135 }, "goals": ["str"], "why": "Tumbling power; loads feet in a fascia-friendly way", "progression": { "step": 1, "max": 12, "weightStep": 10 } },
+      { "name": "Overhead press", "dose": { "sets": 3, "amount": 6, "unit": "reps", "weight": 65 }, "goals": ["str"], "why": "Neutral wrists, don't slam elbow lockout (cubital tunnel)", "progression": { "step": 1, "max": 8, "weightStep": 5 } },
+      { "name": "Face pulls or band pull-aparts", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "goals": ["posture"], "why": "Posture — balances all the pressing" }
     ],
     "weightsB": [
-      { "name": "Bulgarian split squat", "dose": { "sets": 3, "amount": 8, "unit": "reps/side" }, "category": "str", "why": "Single-leg drive and landing strength", "aerialAlt": { "category": "aerial", "why": "Single-leg drive — your best aerial lift" } },
-      { "name": "Chest-supported or cable row", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "health", "why": "The missing pull your posture needs" },
-      { "name": "Leg press (light-moderate)", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "category": "str", "why": "Optional volume, easy on joints" }
+      { "name": "Bulgarian split squat", "dose": { "sets": 3, "amount": 8, "unit": "reps/side", "weight": 20 }, "goals": ["str", "aerial", "splits"], "why": "Single-leg drive and landing strength", "progression": { "step": 1, "max": 10, "weightStep": 5 } },
+      { "name": "Chest-supported or cable row", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "The missing pull your posture needs" },
+      { "name": "Leg press (light-moderate)", "dose": { "sets": 3, "amount": 8, "unit": "reps", "weight": 180 }, "goals": ["str"], "why": "Optional volume, easy on joints", "progression": { "step": 1, "max": 12, "weightStep": 10 } }
     ],
     "machinesA": [
-      { "name": "Standing calf raise (slow eccentric)", "dose": { "sets": 3, "amount": 10, "unit": "reps", "tempoNote": "3 sec down" }, "category": "health", "why": "Slow heavy loading treats the fascia — different job than your jumping" },
-      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "str", "why": "Hamstrings protect knees on landings" }
+      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps", "weight": 140 }, "goals": ["str"], "why": "Hamstrings protect knees on landings", "progression": { "step": 1, "max": 15, "weightStep": 10 } },
+      { "name": "Leg extension", "dose": { "sets": 3, "amount": 10, "unit": "reps", "weight": 85 }, "goals": ["str"], "why": "Quad and knee-tendon capacity for jumping", "progression": { "step": 1, "max": 15, "weightStep": 10 } }
     ],
     "machinesB": [
-      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps" }, "category": "str", "why": "Hamstrings protect knees on landings" },
-      { "name": "Tibialis raises", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "category": "health", "why": "Balances all that calf and jump work — shin and foot health" }
+      { "name": "Leg curl", "dose": { "sets": 3, "amount": 12, "unit": "reps", "weight": 140 }, "goals": ["str"], "why": "Hamstrings protect knees on landings", "progression": { "step": 1, "max": 15, "weightStep": 10 } },
+      { "name": "Tibialis raises", "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "goals": ["plantar", "recovery"], "why": "Balances all that calf and jump work — shin and foot health" }
     ],
     "cooldown": [
-      { "name": "Splits routine (incl. sciatic floss)", "dose": { "sets": 1, "amount": 5, "unit": "min" }, "category": "gen", "why": "Your routine — hip range plus the nerve work you already do", "aerialAlt": { "category": "aerial", "why": "Your routine — hip range for aerials, plus your nerve work" }, "alwaysInShort": true },
-      { "name": "Doorway pec stretch + thoracic extension", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "category": "health", "why": "Posture — opens what tumbling rounds", "alwaysInShort": true },
-      { "name": "Calf + plantar fascia stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "category": "health", "why": "Gentle end-of-session foot care" }
+      { "name": "Splits routine (incl. sciatic floss)", "dose": { "sets": 1, "amount": 5, "unit": "min" }, "goals": ["splits", "sciatic", "recovery", "aerial"], "why": "Your routine — hip range plus the nerve work you already do", "alwaysInShort": true, "progression": { "step": 1, "max": 8, "maxSets": 1 } },
+      { "name": "Doorway pec stretch + thoracic extension", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["posture"], "why": "Posture — opens what tumbling rounds", "alwaysInShort": true },
+      { "name": "Calf + plantar fascia stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["plantar"], "why": "Gentle end-of-session foot care" }
     ]
   },
   "structure": {
     "frequencyPerWeek": "2-3",
     "dayAlternation": "A on odd sessions, B on even",
-    "sliders": { "skill": [1, 3], "core": [1, 3], "wts": [1, 3], "mach": [0, 2], "cool": [1, 2] },
-    "varietySlotIndex": "third item of skill and core blocks",
+    "sliders": { "skill": [1, 5], "core": [1, 5], "wts": [1, 3], "mach": [0, 2], "cool": [1, 2] },
+    "varietySlotIndex": "sliders set the TOTAL items per skill/core block; staples fill first, variety fills the rest",
     "notes": [
-      "Warmup is user-managed — never modify it",
-      "Aerial toggle: when off, aerialOnly items leave rotation and aerialAlt items use base category/why",
+      "Warm-up is real, editable data — the assistant should only change it when the user explicitly asks",
+      "Goals are toggleable in Settings; a move drops out of rotation when all of its goal tags are turned off",
       "Health constraints: cubital tunnel (no hard elbow lockout pressing), plantar fasciitis (keep slow calf loading, conservative impact), sciatic nerve (gentle flossing lives in user's splits routine), posture (never drop the pulling work), user stims by jumping (extra daily impact through feet)"
     ]
   }
