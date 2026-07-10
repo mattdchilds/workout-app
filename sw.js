@@ -2,7 +2,7 @@
    Cache-first, offline-first. Bump CACHE on every asset change so the
    activate handler evicts the stale cache. */
 
-const CACHE = 'tumble-trainer-v2.2.1';
+const CACHE = 'tumble-trainer-v2.6.0';
 
 const ASSETS = [
   './',
@@ -10,7 +10,10 @@ const ASSETS = [
   'app.js',
   'styles.css',
   'manifest.webmanifest',
-  'routine-seed.json'
+  'routine-seed.json',
+  'icon-192.png',
+  'icon-512.png',
+  'icon-maskable-512.png'
 ];
 
 self.addEventListener('install', (event) => {
