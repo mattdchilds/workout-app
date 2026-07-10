@@ -13,12 +13,11 @@
  *   8. Import / export / clear / history  (Phase 2 & 3)
  *  10. Heuristics  (Phase 4 — volume nudge, skip swap, progression hint;
  *                   variety guarantee is in section 4's selectVariety)
- *  11. LLM integration  (Phase 5 — callClaude, 5a edit flow + diff, 5b Ask)
  *   9. Service worker + init
  *
- * Phase 4/5 implementers: the two clean seams are
+ * Phase 4 implementers: the two clean seams are
  *   - selectVariety()  — swap in "least-recently-completed" logic from state.log
- *   - validateRoutine() — already exported for the LLM edit flow
+ *   - validateRoutine() — the routine schema validator
  * Both are exposed on window.TumbleTrainer at the bottom of this file.
  * ==========================================================================*/
 
@@ -44,19 +43,21 @@ const CATEGORY_TO_GOALS = {
 
 // Generic tab registry. Later phases just push more entries.
 const TABS = [
-  { id: 'today', label: 'Today' },
-  { id: 'edit', label: 'Edit' },      // Phase 5a — natural-language routine editing
-  { id: 'ask', label: 'Ask' },        // Phase 5b — technique/planning chat
+  { id: 'today', label: 'Gym' },
+  { id: 'daily', label: 'Daily' },    // warm-up + cool-down + the daily jumping stim
+  { id: 'moves', label: 'Moves' },    // browse / add / delete the moves the generator picks from
   { id: 'settings', label: 'Settings' }
 ];
 
-// Phase 5 (LLM): model choice. Default is fast/cheap Haiku; Sonnet is the
-// "correctness wins" toggle for structurally sloppy edits (per spec).
-const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
-const MODELS = [
-  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — fast (default)' },
-  { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6 — slower, sharper' }
-];
+// The "Daily" tab shows the static warm-up and cool-down plus this fixed daily
+// plyometric stim (the user stims by jumping). It is NOT part of the generated Gym
+// session — it renders only on the Daily tab, right after the warm-up.
+const DAILY_TUCK_JUMPS = {
+  name: 'Tuck jumps',
+  dose: { sets: 3, amount: 10, unit: 'reps' },
+  goals: ['flip', 'recovery'],
+  why: 'Daily plyometric stim — light, springy jumps through the feet'
+};
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const deepClone = (o) => JSON.parse(JSON.stringify(o));
@@ -74,6 +75,7 @@ let state = null;
 let SEED_ROUTINE = null;
 let renderedExercises = [];       // flat list built each render; handlers index into it
 let renderedSuggestions = [];     // Phase 4 suggestion banners built each render; handlers index into it
+let renderedMoves = [];           // Move-viewer rows built each render; mv handlers index into it
 // v3.1 day preview: how many sessions ahead the Today view is peeking. TRANSIENT —
 // never persisted, never migrated; reset to 0 on finish. 0 = today (live, editable).
 let previewOffset = 0;
@@ -82,18 +84,7 @@ function inPreview() { return previewOffset > 0; }
 const ui = {
   expanded: new Set(),
   finishing: false,
-  // Phase 5 (LLM) — all in-memory, never persisted.
-  llm: {
-    editInput: '',        // free-text edit instruction (survives re-render / prefill from Ask)
-    editStatus: 'idle',   // 'idle' | 'loading' | 'error' | 'diff' | 'raw'
-    editError: '',
-    editRaw: '',          // raw model output shown when it won't validate twice
-    proposal: null,       // { routine, changes[], warnings[], diff }
-    ask: [],              // [{ role:'user'|'assistant', text }] — in-memory chat history
-    askStatus: 'idle',    // 'idle' | 'loading'
-    askError: '',
-    askInput: ''
-  }
+  adjustOpen: false               // v3.4: Gym-tab "Adjust session" panel open/collapsed (transient)
 };
 
 function freshState(routine) {
@@ -103,8 +94,13 @@ function freshState(routine) {
     view: 'today',
     // v3.0: ONE "moves" slider = total goal-weighted moves per session; the four
     // per-block sliders (skill/core/wts/mach) collapsed into it. Default 10.
-    settings: { moves: 10, cool: 2 },
+    // v3.4/v3.6: two independent joint-friendly toggles restrict generation — legs
+    // (knees/ankles) and arms (shoulders/elbows/wrists), each default off. See selectMoves.
+    // v3.5: supersetBias 0–10 nudges the generator toward moves that pair into
+    // supersets (default 5; 0 = old behavior). See selectMoves.
+    settings: { moves: 10, cool: 2, jointFriendlyLegs: false, jointFriendlyArms: false, supersetBias: 5 },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
+    collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
     setsDone: {},                 // Feature E: { [exerciseName]: int } — per-session, cleared on finish
     rest: { name: null, startedAt: null }, // Feature E: single global rest clock
@@ -115,8 +111,7 @@ function freshState(routine) {
     dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
     swaps: {},                    // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
     autoSuperset: true,           // v2.5: group same-location skill/core moves into supersets (default ON)
-    apiKey: '',                   // Phase 5: BYO Anthropic key. Device-only; never committed, never sent anywhere but api.anthropic.com
-    model: DEFAULT_MODEL          // Phase 5: model toggle
+    deletedMoves: []              // Move viewer tombstones — deleted moves never return via a seed migration
   };
 }
 
@@ -536,6 +531,124 @@ function migrateRoutineV6(routine, seed) {
 }
 
 /*
+ * v3.1 -> v3.2 migration: add the "Shoulders" warm-up group (Shoulder lifts +
+ * Misc). Runs for any stored routine whose version is < 7 — seed edits alone never
+ * reach devices that persist their own routine. Pure; returns a new routine object
+ * stamped version 7. Idempotent (adds only the shoulder moves it is missing by
+ * name), and places them after the existing "Circles" group to match the seed.
+ */
+function migrateRoutineV7(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 7) return routine;
+  const r = deepClone(routine);
+  const b = r.blocks || (r.blocks = {});
+  const wu = Array.isArray(b.warmup) ? b.warmup : (b.warmup = []);
+  const seedWU = (seed && seed.blocks && seed.blocks.warmup) || [];
+  const shoulders = seedWU.filter((ex) => ex && ex.group === 'Shoulders');
+  const have = {};
+  wu.forEach((ex) => { if (ex && ex.name) have[ex.name] = true; });
+  const toAdd = shoulders.filter((ex) => !have[ex.name]).map((ex) => deepClone(ex));
+  if (toAdd.length) {
+    let at = -1;
+    wu.forEach((ex, i) => { if (ex && ex.group === 'Circles') at = i; });
+    if (at === -1) wu.push.apply(wu, toAdd);
+    else wu.splice.apply(wu, [at + 1, 0].concat(toAdd));
+  }
+  r.version = 7;
+  return r;
+}
+
+/*
+ * v3.2 -> v3.3 migration: rescale goal scores from the old 0–3 band to the new
+ * 0–10 band. Users have not hand-edited scores, so every seed-known move adopts the
+ * seed's new goalScores wholesale by name; user-added moves (absent from the seed)
+ * keep their own scores. Runs for any stored routine whose version is < 8. Pure;
+ * returns a new routine stamped version 8. Idempotent.
+ */
+function migrateRoutineV8(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 8) return routine;
+  const r = deepClone(routine);
+  const seedByName = {};
+  ((seed && seed.blocks && seed.blocks.moves) || []).forEach((ex) => {
+    if (ex && ex.name) seedByName[ex.name] = ex;
+  });
+  const moves = (r.blocks && r.blocks.moves) || [];
+  moves.forEach((m) => {
+    const s = m && m.name && seedByName[m.name];
+    if (s && s.goalScores) m.goalScores = deepClone(s.goalScores);
+  });
+  r.version = 8;
+  return r;
+}
+
+/*
+ * v3.3 -> v3.4 migration: stamp the per-move `jointFriendly` boolean (added to the
+ * schema in v3.4) onto stored routines. Every seed-known move adopts the seed's
+ * hand-authored flag by name (only when the stored move lacks its own boolean, so a
+ * user edit survives). User-added moves (absent from the seed) get NO flag — and a
+ * move with no flag is ALLOWED by joint-friendly mode, so the feature never silently
+ * hides a move the user created themselves; only an explicit jointFriendly:false is
+ * filtered out. Runs for any stored routine whose version is < 9. Pure; returns a new
+ * routine stamped version 9. Idempotent.
+ */
+function migrateRoutineV9(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 9) return routine;
+  const r = deepClone(routine);
+  const seedByName = {};
+  ((seed && seed.blocks && seed.blocks.moves) || []).forEach((ex) => {
+    if (ex && ex.name) seedByName[ex.name] = ex;
+  });
+  const moves = (r.blocks && r.blocks.moves) || [];
+  moves.forEach((m) => {
+    const s = m && m.name && seedByName[m.name];
+    if (s && typeof s.jointFriendly === 'boolean' && typeof m.jointFriendly !== 'boolean') {
+      m.jointFriendly = s.jointFriendly;
+    }
+  });
+  r.version = 9;
+  return r;
+}
+
+/*
+ * v3.4 -> v3.6 migration: split the per-move `jointFriendly` boolean into a
+ * `jointStress` array (subset of ['legs','arms'] — legs = knees/ankles, arms =
+ * shoulders/elbows/wrists; absent/empty = safe both ways). Seed-known moves adopt the
+ * seed's hand-authored jointStress by name (unless the stored move already carries its
+ * own — a user edit survives). A user-created move that was explicitly excluded before
+ * (jointFriendly:false) but gets no seed jointStress migrates to ['legs','arms'] —
+ * conservative: it was hidden under the old single toggle, so it stays hidden under
+ * either new toggle. Moves with jointFriendly:true or no flag get no jointStress (safe).
+ * The retired `jointFriendly` boolean is then removed from every move. Runs for any
+ * stored routine whose version is < 10. Pure; returns a new routine stamped version 10.
+ * Idempotent (once jointFriendly is gone there is nothing left to convert).
+ */
+function migrateRoutineV10(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 10) return routine;
+  const r = deepClone(routine);
+  const seedByName = {};
+  ((seed && seed.blocks && seed.blocks.moves) || []).forEach((ex) => {
+    if (ex && ex.name) seedByName[ex.name] = ex;
+  });
+  const moves = (r.blocks && r.blocks.moves) || [];
+  moves.forEach((m) => {
+    if (!m) return;
+    const s = m.name && seedByName[m.name];
+    if (s && Array.isArray(s.jointStress) && !Array.isArray(m.jointStress)) {
+      m.jointStress = s.jointStress.slice();
+    }
+    if (!Array.isArray(m.jointStress) && m.jointFriendly === false) {
+      m.jointStress = ['legs', 'arms'];   // was excluded before → stays excluded
+    }
+    delete m.jointFriendly;               // the per-move boolean is retired in v3.6
+  });
+  r.version = 10;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -592,12 +705,33 @@ function normalizeState(obj) {
     try { routine = migrateRoutineV6(routine, seed); }
     catch (e) { routine = deepClone(seed); }
   }
+  // v3.1 -> v3.2: add the "Shoulders" warm-up group (Shoulder lifts + Misc). Runs
+  // for any stored routine.version < 7 so existing users get the new section.
+  if (seed) routine = migrateRoutineV7(routine, seed);
+  // v3.2 -> v3.3: rescale goal scores 0–3 -> 0–10. Seed-known moves adopt the seed's
+  // new scores by name; user-added moves keep theirs. Runs for any version < 8.
+  if (seed) routine = migrateRoutineV8(routine, seed);
+  // v3.3 -> v3.4: stamp per-move jointFriendly from the seed by name (seed-known moves
+  // only; user-added moves stay flag-less and are allowed by joint-friendly mode).
+  if (seed) routine = migrateRoutineV9(routine, seed);
+  // v3.4 -> v3.6: split jointFriendly into a jointStress array (['legs','arms']). Stamp
+  // seed-known moves by name; a user move that was excluded before stays excluded. Runs
+  // for any stored routine.version < 10.
+  if (seed) routine = migrateRoutineV10(routine, seed);
+  // Move-viewer tombstones: a move the user deleted must never be resurrected by a
+  // migration or a re-inserted seed move — filter deleted names after all migrations.
+  const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
+  if (tombstones.length && routine.blocks && Array.isArray(routine.blocks.moves)) {
+    routine.blocks.moves = routine.blocks.moves.filter((m) => tombstones.indexOf(m && m.name) === -1);
+  }
   renameWarmupGroups(routine);   // v2.4.1 warm-up group rename (see below)
 
   const base = freshState(routine);
   const merged = Object.assign(base, obj, {
     settings: Object.assign({}, base.settings, obj.settings || {}),
     checks: obj.checks || {},
+    // v3.6: collapsed session blocks — tolerate the field being absent in older saves.
+    collapsed: obj.collapsed && typeof obj.collapsed === 'object' ? obj.collapsed : {},
     intensity: obj.intensity || {},
     setsDone: obj.setsDone || {},
     rest: obj.rest && typeof obj.rest === 'object' ? obj.rest : { name: null, startedAt: null },
@@ -607,10 +741,9 @@ function normalizeState(obj) {
     swaps: obj.swaps || {},
     // v2.5 Auto Superset — state-level toggle, default ON (NOT part of the routine migration).
     autoSuperset: typeof obj.autoSuperset === 'boolean' ? obj.autoSuperset : true,
-    apiKey: typeof obj.apiKey === 'string' ? obj.apiKey : base.apiKey,
-    model: obj.model || base.model,
+    deletedMoves: tombstones,
     routine: routine,
-    view: obj.view || 'today'
+    view: ['today', 'daily', 'moves', 'settings'].indexOf(obj.view) >= 0 ? obj.view : 'today'
   });
   delete merged.settings.aerial;   // obsolete — aerial is now a goal
 
@@ -627,6 +760,21 @@ function normalizeState(obj) {
   ['skill', 'core', 'wts', 'mach'].forEach((k) => delete merged.settings[k]);
   if (typeof merged.settings.moves !== 'number') merged.settings.moves = base.settings.moves;
   merged.settings.moves = clamp(merged.settings.moves, 3, 15);
+  // v3.4/v3.6: joint-friendly is now two independent session toggles (legs / arms), each
+  // default off. Migrate the old single boolean: jointFriendly:true -> both on; then drop
+  // the retired key.
+  if (typeof merged.settings.jointFriendly === 'boolean') {
+    if (merged.settings.jointFriendly) {
+      merged.settings.jointFriendlyLegs = true;
+      merged.settings.jointFriendlyArms = true;
+    }
+    delete merged.settings.jointFriendly;
+  }
+  merged.settings.jointFriendlyLegs = !!merged.settings.jointFriendlyLegs;
+  merged.settings.jointFriendlyArms = !!merged.settings.jointFriendlyArms;
+  // v3.5: superset bias — integer 0–10 (default 5). Missing / non-number → 5; clamp + int.
+  merged.settings.supersetBias = typeof merged.settings.supersetBias === 'number'
+    ? clamp(merged.settings.supersetBias | 0, 0, 10) : 5;
 
   if (legacy) {
     merged.intensity = migrateIntensity(obj.intensity || {}, routine);
@@ -665,7 +813,7 @@ async function loadSeed() {
  * v3.0 schema: goals have a `kind` ("training" | "care"); training goals carry a
  * numeric weight, care goals do not. blocks = { warmup[], moves[], cooldown[] }.
  * A `moves` entry has a `section` ("floor"|"weights"|"machines"), a `goalScores`
- * map (trainingGoalId -> integer 0..3), and an optional `care` array of care-goal
+ * map (trainingGoalId -> integer 0..10), and an optional `care` array of care-goal
  * ids. warmup/cooldown entries keep a `goals` tag array. Extra fields (group,
  * rest, progression, dayLock, tempoNote, alwaysInShort, muscle) are allowed.
  */
@@ -771,15 +919,15 @@ function validateRoutine(routine) {
     if ('goalScores' in ex) {
       const gs = ex.goalScores;
       if (!gs || typeof gs !== 'object' || Array.isArray(gs)) {
-        errors.push(path + ' (' + label + '): goalScores must be an object of trainingGoalId -> 0..3');
+        errors.push(path + ' (' + label + '): goalScores must be an object of trainingGoalId -> 0..10');
       } else {
         Object.keys(gs).forEach((id) => {
           if (trainingIds.indexOf(id) === -1) {
             errors.push(path + ' (' + label + '): goalScores references unknown training goal "' + id + '"');
           }
           const v = gs[id];
-          if (!Number.isInteger(v) || v < 0 || v > 3) {
-            errors.push(path + ' (' + label + '): goalScores.' + id + ' must be an integer 0–3 (got ' + JSON.stringify(v) + ')');
+          if (!Number.isInteger(v) || v < 0 || v > 10) {
+            errors.push(path + ' (' + label + '): goalScores.' + id + ' must be an integer 0–10 (got ' + JSON.stringify(v) + ')');
           }
         });
       }
@@ -790,6 +938,24 @@ function validateRoutine(routine) {
       } else {
         ex.care.forEach((id) => {
           if (careIds.indexOf(id) === -1) errors.push(path + ' (' + label + '): care references unknown care goal "' + id + '"');
+        });
+      }
+    }
+    // v3.4: optional per-move `disabled` boolean keeps a move out of the generator pool
+    // (Moves tab toggle). v3.6: optional `jointStress` array marks which joint region(s)
+    // a move loads ('legs' and/or 'arms'); absent/empty = safe both ways. Accept the
+    // field absent; reject a non-array or an unknown region value.
+    if ('disabled' in ex && typeof ex.disabled !== 'boolean') {
+      errors.push(path + ' (' + label + '): disabled must be a boolean');
+    }
+    if ('jointStress' in ex) {
+      if (!Array.isArray(ex.jointStress)) {
+        errors.push(path + ' (' + label + '): jointStress must be an array of "legs"/"arms"');
+      } else {
+        ex.jointStress.forEach((v) => {
+          if (v !== 'legs' && v !== 'arms') {
+            errors.push(path + ' (' + label + '): jointStress has unknown region "' + v + '"');
+          }
         });
       }
     }
@@ -885,6 +1051,12 @@ function eligible(ex, day) {
   return !ex.dayLock || ex.dayLock === day;
 }
 
+// v3.6: does a move load the given joint region? `jointStress` is an optional array of
+// 'legs' (knees/ankles) and/or 'arms' (shoulders/elbows/wrists); absent/empty = safe.
+function jointStresses(ex, region) {
+  return !!(ex && Array.isArray(ex.jointStress) && ex.jointStress.indexOf(region) !== -1);
+}
+
 // Base goal-weighted score of a move: Σ over training goals of weight × score.
 // Pure given (move, goals). A move scoring 0 is off for the current weights.
 function scoreMove(move, goals) {
@@ -958,6 +1130,27 @@ function leastRecentlyCompleted(elig, log) {
 const SECTION_DECAY = 0.85;
 
 /*
+ * v3.2 "number of moves" budget cost of a chosen set of moves. With Auto Superset
+ * on, Floor moves that group into a superset (a group of >= 2) each count as HALF a
+ * move — so a superset pair costs one whole move toward the slider — while every
+ * other move costs one. Grouping mirrors supersetPlan (groupSupersets over the Floor
+ * moves that carry a `muscle`, in pool order), so selection and rendering agree. Pure.
+ */
+function sessionMoveCost(moves, autoSuperset) {
+  if (!autoSuperset) return (moves || []).length;
+  const floorMembers = (moves || [])
+    .filter((ex) => ex && (ex.section || 'floor') === 'floor' && ex.muscle)
+    .map((ex) => ({ ex: ex, block: 'floor' }));
+  const grouped = new Set();
+  groupSupersets(floorMembers).forEach((g) => {
+    if (g.members.length >= 2) g.members.forEach((m) => grouped.add(m.ex));
+  });
+  let cost = 0;
+  (moves || []).forEach((ex) => { cost += grouped.has(ex) ? 0.5 : 1; });
+  return cost;
+}
+
+/*
  * v3.0 move selection (replaces the staple/variety machinery). Pure given `st`.
  *   1. Pool = blocks.moves eligible for the day (dayLock).
  *   2. baseScore = Σ training goal weight × goalScore; drop moves scoring 0.
@@ -971,7 +1164,17 @@ const SECTION_DECAY = 0.85;
  */
 function selectMoves(st) {
   const b = (st.routine && st.routine.blocks) || {};
-  const pool = (b.moves || []).filter((ex) => eligible(ex, currentDay(st.session)));
+  // v3.4/v3.6: drop moves the user disabled in the Moves tab, and — per the two
+  // joint-friendly toggles — any move that stresses a region whose toggle is on (a move
+  // that stresses neither, e.g. most moves, is always allowed). Then apply the day
+  // (dayLock) filter as before.
+  const sfLegs = !!(st.settings && st.settings.jointFriendlyLegs);
+  const sfArms = !!(st.settings && st.settings.jointFriendlyArms);
+  const pool = (b.moves || []).filter((ex) =>
+    ex && !ex.disabled &&
+    !(sfLegs && jointStresses(ex, 'legs')) &&
+    !(sfArms && jointStresses(ex, 'arms')) &&
+    eligible(ex, currentDay(st.session)));
   const goals = ((st.routine && st.routine.goals) || []).filter((g) => g && g.kind === 'training');
   const log = st.log || [];
   const count = Math.max(st.settings.moves || 0, 0);
@@ -988,11 +1191,26 @@ function selectMoves(st) {
   const remaining = scored.slice();
   const sectionCount = {};
   const chosen = [];
-  while (chosen.length < count && remaining.length) {
+  // v3.2: superset members each cost half a move toward the budget (see
+  // sessionMoveCost), so a supersetting session pulls in more actual moves. Cost is
+  // measured over the chosen moves in pool order (matching how they render).
+  const autoSuperset = st.autoSuperset !== false;
+  // v3.5: superset bias (settings.supersetBias, 0–10, default 5). While Auto superset
+  // is on, a candidate Floor move that would land in a superset group (>= 2) with the
+  // already-chosen moves has its score multiplied by (1 + 0.1 * bias) — bias 10 = 2x,
+  // bias 0 = no change (so bias 0 reproduces pre-v3.5 selection byte-for-byte). The
+  // pair test (wouldSuperset) mirrors render-time grouping exactly; O(n^2) over the
+  // small move pool is fine.
+  const bias = (st.settings && typeof st.settings.supersetBias === 'number') ? st.settings.supersetBias : 5;
+  const biasOn = autoSuperset && bias > 0;
+  const underBudget = () =>
+    sessionMoveCost(chosen.slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset) < count;
+  while (underBudget() && remaining.length) {
     let best = -1, bestVal = -Infinity;
     for (let k = 0; k < remaining.length; k++) {
       const c = remaining[k];
-      const val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
+      let val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
+      if (biasOn && wouldSuperset(chosen, c)) val *= (1 + 0.1 * bias);
       // Strictly-greater wins; exact ties fall to the earlier pool index (stable).
       if (val > bestVal || (val === bestVal && c.i < remaining[best].i)) { bestVal = val; best = k; }
     }
@@ -1289,14 +1507,13 @@ function render() {
     renderedExercises = [];
     view.innerHTML = renderSettings();
     renderHeader(null, 'Settings');
-  } else if (state.view === 'edit') {
+  } else if (state.view === 'daily') {
+    view.innerHTML = renderDaily();   // populates renderedExercises
+    renderHeader(null, 'Daily');
+  } else if (state.view === 'moves') {
     renderedExercises = [];
-    view.innerHTML = renderEdit();
-    renderHeader(null, 'Edit routine');
-  } else if (state.view === 'ask') {
-    renderedExercises = [];
-    view.innerHTML = renderAsk();
-    renderHeader(null, 'Ask');
+    view.innerHTML = renderMoves();   // populates renderedMoves
+    renderHeader(null, 'Moves');
   } else {
     const build = buildFutureSession(state, previewOffset);   // offset 0 = today
     view.innerHTML = renderToday(build);   // populates renderedExercises
@@ -1389,12 +1606,64 @@ function renderTabs() {
   ).join('');
 }
 
+/*
+ * v3.4: the Gym tab's collapsible "Adjust session" panel. Default collapsed
+ * (ui.adjustOpen, transient/in-memory). Reuses the shared session-tuning controls so
+ * it's one source of truth with Settings. Changing any control fires the existing
+ * onChange handlers (setting / goal-weight / toggle-joint-friendly), each of which
+ * re-renders — regenerating the visible session live; ui.adjustOpen keeps the panel
+ * open across those re-renders.
+ */
+function renderAdjustPanel() {
+  const open = ui.adjustOpen;
+  let h = '<section class="adjust-panel' + (open ? ' is-open' : '') + '">';
+  h += '<button class="adjust-toggle" data-action="toggle-adjust" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+    '<span>Adjust session</span><span class="adjust-caret">' + (open ? '▾' : '▸') + '</span></button>';
+  if (open) {
+    h += '<div class="adjust-body">' +
+      renderSettingSlider('moves', 'Number of moves') +
+      renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
+      renderJointFriendlyField() +
+      renderSupersetBiasField() +
+      '<div class="adjust-goals-head">Goal weights</div>' +
+      renderGoalWeightSliders() +
+      '</div>';
+  }
+  return h + '</section>';
+}
+
+/*
+ * v3.6: wrap a session block so its title toggles collapse. The <h2> is the tap
+ * target (data-action="toggle-block", keyed by the block key) — collapse state
+ * lives in state.collapsed, NOT the DOM, so it survives the app's re-render on
+ * every check-off. `units` is this block's slice of renderedExercises (one entry
+ * per rendered card, incl. warm-up group / superset synthetics), so the collapsed
+ * header's done/total count reads the exact same state.checks data the cards do.
+ * The count is skipped in preview, where state.checks reflects today, not the peek.
+ */
+function renderBlock(key, title, inner, units) {
+  const collapsed = !!(state.collapsed && state.collapsed[key]);
+  let countHtml = '';
+  if (!inPreview() && units && units.length) {
+    const done = units.filter((u) => u && state.checks[u.name]).length;
+    countHtml = ' <span class="block-count">' + done + '/' + units.length + '</span>';
+  }
+  return '<section class="block' + (collapsed ? ' is-collapsed' : '') + '">' +
+    '<h2 class="block-title" data-action="toggle-block" data-block="' + escapeHtml(key) + '">' +
+    '<span class="block-chevron" aria-hidden="true"></span>' +
+    '<span class="block-name">' + escapeHtml(title) + '</span>' + countHtml + '</h2>' +
+    '<div class="block-cards">' + inner + '</div></section>';
+}
+
 function renderToday(build) {
   renderedExercises = [];
   const preview = inPreview();
   let html = renderPreviewBar(build);
   // Suggestions (incl. swap chips) are interactive — hide them while previewing.
   if (!preview) html += renderSuggestions(build);
+  // v3.4: collapsible "Adjust session" — the same sliders/toggles as Settings, live in
+  // the Gym tab so tuning immediately re-generates the session below. Hidden in preview.
+  if (!preview) html += renderAdjustPanel();
 
   // v3.0 safety note: warn when goal weights leave no scored moves to select.
   const hasMoves = build.blocks.some((bl) =>
@@ -1410,6 +1679,7 @@ function renderToday(build) {
 
   build.blocks.forEach((bl) => {
     if (!bl.exercises.length) return;   // skip empty blocks (e.g. machines at count 0)
+    const startIdx = renderedExercises.length;   // v3.6: this block's slice, for the collapsed count
     let inner = '';
     if (bl.key === 'warmup') {
       // v2.4.1: collapse the warm-up block's RENDERING to one card per contiguous
@@ -1450,8 +1720,7 @@ function renderToday(build) {
       });
     }
     if (!inner) return;   // every move here was absorbed into a superset anchored elsewhere
-    html += '<section class="block"><h2 class="block-title">' + escapeHtml(bl.title) + '</h2>' +
-      inner + '</section>';
+    html += renderBlock(bl.key, bl.title, inner, renderedExercises.slice(startIdx));
   });
   if (!preview) html += renderFinish();   // no finishing a future preview
   return html;
@@ -1554,6 +1823,28 @@ function groupSupersets(members) {
     else groups.push({ location: loc, members: [m] });
   });
   return groups;
+}
+
+/*
+ * v3.5 superset-bias predicate (pure; exported for tests). Would adding `cand` (a
+ * greedy pick { move, i }) to the already-chosen picks `entries` ({ move, i }) place
+ * it in a superset group of >= 2? Mirrors render-time grouping: the chosen floor+muscle
+ * moves plus the candidate, ordered by pool index, mapped to { ex, block:'floor' } and
+ * run through groupSupersets; true iff the candidate's resulting group has >= 2 members.
+ * Non-Floor / muscle-less candidates never pair (return false).
+ */
+function wouldSuperset(entries, cand) {
+  if (!cand || !cand.move || (cand.move.section || 'floor') !== 'floor' || !cand.move.muscle) return false;
+  const floor = (entries || [])
+    .filter((o) => o && o.move && (o.move.section || 'floor') === 'floor' && o.move.muscle)
+    .concat([cand])
+    .sort((a, b) => a.i - b.i)
+    .map((o) => ({ ex: o.move, block: 'floor' }));
+  const groups = groupSupersets(floor);
+  for (let gi = 0; gi < groups.length; gi++) {
+    if (groups[gi].members.some((m) => m.ex === cand.move)) return groups[gi].members.length >= 2;
+  }
+  return false;
 }
 
 /*
@@ -1707,7 +1998,7 @@ function renderCard(ex, idx, blockKey) {
   const done = !preview && !!state.checks[ex.name];
   const overridden = currentLevel(ex) > 0;
   const expanded = !preview && ui.expanded.has(ex.name);
-  const showProg = expanded && blockKey !== 'warmup' && blockKey !== 'cooldown';
+  const showProg = expanded && blockKey !== 'warmup' && blockKey !== 'cooldown' && blockKey !== 'daily';
 
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
@@ -1827,51 +2118,342 @@ function renderFinish() {
   return '<button class="btn primary big" data-action="finish">Finish session</button>';
 }
 
+/*
+ * The "Daily" tab: the static warm-up and cool-down (reusing the Gym view's grouped
+ * warm-up card + cool-down rendering and check-off) plus the daily Tuck jumps stim
+ * after the warm-up. Shares state.checks with the Gym view for the same warm-up /
+ * cool-down items, so a daily item stays checked across both tabs.
+ */
+function renderDaily() {
+  renderedExercises = [];
+  const b = (state.routine && state.routine.blocks) || {};
+  let html = '';
+
+  // Warm-up — same grouped-card rendering / check-off as the Gym view.
+  const warmup = (b.warmup || []);
+  if (warmup.length) {
+    const startIdx = renderedExercises.length;
+    let inner = '';
+    warmupGroups(warmup).forEach((item) => {
+      const idx = renderedExercises.length;
+      if (item.kind === 'group') {
+        renderedExercises.push(item.card);
+        inner += renderWarmupGroupCard(item.card, idx);
+      } else {
+        renderedExercises.push(item.ex);
+        inner += renderCard(item.ex, idx, 'warmup');
+      }
+    });
+    html += renderBlock('warmup', 'Warm-up', inner, renderedExercises.slice(startIdx));
+  }
+
+  // Tuck jumps — the daily jumping stim, placed right after the warm-up.
+  {
+    const idx = renderedExercises.length;
+    renderedExercises.push(DAILY_TUCK_JUMPS);
+    html += renderBlock('daily', 'Jumps', renderCard(DAILY_TUCK_JUMPS, idx, 'daily'),
+      renderedExercises.slice(idx));
+  }
+
+  // Cool-down — full list, same rendering / check-off as the Gym view.
+  const cooldown = (b.cooldown || []);
+  if (cooldown.length) {
+    const startIdx = renderedExercises.length;
+    let inner = '';
+    cooldown.forEach((ex) => {
+      const idx = renderedExercises.length;
+      renderedExercises.push(ex);
+      inner += renderCard(ex, idx, 'cooldown');
+    });
+    html += renderBlock('cooldown', 'Cool-down', inner, renderedExercises.slice(startIdx));
+  }
+
+  return html;
+}
+
+/* --- Move viewer (browse / add / delete the generator's move pool) -------- */
+
+// The full pool of selectable moves, grouped by section, each with its 0–10 goal
+// scores; plus an add-move form. Deleting tombstones the move (see deleteMove) so a
+// seed migration can't resurrect it; adding pushes straight into routine.blocks.moves.
+function renderMoves() {
+  renderedMoves = [];
+  const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training');
+  const moves = (state.routine.blocks && state.routine.blocks.moves) || [];
+  let html = '<div class="moves-viewer">';
+
+  html += '<section class="panel"><h3>Moves (' + moves.length + ')</h3>' +
+    '<p class="muted">Everything the session generator can pick from, with its 0–10 goal scores. ' +
+    'Delete removes a move for good (it won\'t come back on updates); Add creates a new one.</p>';
+  MOVE_SECTIONS.forEach((sec) => {
+    const inSec = moves.filter((m) => (m.section || 'floor') === sec.key);
+    if (!inSec.length) return;
+    html += '<h4 class="mv-sec">' + escapeHtml(sec.title) + '</h4>';
+    inSec.forEach((m) => {
+      const idx = renderedMoves.length;
+      renderedMoves.push(m);
+      html += renderMoveRow(m, idx, training);
+    });
+  });
+  if (!moves.length) html += '<p class="muted">No moves yet — add one below.</p>';
+  html += '</section>';
+
+  html += renderAddMoveForm(training);
+  return html + '</div>';
+}
+
+function renderMoveRow(m, idx, training) {
+  const gs = m.goalScores || {};
+  const scoreChips = training.filter((g) => gs[g.id] > 0)
+    .sort((a, b) => gs[b.id] - gs[a.id])
+    .map((g) => '<span class="mv-score c-' + escapeHtml(g.colorId || 'gray') + '">' +
+      escapeHtml(g.name) + ' ' + gs[g.id] + '</span>').join(' ');
+  const careChips = (m.care || []).map((id) =>
+    '<span class="chip c-' + escapeHtml(goalColor(id)) + '">' + escapeHtml(goalName(id)) + '</span>').join(' ');
+  const meta = [escapeHtml(formatDose(m.dose || { sets: 0, amount: 0, unit: '' }))];
+  if (m.muscle) meta.push('muscle: ' + escapeHtml(m.muscle));
+  if (m.dayLock) meta.push('day ' + escapeHtml(m.dayLock));
+  // v3.6: flag which joint region(s) a move loads — it drops out when that toggle is on.
+  if (jointStresses(m, 'legs')) meta.push('<span class="mv-flag-warn">stresses knees/ankles</span>');
+  if (jointStresses(m, 'arms')) meta.push('<span class="mv-flag-warn">stresses shoulders/elbows/wrists</span>');
+  const disabled = !!m.disabled;
+  return '<div class="mv-row' + (disabled ? ' mv-row-disabled' : '') + '">' +
+    '<div class="mv-row-head">' +
+      '<span class="mv-name">' + escapeHtml(m.name) +
+        (disabled ? ' <span class="mv-off">disabled</span>' : '') + '</span>' +
+      '<div class="mv-row-actions">' +
+        '<label class="mv-enable" title="Include this move in generated sessions">' +
+          '<input type="checkbox" data-action="mv-toggle" data-idx="' + idx + '"' +
+            (disabled ? '' : ' checked') + ' aria-label="Enable ' + escapeHtml(m.name) + '">' +
+          '<span>' + (disabled ? 'Off' : 'On') + '</span></label>' +
+        '<button class="btn small danger" data-action="mv-delete" data-idx="' + idx + '">Delete</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="mv-meta">' + meta.join(' · ') + '</div>' +
+    (scoreChips ? '<div class="mv-scores">' + scoreChips + '</div>' : '') +
+    (careChips ? '<div class="mv-scores">' + careChips + '</div>' : '') +
+    (m.why ? '<div class="mv-why">' + escapeHtml(m.why) + '</div>' : '') +
+    '</div>';
+}
+
+function renderAddMoveForm(training) {
+  let h = '<section class="panel add-move"><h3>Add a move</h3>';
+  h += '<div class="field"><label for="mv-name">Name</label>' +
+    '<input type="text" id="mv-name" placeholder="e.g. Pike push-up"></div>';
+  h += '<div class="row wrap">' +
+    '<div class="field"><label for="mv-section">Section</label><select id="mv-section">' +
+      MOVE_SECTIONS.map((s) => '<option value="' + s.key + '">' + escapeHtml(s.title) + '</option>').join('') +
+      '</select></div>' +
+    '<div class="field"><label for="mv-daylock">Day</label><select id="mv-daylock">' +
+      '<option value="">Both</option><option value="A">A only</option><option value="B">B only</option>' +
+      '</select></div>' +
+    '</div>';
+  h += '<div class="row wrap">' +
+    '<div class="field"><label for="mv-sets">Sets</label><input type="number" id="mv-sets" min="1" max="6" step="1" value="3"></div>' +
+    '<div class="field"><label for="mv-amount">Amount</label><input type="number" id="mv-amount" min="1" step="1" value="10"></div>' +
+    '<div class="field"><label for="mv-unit">Unit</label><select id="mv-unit">' +
+      UNITS.map((u) => '<option value="' + escapeHtml(u) + '">' + escapeHtml(u) + '</option>').join('') + '</select></div>' +
+    '<div class="field"><label for="mv-weight">Weight lb</label><input type="number" id="mv-weight" min="0" step="1" placeholder="—"></div>' +
+    '</div>';
+  h += '<div class="row wrap">' +
+    '<div class="field"><label for="mv-muscle">Muscle (Floor supersets)</label><input type="text" id="mv-muscle" placeholder="optional, e.g. core"></div>' +
+    '<div class="field"><label for="mv-why">Why</label><input type="text" id="mv-why" placeholder="optional purpose"></div>' +
+    '</div>';
+  // v3.6: polarity flip vs the old single "is friendly" checkbox — each box now marks a
+  // region the move STRESSES (both off = jointStress omitted, i.e. safe both ways).
+  h += '<div class="field toggle"><label for="mv-joint-legs">Stresses knees/ankles</label>' +
+    '<input type="checkbox" id="mv-joint-legs"></div>';
+  h += '<div class="field toggle"><label for="mv-joint-arms">Stresses shoulders/elbows/wrists</label>' +
+    '<input type="checkbox" id="mv-joint-arms"></div>';
+  h += '<div class="field"><label>Goal scores (0–10)</label><div class="mv-goal-scores">' +
+    training.map((g) =>
+      '<div class="mv-goal-field"><span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' +
+        escapeHtml(g.name) + '</span>' +
+        '<input type="number" id="mv-score-' + escapeHtml(g.id) + '" min="0" max="10" step="1" value="0">' +
+      '</div>').join('') +
+    '</div></div>';
+  h += '<div id="mv-errors" class="errors"></div>';
+  h += '<div class="row"><button class="btn primary" data-action="mv-add">Add move</button></div>';
+  return h + '</section>';
+}
+
+// v3.4: enable/disable a move without deleting it. A disabled move stays listed in
+// the Moves tab (dimmed) but is excluded from the generator pool (see selectMoves).
+// Stored as `disabled: true` on the move (the flag is omitted when enabled). `m` is a
+// live reference into state.routine.blocks.moves, so mutating it persists.
+function toggleMoveDisabled(i) {
+  const m = renderedMoves[i];
+  if (!m) return;
+  if (m.disabled) delete m.disabled;
+  else m.disabled = true;
+  saveState();
+  render();
+}
+
+// Delete (with confirm) + tombstone so no future seed migration brings it back.
+function deleteMove(i) {
+  const m = renderedMoves[i];
+  if (!m) return;
+  if (typeof confirm === 'function' &&
+      !confirm('Delete "' + m.name + '"? It won\'t come back on future updates.')) return;
+  const moves = (state.routine.blocks && state.routine.blocks.moves) || [];
+  const at = moves.indexOf(m);
+  if (at !== -1) moves.splice(at, 1);
+  state.deletedMoves = state.deletedMoves || [];
+  if (m.name && state.deletedMoves.indexOf(m.name) === -1) state.deletedMoves.push(m.name);
+  // Drop any per-move session state so a stale key can't linger.
+  delete state.intensity[m.name];
+  delete state.checks[m.name];
+  delete state.setsDone[m.name];
+  if (ui.expanded.has(m.name)) ui.expanded.delete(m.name);
+  saveState();
+  render();
+}
+
+// Build a move from the add form, validate the whole routine with it, then persist.
+function addMove() {
+  if (typeof document === 'undefined') return;
+  const g = (id) => document.getElementById(id);
+  const errBox = g('mv-errors');
+  const showErr = (msgs) => { if (errBox) { errBox.innerHTML = msgs.map(escapeHtml).join('<br>'); errBox.classList.add('show'); } };
+
+  const name = ((g('mv-name') && g('mv-name').value) || '').trim();
+  if (!name) { showErr(['Give the move a name.']); return; }
+
+  const move = {
+    name: name,
+    section: g('mv-section').value,
+    dose: { sets: Math.round(+g('mv-sets').value), amount: +g('mv-amount').value, unit: g('mv-unit').value },
+    goalScores: {},
+    why: ((g('mv-why') && g('mv-why').value) || '').trim() || 'Added in the Move viewer'
+  };
+  const w = parseFloat(g('mv-weight').value);
+  if (!isNaN(w) && w > 0) move.dose.weight = w;
+  const muscle = ((g('mv-muscle') && g('mv-muscle').value) || '').trim();
+  if (muscle) move.muscle = muscle;
+  const day = g('mv-daylock').value;
+  if (day === 'A' || day === 'B') move.dayLock = day;
+  // v3.6: the two "stresses X" checkboxes write the jointStress array; both off omits it.
+  const stress = [];
+  const jLegs = g('mv-joint-legs');
+  const jArms = g('mv-joint-arms');
+  if (jLegs && jLegs.checked) stress.push('legs');
+  if (jArms && jArms.checked) stress.push('arms');
+  if (stress.length) move.jointStress = stress;
+
+  (state.routine.goals || []).filter((x) => x && x.kind === 'training').forEach((gg) => {
+    const el = g('mv-score-' + gg.id);
+    const v = el ? Math.round(+el.value) : 0;
+    if (v > 0) move.goalScores[gg.id] = clamp(v, 0, 10);
+  });
+
+  const trial = deepClone(state.routine);
+  trial.blocks.moves = (trial.blocks.moves || []).concat([move]);
+  const v = validateRoutine(trial);
+  if (!v.valid) { showErr(v.errors); return; }
+
+  state.routine.blocks = state.routine.blocks || {};
+  state.routine.blocks.moves = state.routine.blocks.moves || [];
+  state.routine.blocks.moves.push(move);
+  // If this name was previously tombstoned, adding it back un-tombstones it.
+  state.deletedMoves = (state.deletedMoves || []).filter((n) => n !== name);
+  saveState();
+  render();
+}
+
+/* --- Shared session-tuning controls (rendered in Settings AND the Gym tab) --
+ * v3.4: one source of truth for the moves/cool sliders, the training-goal weight
+ * sliders, and the joint-friendly + auto-superset toggles. Settings composes them
+ * into its panels; the Gym tab's collapsible "Adjust session" panel reuses the same
+ * markup so both stay in sync. All read live state and carry the same data-action
+ * hooks, so onChange's existing handlers re-generate the session either place. */
+
+// One session slider (moves / cool). Range comes from routine.structure.sliders.
+function renderSettingSlider(key, label) {
+  const ranges = (state.routine.structure && state.routine.structure.sliders) || DEFAULT_RANGES;
+  const [lo, hi] = ranges[key] || DEFAULT_RANGES[key];
+  const val = clamp(state.settings[key], lo, hi);
+  return '<div class="field">' +
+    '<label>' + escapeHtml(label) + ' <span class="val">' + val + '</span></label>' +
+    '<input type="range" data-action="setting" data-key="' + escapeHtml(key) + '" min="' + lo + '" max="' + hi + '" step="1" value="' + val + '">' +
+    '</div>';
+}
+
+// A 0–10 weight slider per TRAINING goal (0 = off).
+function renderGoalWeightSliders() {
+  const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training');
+  return training.map((g) => {
+    const w = clamp(typeof g.weight === 'number' ? g.weight : 0, 0, 10);
+    return '<div class="field">' +
+      '<label>' +
+        '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span> ' +
+        '<span class="val">' + w + '</span></label>' +
+      '<input type="range" data-action="goal-weight" data-goal="' + escapeHtml(g.id) + '" ' +
+        'min="0" max="10" step="1" value="' + w + '">' +
+    '</div>';
+  }).join('');
+}
+
+// Joint-friendly toggles (v3.4; split legs/arms in v3.6). Each hides moves that stress
+// its region from generation. data-region tells the shared onChange which toggle fired.
+function renderJointFriendlyField() {
+  return '<div class="field toggle">' +
+    '<label for="joint-friendly-legs">Joint-friendly: legs (knees/ankles)</label>' +
+    '<input type="checkbox" id="joint-friendly-legs" data-action="toggle-joint-friendly" data-region="legs"' +
+      (state.settings.jointFriendlyLegs ? ' checked' : '') + '>' +
+    '</div>' +
+    '<div class="field toggle">' +
+    '<label for="joint-friendly-arms">Joint-friendly: arms (shoulders/elbows/wrists)</label>' +
+    '<input type="checkbox" id="joint-friendly-arms" data-action="toggle-joint-friendly" data-region="arms"' +
+      (state.settings.jointFriendlyArms ? ' checked' : '') + '>' +
+    '</div>';
+}
+
+// Auto-superset toggle.
+function renderAutoSupersetField() {
+  return '<div class="field toggle">' +
+    '<label for="auto-superset">Auto superset</label>' +
+    '<input type="checkbox" id="auto-superset" data-action="toggle-superset"' +
+      (state.autoSuperset ? ' checked' : '') + '>' +
+    '</div>';
+}
+
+// Superset-bias slider (v3.5): 0–10, higher = the generator prefers moves that pair
+// into supersets (applies only while Auto superset is on). Range is hard-coded 0–10 —
+// NOT sourced from routine.structure.sliders — and shows its value like a goal slider.
+function renderSupersetBiasField() {
+  const val = clamp(typeof state.settings.supersetBias === 'number' ? state.settings.supersetBias : 5, 0, 10);
+  return '<div class="field">' +
+    '<label>Superset bias <span class="val">' + val + '</span></label>' +
+    '<input type="range" data-action="setting" data-key="supersetBias" min="0" max="10" step="1" value="' + val + '">' +
+    '</div>';
+}
+
 /* --- Settings view -------------------------------------------------------- */
 
 function renderSettings() {
-  const s = state.settings;
-  const ranges = (state.routine.structure && state.routine.structure.sliders) || DEFAULT_RANGES;
-
-  const slider = (key, label) => {
-    const [lo, hi] = ranges[key] || DEFAULT_RANGES[key];
-    const val = clamp(s[key], lo, hi);
-    return '<div class="field">' +
-      '<label>' + escapeHtml(label) + ' <span class="val">' + val + '</span></label>' +
-      '<input type="range" data-action="setting" data-key="' + key + '" min="' + lo + '" max="' + hi + '" step="1" value="' + val + '">' +
-      '</div>';
-  };
-
   let html = '<div class="settings">';
 
-  // Session knobs (v3.0: one unified "moves" slider + cool-down + auto superset).
+  // Session knobs (v3.0: one unified "moves" slider + cool-down; v3.4 adds the
+  // joint-friendly toggle beside auto superset).
   html += '<section class="panel"><h3>Session</h3>' +
-    slider('moves', 'Number of moves') +
-    slider('cool', 'Cool-down (1 = short, 2 = full)') +
-    '<div class="field toggle">' +
-      '<label for="auto-superset">Auto superset</label>' +
-      '<input type="checkbox" id="auto-superset" data-action="toggle-superset"' +
-        (state.autoSuperset ? ' checked' : '') + '>' +
-    '</div>' +
-    '<p class="muted">Groups same-muscle-free Floor moves into supersets — ' +
-      'one card, alternate the moves, rest after each round.</p>' +
+    renderSettingSlider('moves', 'Number of moves') +
+    renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
+    renderJointFriendlyField() +
+    renderAutoSupersetField() +
+    renderSupersetBiasField() +
+    '<p class="muted">Joint-friendly mode limits the session to moves that are easy on ' +
+      'recovering joints. Auto superset groups same-muscle-free Floor moves into supersets — ' +
+      'one card, alternate the moves, rest after each round. ' +
+      'Higher superset bias makes the generator prefer moves that pair into supersets; ' +
+      'it only applies while Auto superset is on.</p>' +
     '</section>';
 
   // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
   // are always on (they live in the static warm-up / cool-down) and get no slider.
-  const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training');
   const care = (state.routine.goals || []).filter((g) => g && g.kind === 'care');
   html += '<section class="panel"><h3>Goals</h3>' +
-    training.map((g) => {
-      const w = clamp(typeof g.weight === 'number' ? g.weight : 0, 0, 10);
-      return '<div class="field">' +
-        '<label>' +
-          '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span> ' +
-          '<span class="val">' + w + '</span></label>' +
-        '<input type="range" data-action="goal-weight" data-goal="' + escapeHtml(g.id) + '" ' +
-          'min="0" max="10" step="1" value="' + w + '">' +
-      '</div>';
-    }).join('') +
+    renderGoalWeightSliders() +
     '<p class="muted">Higher weight pulls a goal\'s moves in more often. 0 turns it off.</p>' +
     '</section>';
 
@@ -1881,28 +2463,6 @@ function renderSettings() {
       '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span>'
     ).join(' ') + '</div>' +
     '<p class="muted">These are always on — no need to weight them.</p>' +
-    '</section>';
-
-  // AI routine editing (Phase 5) — password key + model toggle. Optional:
-  // everything else in the app works fully with no key set.
-  html += '<section class="panel"><h3>AI routine editing (optional)</h3>' +
-    '<div class="field">' +
-      '<label for="apikey">Anthropic API key</label>' +
-      '<input type="password" id="apikey" data-action="apikey" autocomplete="off" ' +
-        'autocapitalize="off" spellcheck="false" placeholder="sk-ant-…" value="' +
-        escapeHtml(state.apiKey || '') + '">' +
-    '</div>' +
-    '<div class="field">' +
-      '<label for="model">Model</label>' +
-      '<select id="model" data-action="model">' +
-        MODELS.map((m) => '<option value="' + escapeHtml(m.id) + '"' +
-          (state.model === m.id ? ' selected' : '') + '>' + escapeHtml(m.label) + '</option>').join('') +
-      '</select>' +
-    '</div>' +
-    '<p class="muted">Your key is stored only on this device and is sent only to ' +
-      'api.anthropic.com — never committed, never to any other server. ' +
-      'Recommended: set a monthly spend limit in the Anthropic Console. ' +
-      'The rest of the app (workouts, logging, heuristics) works fully without a key.</p>' +
     '</section>';
 
   // Data
@@ -1972,19 +2532,16 @@ function onClick(e) {
     case 'prev-day': setPreviewOffset(previewOffset - 1); break;
     case 'next-day': setPreviewOffset(previewOffset + 1); break;
     case 'back-to-today': setPreviewOffset(0); break;
+    case 'toggle-adjust': ui.adjustOpen = !ui.adjustOpen; render(); break;   // v3.4 Gym panel
+    case 'toggle-block': toggleBlock(el.dataset.block); break;               // v3.6 collapse a session block
     case 'export': exportState(); break;
     case 'clear': clearData(); break;
     case 'rollback': rollback(+el.dataset.hidx); break;
     case 'save-routine': saveRoutineFromEditor(); break;
     case 'suggest-apply': applySuggestion(+el.dataset.sidx); break;
     case 'suggest-dismiss': dismissSuggestion(+el.dataset.sidx); break;
-    // Phase 5 (LLM) — all gated behind explicit user action.
-    case 'llm-goto-settings': setView('settings'); break;
-    case 'llm-send-edit': sendEdit(); break;
-    case 'llm-apply': applyProposal(); break;
-    case 'llm-discard': discardProposal(); break;
-    case 'ask-send': sendAsk(); break;
-    case 'ask-forward': forwardToEditor(+el.dataset.i); break;
+    case 'mv-delete': deleteMove(+el.dataset.idx); break;   // idx into renderedMoves
+    case 'mv-add': addMove(); break;
     default: break;
   }
 }
@@ -2034,15 +2591,16 @@ function onChange(e) {
     state.autoSuperset = el.checked;   // v2.5 Auto Superset on/off
     saveState();
     render();
+  } else if (action === 'toggle-joint-friendly') {
+    // v3.6: one handler for both region toggles; data-region says which one fired.
+    if (el.dataset.region === 'legs') state.settings.jointFriendlyLegs = el.checked;
+    else if (el.dataset.region === 'arms') state.settings.jointFriendlyArms = el.checked;
+    saveState();
+    render();
+  } else if (action === 'mv-toggle') {
+    toggleMoveDisabled(+el.dataset.idx);         // v3.4 Moves-tab enable/disable
   } else if (action === 'import') {
     importFile(el.files && el.files[0]);
-  } else if (action === 'apikey') {
-    // Persist quietly — no re-render, so focus/caret in the field is preserved.
-    state.apiKey = el.value.trim();
-    saveState();
-  } else if (action === 'model') {
-    state.model = el.value;
-    saveState();
   }
 }
 
@@ -2164,6 +2722,7 @@ function setDone(ex, blockKey, k) {
 
 function setView(v) {
   state.view = v;
+  previewOffset = 0;               // day preview is a Today-only transient — reset on tab change
   saveState();
   render();
 }
@@ -2172,6 +2731,18 @@ function setView(v) {
 // saved (no saveState), so a refresh returns to today.
 function setPreviewOffset(n) {
   previewOffset = clamp(n, 0, PREVIEW_MAX);
+  render();
+}
+
+// v3.6: collapse/expand a session block by key. State lives in state.collapsed (not
+// the DOM) so it survives the re-render on every check-off, and is saved so it also
+// survives reload. Reset to {} on finish, so each new session starts fully expanded.
+function toggleBlock(key) {
+  if (!key) return;
+  if (!state.collapsed || typeof state.collapsed !== 'object') state.collapsed = {};
+  if (state.collapsed[key]) delete state.collapsed[key];
+  else state.collapsed[key] = true;
+  saveState();
   render();
 }
 
@@ -2215,6 +2786,7 @@ function finishSession(note) {
   state.log.push(entry);
   state.session += 1;
   state.checks = {};
+  state.collapsed = {};          // v3.6: a fresh session starts with every block expanded
   state.swaps = {};              // Phase 4: swaps are per-session trials — clear on finish
   state.setsDone = {};           // Feature E: per-session, cleared on finish
   state.rest = { name: null, startedAt: null };
@@ -2576,652 +3148,6 @@ function dismissSuggestion(i) {
   render();
 }
 
-/* --- 11. LLM integration (Phase 5 — BYO Anthropic key) -------------------- *
- * PRIMARY PURPOSE: natural-language routine editing (5a). Secondary: Ask (5b).
- * Everything here is gated behind explicit user action — no LLM call ever
- * happens on its own. Degrades gracefully with no key / offline: the UI shows
- * an inline message instead of a dead input, and the rest of the app is
- * untouched. All chat/edit UI state lives in ui.llm (in-memory only).
- * ==========================================================================*/
-
-const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
-let LLM_RETRY_MS = 1500;   // delay before the single 429/529 retry (0 in tests)
-
-// Constraints/goals blurb sent with every 5a edit (from the spec + seed).
-const GOALS_BLURB =
-  '2–3 sessions/week, alternating A/B day structure. Training goals are weighted: ' +
-  'flip (backflip power & endurance), core (stronger core), and gym (general gymnastics) ' +
-  'are the primary drivers; aerial is optional (weight 0 = off by default). Each move ' +
-  'carries goalScores (a training-goal id -> 0..3), and the session picks the highest ' +
-  'goal-weighted-scoring moves (with per-section diminishing returns so Floor, Weights and ' +
-  'Machines each stay represented), so raising a goal\'s weight pulls its moves in. Care goals ' +
-  'are always on and live in the STATIC warm-up and cool-down — splits (hip/hamstring ' +
-  'end-range), plantar (plantar fasciitis: keep impact conservative, keep slow calf ' +
-  'loading), cubital (cubital tunnel: no aggressive elbow-lockout pressing volume), ' +
-  'posture (keep the pulling / row work), sciatic (gentle nerve mobility, lives in the ' +
-  'splits routine), and recovery (joint-friendly recovery). A move may also list `care` ' +
-  'ids it happens to serve (display only). The user already stims by jumping (extra daily ' +
-  'impact through the feet), so added plyometric/impact volume should stay conservative. ' +
-  'The warm-up and cool-down are static — only change them when the user explicitly asks.';
-
-// 5a system prompt: ONLY-JSON output, the full schema, and every guardrail.
-const EDIT_SYSTEM_PROMPT =
-  'You are a strength & tumbling coach editing a workout routine stored as JSON.\n\n' +
-  'Respond with ONLY a single JSON object — no markdown, no code fences, no prose ' +
-  'before or after. It MUST have exactly this shape:\n' +
-  '{\n' +
-  '  "routine": <the COMPLETE new routine object, same schema as the input>,\n' +
-  '  "changes": ["short human-readable description of each change", ...],\n' +
-  '  "warnings": ["anything the user should double-check", ...]\n' +
-  '}\n' +
-  'Return the ENTIRE routine, not a diff. Copy every field you are not changing ' +
-  'exactly as given.\n\n' +
-  'ROUTINE SCHEMA:\n' +
-  '- Top level: { version:int, goals:[...], blocks:{...}, structure?:{...} }\n' +
-  '- goals: array of { id:string, name:string, kind:"training"|"care", colorId:string, weight?:number }. ' +
-  'Training goals carry a numeric weight 0–10 (0 = off); care goals have NO weight and are always on. ' +
-  'colorId is one of: purple, teal, coral, pink, gray, green, amber, blue, slate, orange.\n' +
-  '- blocks: { warmup:[static...], moves:[move...], cooldown:[static...] }.\n' +
-  '  `moves` is ONE unified pool; the app scores and picks from it. `moves` must be non-empty. ' +
-  'No duplicate names within a block.\n' +
-  '- move (an entry in blocks.moves): {\n' +
-  '    name: string (unique),\n' +
-  '    section: "floor" | "weights" | "machines",   // which on-page group it renders in\n' +
-  '    dose: { sets:int 1-6, amount:number>0, unit: "sec"|"sec/side"|"reps"|"reps/side"|"min", weight?:number },  // weight is lb, loaded moves only\n' +
-  '    goalScores: { <trainingGoalId>: 0..3, ... },  // 3 = primary driver, 2 = strong, 1 = supportive; omit zero entries; the top-scoring goal drives the card color\n' +
-  '    care?: [ <careGoalId>, ... ],   // care goals this move also serves (display chips only)\n' +
-  '    why: short string explaining the purpose,\n' +
-  '    rest?: int,                     // rest-clock target in seconds\n' +
-  '    progression?: { step:number, max:number, maxSets:number, weightStep?:number },\n' +
-  '    dayLock?: "A" | "B",            // move only appears on that day\n' +
-  '    muscle?: string                 // coarse muscle group; Floor moves only — drives Auto Superset grouping, preserve it\n' +
-  '  }\n' +
-  '- static (an entry in blocks.warmup / blocks.cooldown): { name, dose, goals:[goalId...], why, group?, progression?, alwaysInShort? }. ' +
-  'These keep a plain `goals` tag array (care ids); do NOT give them goalScores.\n' +
-  '  Auto Superset groups Floor moves with distinct muscles into one card — keep each Floor move\'s muscle field when you edit it.\n' +
-  '  Double progression (weighted moves): reps climb from dose.amount to progression.max by step, ' +
-  'then the weight rises by weightStep (lb) and reps reset — set weight + weightStep together on loaded lifts.\n\n' +
-  'GUARDRAILS (follow strictly):\n' +
-  '- Preserve the A/B day structure and the block shapes unless the user explicitly asks to change them.\n' +
-  '- Never remove health/rehab items (slow calf work, nerve/sciatic care, rows/pulling, tibialis ' +
-  'raises, plantar-fascia and posture work) unless the user explicitly names that item for removal — ' +
-  'and if they do, add a warning.\n' +
-  '- Respect known issues: no aggressive elbow-lockout pressing volume (cubital tunnel); keep impact / ' +
-  'plyometric volume conservative (plantar fasciitis, joint recovery); the user already gets daily ' +
-  'impact from jumping.\n' +
-  '- The warm-up and cool-down are static — only add, edit, or remove their items when the user explicitly asks.\n' +
-  '- When adding a new training goal, give it an explicit id, kind:"training", weight, and colorId, and ' +
-  'set goalScores on the moves that serve it so the generator can pick them.\n' +
-  '- For anything symptom- or pain-related, adjust conservatively and add a warning recommending the ' +
-  'user see a physical therapist rather than prescribing rehab.\n' +
-  '- Keep dayLock semantics intact on moves you keep.';
-
-// 5b system prompt: technique/planning assistant, not medical advice.
-const ASK_SYSTEM_PROMPT =
-  'You are a knowledgeable tumbling and strength-training assistant helping the user plan and ' +
-  'refine a workout routine. Answer questions about technique, programming, and progression ' +
-  'concisely and practically. You are a technique and planning assistant, NOT a medical ' +
-  'professional — for pain, injury, or symptoms, recommend seeing a physical therapist rather ' +
-  'than prescribing treatment. If you suggest a concrete change to the routine, phrase it clearly ' +
-  'so it can be forwarded to the routine editor, but do NOT output JSON here.';
-
-function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
-// Attach a machine-readable kind to LLM errors so callers can pick a message.
-function llmError(kind, message) {
-  const e = new Error(message);
-  e.kind = kind;
-  return e;
-}
-
-/*
- * Shared API helper — the ONLY place that talks to Anthropic. Uses the exact
- * fetch shape from the spec (browser-direct via the dangerous-direct-browser
- * header). Error handling per spec:
- *   offline / network fail -> "needs connection" (nothing queued)
- *   401                     -> message pointing to Settings
- *   429 / 529 (overloaded)  -> retry ONCE after a short delay, then friendly msg
- * Resolves to the assistant's text; rejects with an llmError otherwise.
- */
-async function callClaude({ system, messages, maxTokens }) {
-  if (!state.apiKey) {
-    throw llmError('no-key', 'Add your Anthropic API key in Settings to use this.');
-  }
-  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-    throw llmError('offline', 'This needs an internet connection — try again when you\'re back online.');
-  }
-
-  const body = JSON.stringify({
-    model: state.model || DEFAULT_MODEL,
-    max_tokens: maxTokens || 1500,
-    system: system,
-    messages: messages
-  });
-
-  const attempt = () => fetch(ANTHROPIC_URL, {
-    method: 'POST',
-    headers: {
-      'x-api-key': state.apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: body
-  });
-
-  let res;
-  try {
-    res = await attempt();
-  } catch (e) {
-    throw llmError('offline', 'Couldn\'t reach the server — check your connection and try again.');
-  }
-
-  // Retry ONCE on rate-limit / overload.
-  if (res.status === 429 || res.status === 529) {
-    await delay(LLM_RETRY_MS);
-    try { res = await attempt(); }
-    catch (e) { throw llmError('offline', 'Couldn\'t reach the server — check your connection and try again.'); }
-  }
-
-  if (res.status === 401) {
-    throw llmError('auth', 'That API key was rejected. Check it in Settings.');
-  }
-  if (res.status === 429 || res.status === 529) {
-    throw llmError('overloaded', 'The service is busy right now. Give it a minute and try again.');
-  }
-  if (!res.ok) {
-    let detail = '';
-    try { const j = await res.json(); detail = (j && j.error && j.error.message) || ''; } catch (e) { /* ignore */ }
-    throw llmError('http', 'Request failed (' + res.status + ')' + (detail ? ': ' + detail : '') + '.');
-  }
-
-  let data;
-  try { data = await res.json(); }
-  catch (e) { throw llmError('parse', 'Got an unreadable response from the server.'); }
-
-  const text = extractText(data);
-  if (!text) throw llmError('empty', 'The model returned an empty response.');
-  return text;
-}
-
-// Concatenate all text blocks of an Anthropic Messages response.
-function extractText(data) {
-  if (!data || !Array.isArray(data.content)) return '';
-  return data.content.filter((b) => b && b.type === 'text').map((b) => b.text).join('').trim();
-}
-
-// Strip a single ```json … ``` (or bare ```) fence if the model wrapped its output.
-function stripFences(text) {
-  let t = String(text == null ? '' : text).trim();
-  if (t.indexOf('```') === 0) {
-    t = t.replace(/^```[^\n]*\n?/, '');   // opening fence + optional language tag
-    t = t.replace(/\n?```\s*$/, '');      // closing fence
-  }
-  return t.trim();
-}
-
-/* --- 5a: edit flow -------------------------------------------------------- */
-
-// Compact log summary for the 5a payload: last ~10 sessions, completion %, skips, notes.
-function buildLogSummary(st) {
-  const log = st.log || [];
-  if (!log.length) return 'No sessions logged yet.';
-  return log.slice(-10).map((e) => {
-    const pct = Math.round(sessionCompletion(e) * 100);
-    const skipped = (e.exercises || []).filter((x) => !x.done).map((x) => x.name);
-    let line = 'Session ' + e.session + ' (Day ' + e.day + '): ' + pct + '% complete';
-    if (skipped.length) line += '; skipped: ' + skipped.join(', ');
-    if (e.note) line += '; note: "' + e.note + '"';
-    return line;
-  }).join('\n');
-}
-
-function buildEditUserMessage(instruction) {
-  return 'CURRENT ROUTINE (JSON):\n' + JSON.stringify(state.routine, null, 2) + '\n\n' +
-    'GOALS & CONSTRAINTS:\n' + GOALS_BLURB + '\n\n' +
-    'RECENT TRAINING LOG (last ~10 sessions):\n' + buildLogSummary(state) + '\n\n' +
-    'MY INSTRUCTION:\n' + instruction;
-}
-
-// Strip fences -> JSON.parse -> shape check. Returns { ok, value?, errors? }.
-function tryParseProposal(text) {
-  const stripped = stripFences(text);
-  let obj;
-  try { obj = JSON.parse(stripped); }
-  catch (e) { return { ok: false, errors: ['Output was not valid JSON: ' + e.message] }; }
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || !obj.routine) {
-    return { ok: false, errors: ['Output was not a single JSON object with a "routine" key.'] };
-  }
-  return { ok: true, value: {
-    routine: obj.routine,
-    changes: Array.isArray(obj.changes) ? obj.changes : [],
-    warnings: Array.isArray(obj.warnings) ? obj.warnings : []
-  } };
-}
-
-// Wrap a parsed proposal with a COMPUTED diff against the current routine.
-function buildProposal(value) {
-  return {
-    routine: value.routine,
-    changes: value.changes,
-    warnings: value.warnings,
-    diff: computeDiff(state.routine, value.routine)
-  };
-}
-
-// Flat name -> exercise map across every pool (staples, variety, flat blocks).
-function flattenExercises(routine) {
-  const map = {};
-  collectPools(routine).forEach((pool) => pool.forEach((ex) => {
-    if (ex && ex.name) map[ex.name] = ex;
-  }));
-  return map;
-}
-
-// Dose identity string for equality checks.
-function doseKey(d) {
-  d = d || {};
-  return [d.sets, d.amount, d.unit, d.weight == null ? '' : d.weight].join('|');
-}
-
-// Order-insensitive goal-tag equality (used for static warm-up/cool-down tags).
-function goalsEqual(a, b) {
-  const x = (a || []).slice().sort();
-  const y = (b || []).slice().sort();
-  return x.length === y.length && x.every((v, i) => v === y[i]);
-}
-
-// Canonical string for a goalScores map (order-insensitive) and a care list.
-function goalScoresKey(gs) {
-  gs = gs || {};
-  return Object.keys(gs).sort().map((k) => k + ':' + gs[k]).join(',');
-}
-
-// Progression identity string.
-function progKey(p) {
-  if (!p) return '';
-  return [p.step == null ? '' : p.step, p.max == null ? '' : p.max, p.maxSets == null ? '' : p.maxSets,
-    p.weightStep == null ? '' : p.weightStep].join('|');
-}
-
-// modified = same name, different dose / goalScores / care / goals / why / section /
-// group / rest / progression / dayLock / muscle.
-function exerciseEqual(a, b) {
-  return doseKey(a.dose) === doseKey(b.dose) &&
-    goalScoresKey(a.goalScores) === goalScoresKey(b.goalScores) &&
-    goalsEqual(a.care, b.care) &&
-    goalsEqual(a.goals, b.goals) &&
-    a.why === b.why &&
-    (a.section || '') === (b.section || '') &&
-    (a.group || '') === (b.group || '') &&
-    (a.rest == null ? '' : a.rest) === (b.rest == null ? '' : b.rest) &&
-    progKey(a.progression) === progKey(b.progression) &&
-    (a.dayLock || null) === (b.dayLock || null) &&
-    (a.muscle || '') === (b.muscle || '');
-}
-
-function diffGoals(oldGoals, newGoals) {
-  const changes = [];
-  const desc = (g) => g.kind === 'care' ? 'care' : ('weight ' + (g.weight != null ? g.weight : 0));
-  const o = {}; (oldGoals || []).forEach((g) => { if (g && g.name) o[g.name] = g; });
-  const n = {}; (newGoals || []).forEach((g) => { if (g && g.name) n[g.name] = g; });
-  Object.keys(n).forEach((name) => {
-    const ng = n[name], og = o[name];
-    if (!og) {
-      changes.push('Added goal: ' + name + ' (' + desc(ng) + ')');
-    } else if ((og.weight || 0) !== (ng.weight || 0) || (og.kind || '') !== (ng.kind || '')) {
-      let c = 'Changed goal: ' + name;
-      if ((og.weight || 0) !== (ng.weight || 0)) c += ' — weight ' + (og.weight || 0) + ' → ' + (ng.weight || 0);
-      if ((og.kind || '') !== (ng.kind || '')) c += ' — ' + og.kind + ' → ' + ng.kind;
-      changes.push(c);
-    }
-  });
-  Object.keys(o).forEach((name) => { if (!n[name]) changes.push('Removed goal: ' + name); });
-  return changes;
-}
-
-// Computed diff: added / removed / modified exercises + goal changes.
-function computeDiff(oldR, newR) {
-  const o = flattenExercises(oldR);
-  const n = flattenExercises(newR);
-  const added = [], removed = [], modified = [];
-  Object.keys(n).forEach((name) => {
-    if (!(name in o)) added.push(n[name]);
-    else if (!exerciseEqual(o[name], n[name])) modified.push({ from: o[name], to: n[name] });
-  });
-  Object.keys(o).forEach((name) => { if (!(name in n)) removed.push(o[name]); });
-  return {
-    added: added, removed: removed, modified: modified,
-    goalChanges: diffGoals(oldR && oldR.goals, newR && newR.goals)
-  };
-}
-
-/*
- * Full request flow: send -> parse -> validate -> ONE automatic retry with the
- * validator errors appended -> valid ? { proposal } : { raw }. Never mutates
- * state; the caller decides what to do with the result.
- */
-async function runEditRequest(messages) {
-  const first = await callClaude({ system: EDIT_SYSTEM_PROMPT, messages: messages, maxTokens: 1500 });
-  const parsed = tryParseProposal(first);
-  if (parsed.ok) {
-    const v = validateRoutine(parsed.value.routine);
-    if (v.valid) return { proposal: buildProposal(parsed.value) };
-    return finalizeRetry(await retryOnce(messages, first, v.errors));
-  }
-  return finalizeRetry(await retryOnce(messages, first, parsed.errors));
-}
-
-// Append the model's prior (bad) message + a user message listing the errors.
-async function retryOnce(messages, assistantText, errors) {
-  const convo = messages.concat([
-    { role: 'assistant', content: assistantText },
-    { role: 'user', content:
-      'That did not validate. Fix these problems and resend the COMPLETE JSON object ' +
-      '(routine, changes, warnings) with no other text:\n- ' + errors.join('\n- ') }
-  ]);
-  return callClaude({ system: EDIT_SYSTEM_PROMPT, messages: convo, maxTokens: 1500 });
-}
-
-function finalizeRetry(text) {
-  const parsed = tryParseProposal(text);
-  if (parsed.ok) {
-    const v = validateRoutine(parsed.value.routine);
-    if (v.valid) return { proposal: buildProposal(parsed.value) };
-  }
-  return { raw: text };
-}
-
-async function sendEdit() {
-  const ta = (typeof document !== 'undefined') ? document.getElementById('edit-input') : null;
-  const text = ta ? ta.value.trim() : (ui.llm.editInput || '').trim();
-  if (!text) return;
-  if (!state.apiKey) return;                    // gated in the UI, belt-and-suspenders here
-
-  ui.llm.editInput = text;
-  ui.llm.editStatus = 'loading';
-  ui.llm.editError = '';
-  render();
-
-  const messages = [{ role: 'user', content: buildEditUserMessage(text) }];
-  let result;
-  try {
-    result = await runEditRequest(messages);
-  } catch (e) {
-    ui.llm.editStatus = 'error';
-    ui.llm.editError = e.message || 'Something went wrong.';
-    render();
-    return;
-  }
-
-  if (result.proposal) {
-    ui.llm.proposal = result.proposal;
-    ui.llm.editStatus = 'diff';
-  } else {
-    ui.llm.editRaw = result.raw;               // invalid twice — show raw, change NOTHING
-    ui.llm.editStatus = 'raw';
-  }
-  render();
-}
-
-// Apply: pushHistory(old), swap in new, clear swaps + dismissed (keys may be stale).
-function applyProposal() {
-  const p = ui.llm.proposal;
-  if (!p) return;
-  pushHistory(state.routine);
-  state.routine = deepClone(p.routine);
-  state.swaps = {};
-  state.dismissed = {};
-  ui.llm.proposal = null;
-  ui.llm.editStatus = 'idle';
-  ui.llm.editInput = '';
-  ui.expanded.clear();
-  state.view = 'today';                          // show the freshly applied routine
-  saveState();
-  render();
-}
-
-// Discard: change nothing.
-function discardProposal() {
-  ui.llm.proposal = null;
-  ui.llm.editStatus = 'idle';
-  render();
-}
-
-/* --- 5b: Ask flow --------------------------------------------------------- */
-
-// Compact routine (names only) to keep the Ask context small.
-function compactRoutine(r) {
-  const b = (r && r.blocks) || {};
-  const names = (arr) => (arr || []).map((ex) => ex.name);
-  const out = { goals: (r && r.goals) || [], blocks: {} };
-  out.blocks.warmup = names(b.warmup);
-  ['floor', 'weights', 'machines'].forEach((sec) => {
-    out.blocks[sec] = (b.moves || []).filter((ex) => (ex.section || 'floor') === sec).map((ex) => ex.name);
-  });
-  out.blocks.cooldown = names(b.cooldown);
-  return out;
-}
-
-function buildAskContext(st) {
-  const build = buildSession(st);
-  const today = [];
-  build.blocks.forEach((bl) => bl.exercises.forEach((ex) => today.push(ex.name)));
-  const notes = (st.log || []).slice(-5).filter((e) => e.note).map((e) => '- ' + e.note);
-  const goals = (st.routine.goals || []).filter((g) => g && g.kind === 'training' && g.weight > 0)
-    .map((g) => g.name + ' (w' + g.weight + ')');
-  return 'CONTEXT (for your reference):\n' +
-    'Active training goals: ' + (goals.join(', ') || 'none') + '\n' +
-    'Today is Session ' + build.session + ', Day ' + build.day + '. Today\'s exercises: ' +
-      (today.join(', ') || 'none') + '\n' +
-    'Recent session notes:\n' + (notes.join('\n') || '(none)') + '\n' +
-    'Compact routine: ' + JSON.stringify(compactRoutine(st.routine));
-}
-
-async function sendAsk() {
-  const ta = (typeof document !== 'undefined') ? document.getElementById('ask-input') : null;
-  const text = ta ? ta.value.trim() : (ui.llm.askInput || '').trim();
-  if (!text) return;
-  if (!state.apiKey) return;
-
-  ui.llm.ask.push({ role: 'user', text: text });
-  ui.llm.askInput = '';
-  ui.llm.askStatus = 'loading';
-  ui.llm.askError = '';
-  render();
-
-  // Send the in-memory history as conversation context so follow-ups work.
-  const messages = ui.llm.ask.map((m) => ({ role: m.role, content: m.text }));
-  const system = ASK_SYSTEM_PROMPT + '\n\n' + buildAskContext(state);
-
-  try {
-    const reply = await callClaude({ system: system, messages: messages, maxTokens: 1000 });
-    ui.llm.ask.push({ role: 'assistant', text: reply });
-    ui.llm.askStatus = 'idle';
-  } catch (e) {
-    ui.llm.askStatus = 'idle';
-    ui.llm.askError = e.message || 'Something went wrong.';   // keep the user message so they can retry
-  }
-  render();
-}
-
-/*
- * Forward an assistant reply into the 5a edit input, then navigate there.
- * Choice (per spec): rather than trying to detect "suggestion-ish" replies, we
- * always offer this affordance on assistant bubbles and let the user decide —
- * simplest robust option, and it never applies anything on its own.
- */
-function forwardToEditor(i) {
-  const m = ui.llm.ask[i];
-  if (!m || m.role !== 'assistant') return;
-  ui.llm.editInput = m.text;
-  ui.llm.editStatus = 'idle';
-  ui.llm.editError = '';
-  ui.llm.proposal = null;
-  state.view = 'edit';
-  saveState();
-  render();
-}
-
-/* --- 5: rendering --------------------------------------------------------- */
-
-function llmKeyGate(label) {
-  return '<div class="llm-notice">' +
-    '<p>' + escapeHtml(label) + ' needs an Anthropic API key.</p>' +
-    '<button class="btn primary" data-action="llm-goto-settings">Add a key in Settings</button>' +
-    '</div>';
-}
-
-function isOffline() {
-  return typeof navigator !== 'undefined' && navigator.onLine === false;
-}
-
-function renderEdit() {
-  const L = ui.llm;
-  let html = '<div class="llm">';
-
-  if (!state.apiKey) return html + llmKeyGate('Natural-language routine editing') + '</div>';
-
-  // Diff/approve screen takes over the whole view.
-  if (L.editStatus === 'diff' && L.proposal) return html + renderDiff(L.proposal) + '</div>';
-
-  const offline = isOffline();
-  const loading = L.editStatus === 'loading';
-
-  html += '<section class="panel">' +
-    '<h3>Edit routine</h3>' +
-    '<p class="muted">Describe a change in plain English — e.g. "add layout as a goal", ' +
-    '"swap leg press for something posterior chain", "make A days shoulder-light for a while".</p>' +
-    '<textarea id="edit-input" placeholder="What should change?"' + (loading ? ' disabled' : '') + '>' +
-      escapeHtml(L.editInput || '') + '</textarea>';
-
-  if (offline) html += '<p class="llm-inline warn">You\'re offline — connect to send.</p>';
-  if (L.editStatus === 'error') html += '<p class="llm-inline warn">' + escapeHtml(L.editError) + '</p>';
-
-  html += '<div class="row">';
-  if (loading) {
-    html += '<button class="btn primary" disabled><span class="spinner"></span>Thinking…</button>';
-  } else {
-    html += '<button class="btn primary" data-action="llm-send-edit"' + (offline ? ' disabled' : '') + '>Send</button>';
-  }
-  html += '</div></section>';
-
-  // Invalid-twice fallback: show the raw output, change nothing.
-  if (L.editStatus === 'raw') {
-    html += '<section class="panel">' +
-      '<h3>Couldn\'t use that response</h3>' +
-      '<p class="muted">The reply didn\'t validate as a routine, twice. Nothing was changed. Raw output:</p>' +
-      '<pre class="raw-output">' + escapeHtml(L.editRaw) + '</pre>' +
-      '</section>';
-  }
-
-  return html + '</div>';
-}
-
-function renderDiff(p) {
-  let html = '<section class="panel diff"><h3>Proposed changes</h3>';
-
-  if (p.changes && p.changes.length) {
-    html += '<ul class="change-list">' + p.changes.map((c) => '<li>' + escapeHtml(c) + '</li>').join('') + '</ul>';
-  } else {
-    html += '<p class="muted">The model reported no specific changes.</p>';
-  }
-
-  if (p.warnings && p.warnings.length) {
-    html += '<div class="warnings"><strong>Warnings — double-check these</strong><ul>' +
-      p.warnings.map((w) => '<li>' + escapeHtml(w) + '</li>').join('') + '</ul></div>';
-  }
-
-  html += renderComputedDiff(p.diff);
-
-  html += '<div class="row">' +
-    '<button class="btn ghost" data-action="llm-discard">Discard</button>' +
-    '<button class="btn primary" data-action="llm-apply">Apply</button>' +
-    '</div></section>';
-  return html;
-}
-
-function exLine(ex) {
-  // v3.0 moves carry goalScores + care; static warm-up/cool-down keep `goals`.
-  let tags;
-  if (ex.goalScores || ex.care) {
-    const scores = Object.keys(ex.goalScores || {}).map((id) => id + ' ' + ex.goalScores[id]);
-    const care = (ex.care || []).map((id) => id + ' (care)');
-    tags = scores.concat(care).join(', ');
-  } else {
-    tags = (ex.goals || []).join(', ');
-  }
-  const section = ex.section ? ex.section + ' · ' : '';
-  return '<div class="dx-name">' + escapeHtml(ex.name) + '</div>' +
-    '<div class="dx-meta">' + escapeHtml(section + formatDose(ex.dose)) + ' · ' +
-      escapeHtml(tags) + '</div>' +
-    '<div class="dx-why">' + escapeHtml(ex.why || '') + '</div>';
-}
-
-function renderComputedDiff(d) {
-  let h = '<div class="computed-diff">';
-  if (d.goalChanges.length) {
-    h += '<h4>Goals</h4><ul class="diff-list">' + d.goalChanges.map((g) => '<li>' + escapeHtml(g) + '</li>').join('') + '</ul>';
-  }
-  if (d.added.length) {
-    h += '<h4>Added exercises</h4>' + d.added.map((ex) =>
-      '<div class="dx dx-add"><span class="dx-tag">added</span>' + exLine(ex) + '</div>').join('');
-  }
-  if (d.removed.length) {
-    h += '<h4>Removed exercises</h4>' + d.removed.map((ex) =>
-      '<div class="dx dx-removed"><span class="dx-tag">removed</span>' + exLine(ex) + '</div>').join('');
-  }
-  if (d.modified.length) {
-    h += '<h4>Modified exercises</h4>' + d.modified.map((m) =>
-      '<div class="dx dx-mod">' +
-        '<div class="dx-col dx-old"><span class="dx-tag">was</span>' + exLine(m.from) + '</div>' +
-        '<div class="dx-col dx-new"><span class="dx-tag">now</span>' + exLine(m.to) + '</div>' +
-      '</div>').join('');
-  }
-  if (!d.added.length && !d.removed.length && !d.modified.length && !d.goalChanges.length) {
-    h += '<p class="muted">No structural differences detected.</p>';
-  }
-  return h + '</div>';
-}
-
-function renderAsk() {
-  const L = ui.llm;
-  let html = '<div class="llm ask">';
-
-  if (!state.apiKey) return html + llmKeyGate('The Ask assistant') + '</div>';
-
-  const offline = isOffline();
-
-  html += '<div class="chat">';
-  if (!L.ask.length && L.askStatus !== 'loading') {
-    html += '<p class="muted chat-empty">Ask about technique, programming, or how to progress. ' +
-      'Planning assistant — not medical advice.</p>';
-  }
-  L.ask.forEach((m, i) => {
-    html += '<div class="bubble bubble-' + m.role + '">' + escapeHtml(m.text).replace(/\n/g, '<br>') + '</div>';
-    if (m.role === 'assistant') {
-      html += '<div class="bubble-actions"><button class="btn small ghost" ' +
-        'data-action="ask-forward" data-i="' + i + '">Send to routine editor</button></div>';
-    }
-  });
-  if (L.askStatus === 'loading') {
-    html += '<div class="bubble bubble-assistant"><span class="spinner"></span>Thinking…</div>';
-  }
-  html += '</div>';
-
-  if (L.askError) html += '<p class="llm-inline warn">' + escapeHtml(L.askError) + '</p>';
-  if (offline) html += '<p class="llm-inline warn">You\'re offline — connect to send.</p>';
-
-  const busy = offline || L.askStatus === 'loading';
-  html += '<div class="ask-input">' +
-    '<textarea id="ask-input" placeholder="Ask a question…"' + (L.askStatus === 'loading' ? ' disabled' : '') + '>' +
-      escapeHtml(L.askInput || '') + '</textarea>' +
-    '<button class="btn primary" data-action="ask-send"' + (busy ? ' disabled' : '') + '>Send</button>' +
-    '</div>';
-
-  return html + '</div>';
-}
-
 /* --- 9. Service worker + init -------------------------------------------- */
 
 function registerSW() {
@@ -3251,6 +3177,13 @@ async function init() {
     }
     saveState();
   }
+
+  // v3.6: ask the browser to mark this origin's storage persistent so the
+  // localStorage progression data isn't evicted under pressure (esp. Android).
+  // Fire-and-forget, guarded — no UI, and it's a no-op where unsupported.
+  try {
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+  } catch (e) { /* storage API absent / blocked — app still works this session */ }
 
   const app = document.getElementById('app');
   app.addEventListener('click', onClick);
@@ -3295,23 +3228,18 @@ if (typeof module !== 'undefined' && module.exports) {
     validateRoutine, formatDose, effectiveDose, buildSession, buildFutureSession,
     migrateFromV1, freshState, currentDay,
     // v3.0 — goal-weighted generator (pure)
-    eligible, goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
+    eligible, jointStresses, goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
     cardGoalIds, moveChipIds, moveGoalIds, buildCooldown,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
-    // v2.5 Auto Superset (pure grouping + plan)
-    groupSupersets, supersetPlan, supersetRestTarget,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate
+    groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
     // Phase 4 heuristics (pure — take log/state as args)
     leastRecentlyCompleted, lastCompletedIndex, sessionCompletion, buildKnobMap,
     volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
     pickReplacement, progressionReady, isDismissed, computeSuggestions,
     findExerciseByName, collectPools, recentAppearances,
-    // Phase 5 (LLM flow) — for the smoke test.
-    callClaude, extractText, stripFences, tryParseProposal, computeDiff, buildProposal,
-    runEditRequest, applyProposal, discardProposal, buildEditUserMessage, buildLogSummary,
-    exerciseEqual, goalsEqual,
     _ui: ui,
-    _setRetryDelay: (ms) => { LLM_RETRY_MS = ms; },
     _set: (s) => { state = s; },
     _setSeed: (s) => { SEED_ROUTINE = s; }
   };

@@ -374,8 +374,9 @@ upgrades stored routines in place. `routine.version` is now 6; `sw.js` CACHE is
 
 - **One unified `moves` block.** `blocks` becomes `{ warmup[], moves[], cooldown[] }`.
   Every former skill/core/weights/machines exercise now lives in `moves`, each with a
-  `section` (`"floor"|"weights"|"machines"`), a `goalScores` map (trainingGoalId → 0..3,
-  zero entries omitted), and an optional `care` id array (display chips). `location` is
+  `section` (`"floor"|"weights"|"machines"`), a `goalScores` map (trainingGoalId → 0..10
+  as of v3.3; was 0..3, zero entries omitted), and an optional `care` id array (display
+  chips). `location` is
   dropped (Floor is implicitly one location); `muscle` stays on Floor moves for Auto
   Superset. Warm-up / cool-down entries keep their `goals` tag array.
 
@@ -391,9 +392,9 @@ upgrades stored routines in place. `routine.version` is now 6; `sw.js` CACHE is
 
 - **Settings.** The four block sliders collapse into one **Number of moves** slider
   (`settings.moves`, range `[3,15]`, default 10) beside the cool-down slider and Auto
-  Superset toggle. Goals panel shows a 0–10 weight slider per training goal; a static
-  panel lists the six care chips. `restTarget` for Floor is 90 s unless the move's top
-  goal is `core` (60 s); weights/machines 90 s.
+  Superset toggle (and, as of v3.5, a **Superset bias** slider). Goals panel shows a 0–10
+  weight slider per training goal; a static panel lists the six care chips. `restTarget`
+  for Floor is 90 s unless the move's top goal is `core` (60 s); weights/machines 90 s.
 
 - **v6 migration.** Generic so user edits survive: rebuilds goals (drops `str`, adds `gym`;
   training weight = its default flip 8 / core 6 / gym 5 unless the old goal was *explicitly*
@@ -431,6 +432,176 @@ Shipped on top of v3.0. No storage or schema change; `sw.js` CACHE is
   with no progress bar, and `#view` gets an `is-preview` class. Preview doses render at the
   **current** intensity level — the forward simulation does not advance progression ladders,
   so a previewed weighted move shows today's load, not a projected one.
+
+## v3.2 — supersets as half-moves, LLM removed, warm-up + tabs
+Storage stays `tumbleTrainer.v2`; `routine.version` is now 7; `sw.js` CACHE is
+`tumble-trainer-v3.2.0`. A version-gated `migrateRoutineV7` (run from `normalizeState`
+on `routine.version < 7`) upgrades stored routines in place.
+
+- **Supersets count as half a move.** The "number of moves" slider is now a *weighted*
+  budget: with Auto Superset on, each Floor move that pairs into a superset (a group of
+  ≥ 2, per `groupSupersets`) counts as **0.5** toward `settings.moves`, so a superset pair
+  costs one whole move and a supersetting session pulls in more actual moves. `selectMoves`
+  keeps picking (same greedy score × section-decay) while `sessionMoveCost(chosen)` (the new
+  pure helper, grouping the chosen Floor moves in pool order to mirror rendering) is under the
+  slider value. Auto Superset off → cost = move count (unchanged).
+
+- **LLM integration removed.** All of Phase 5 is gone — `callClaude`, the Edit/Ask tabs and
+  flows, prompts, diff/validate-retry machinery, the API-key + model Settings panel,
+  `state.apiKey` / `state.model`, `ui.llm`, and the LLM CSS. `validateRoutine` and the schema
+  stay (used by the raw JSON editor and now the Move viewer).
+
+- **"Shoulders" warm-up group** ("Shoulder lifts", "Misc") added to the seed after the
+  "Circles" group; `migrateRoutineV7` inserts it (by name, idempotent) into stored routines.
+
+- **"Today" tab renamed "Gym"; new "Daily" tab** (`renderDaily`) shows just the static
+  warm-up and cool-down (reusing the grouped warm-up card + cool-down rendering/check-off,
+  sharing `state.checks`) plus a fixed daily **Tuck jumps** stim (`DAILY_TUCK_JUMPS`, not part
+  of the generated session) after the warm-up. The tab id stays `today` (only the label
+  changed); `state.view` is validated against the known views on load.
+
+## v3.3 — goal-score fidelity 0–10 + Move viewer
+Storage stays `tumbleTrainer.v2`; `routine.version` is now 8; `sw.js` CACHE is
+`tumble-trainer-v3.3.0`. A version-gated `migrateRoutineV8` (run on `routine.version < 8`)
+upgrades stored routines in place.
+
+- **Goal scores rescaled 0–3 → 0–10.** The seed's `goalScores` are re-authored across the
+  wider band (best-in-class moves reach 8–10 — e.g. Hollow body hold `core:10`, Handstand wall
+  hold `gym:10`, Hex bar deadlift `flip:9`; solid 4–7; supportive 2–3; unrelated omitted) so
+  the generator strongly favours moves that match the user's goals. `scoreMove` math is
+  unchanged (linear Σ weight × score); only the validator bound (now integer 0–10) moved.
+  `migrateRoutineV8` replaces each **seed-known** move's `goalScores` wholesale by name (users
+  hadn't hand-edited them); user-added moves keep theirs.
+
+- **Move viewer (new "Moves" tab).** `renderMoves` lists every `blocks.moves` entry grouped by
+  section with its dose, muscle, dayLock, 0–10 goal-score chips, care chips, and why, plus an
+  **Add a move** form (name, section, day, dose incl. optional weight, muscle, why, and a 0–10
+  input per training goal). `addMove` validates the whole routine via `validateRoutine` before
+  persisting into `state.routine.blocks.moves`; `deleteMove` confirms, removes the move, and
+  **tombstones** its name in `state.deletedMoves`. Added/deleted moves persist and are
+  respected by the generator immediately.
+
+- **Deletion tombstones.** `state.deletedMoves` (a name list) is applied in `normalizeState`
+  **after** all migrations, filtering `blocks.moves` so a deleted move can never be resurrected
+  by a migration or a re-inserted seed move. Re-adding a move with a tombstoned name clears its
+  tombstone. User-added moves survive migrations because no post-v6 migration rebuilds the pool.
+
+## v3.4 — enable/disable moves, Gym-tab tuning, joint-friendly mode
+Storage stays `tumbleTrainer.v2`; `routine.version` is now 9; `sw.js` CACHE is
+`tumble-trainer-v3.4.0`. A version-gated `migrateRoutineV9` (run on `routine.version < 9`)
+upgrades stored routines in place.
+
+- **Enable / disable moves in the Moves tab.** Each move row gains an On/Off toggle
+  (`mv-toggle` → `toggleMoveDisabled`). Disabling stamps `disabled: true` on the move
+  object in `state.routine.blocks.moves` (the flag is **omitted when enabled**); the row
+  stays listed but dims (`.mv-row-disabled`) and shows a "disabled" badge. `selectMoves`
+  drops `ex.disabled` moves from the pool up front, so a disabled move is completely
+  excluded from generation (Gym session and day preview) immediately and across reloads
+  (it lives on the routine). The toggle mutates the live move reference (like `deleteMove`)
+  and `saveState()`s. The validator accepts an optional boolean `disabled` on a move.
+  Post-v6 migrations never rebuild the move pool, so the flag survives updates.
+
+- **Goal + session controls in the Gym tab.** The moves/cool sliders and the training-goal
+  weight sliders — plus the joint-friendly toggle — are extracted into shared helpers
+  (`renderSettingSlider`, `renderGoalWeightSliders`, `renderJointFriendlyField`,
+  `renderAutoSupersetField`) that are the **single source of truth**, composed into both the
+  Settings panels and a new collapsible **"Adjust session"** panel (`renderAdjustPanel`) at the
+  top of the Gym view. The panel is **default collapsed** (`ui.adjustOpen`, transient
+  in-memory; `toggle-adjust` flips it) and hidden in day-preview. The controls carry the same
+  `data-action` hooks (`setting` / `goal-weight` / `toggle-joint-friendly`), so the existing
+  `onChange` handlers re-render and **live-regenerate the visible session** on release;
+  `ui.adjustOpen` keeps the panel open across those re-renders.
+
+- **Joint-friendly mode.** A new boolean session toggle `settings.jointFriendly` (default
+  off), rendered next to the sliders in **both** the Gym Adjust panel and Settings. When on,
+  `selectMoves` restricts the pool to moves whose `jointFriendly` is **not `false`**. Every
+  seed move carries an explicit boolean `jointFriendly`: `false` on the high-impact /
+  plyometric / deep-wrist-loading moves (Handstand wall hold, Jump tucks, Bridge push-ups,
+  Wall handstand shoulder taps, Broad jump stick landing, Straight jump to fast tuck), `true`
+  on the rest (holds, controlled-tempo lifts, machine work, core). The validator accepts an
+  optional boolean `jointFriendly` on a move; the Add-a-move form has a joint-friendly
+  checkbox (default checked), so user-added moves get an explicit flag. **Default for a
+  flag-less move: allowed.** A move with no `jointFriendly` field (e.g. a user move added
+  before v3.4) passes the filter — joint-friendly mode never silently hides a move the user
+  created; only an explicit `jointFriendly: false` is excluded. The generated session and day
+  preview react immediately.
+
+- **v9 migration.** `migrateRoutineV9` stamps `jointFriendly` onto each **seed-known** move by
+  name (only when the stored move lacks its own boolean, so a user edit survives); user-added
+  moves stay flag-less (and thus allowed). Runs for any `routine.version < 9`, immediately
+  after the v8 call; idempotent. `disabled` needs no migration (absent = enabled).
+
+## v3.5 — superset bias
+No storage or schema change; `routine.version` stays 9. `sw.js` CACHE is
+`tumble-trainer-v3.5.0`. Adds one session knob to `state.settings`.
+
+- **Setting.** `settings.supersetBias`, an **integer 0–10, default 5**. Defaulted in
+  `freshState` and normalized in `normalizeState` beside `jointFriendly` (missing / non-number
+  → 5, then `clamp(value | 0, 0, 10)`). Not part of the routine — it lives on `state.settings`
+  like `moves` / `cool`, and its 0–10 range is hard-coded in the UI (**not** in
+  `routine.structure.sliders`).
+
+- **Effect on selection.** In `selectMoves`' greedy loop, when Auto superset is on **and**
+  `bias > 0`, each candidate that is a Floor move carrying a `muscle` is tested with the new
+  pure `wouldSuperset(chosen, cand)`: it mirrors render-time grouping exactly — the
+  already-chosen floor+muscle moves plus the candidate, ordered by pool index, mapped to
+  `{ ex, block:'floor' }` and run through `groupSupersets` — and returns true iff the
+  candidate lands in a group of **>= 2**. When it would pair, the candidate's score is
+  multiplied by **`(1 + 0.1 * bias)`** (bias 10 = 2×, bias 5 = 1.5×). The existing
+  strictly-greater / earlier-pool-index tie-break is unchanged, and the O(n²) pair test per
+  pick is fine over the small move pool. **`bias 0` (or Auto superset off) reproduces pre-v3.5
+  selection byte-for-byte** — the multiplier is never applied, so no score changes.
+
+- **UI.** A **Superset bias** slider (0–10, step 1, shows its value) renders right after the
+  Auto superset toggle in the shared session-controls group (`renderSupersetBiasField`),
+  wired through the existing `data-action="setting"` / `data-key="supersetBias"` handler, so
+  it live-regenerates the session. It appears in **both** the Settings Session panel and the
+  Gym **"Adjust session"** panel. The Session panel's help text notes that higher bias makes
+  the generator prefer moves that pair into supersets and that it only applies while Auto
+  superset is on. The slider always renders (even with Auto superset off).
+
+## v3.6 — collapsible blocks, storage persistence, split joint-friendly
+Storage stays `tumbleTrainer.v2`; `routine.version` is now **10**; `sw.js` CACHE is
+`tumble-trainer-v3.6.0`. A version-gated `migrateRoutineV10` (run on `routine.version < 10`)
+upgrades stored routines in place.
+
+- **Collapsible session blocks.** Each session block (Warm-up / Floor / Weights / Machines /
+  Jumps / Cool-down) has a tappable `<h2>` that toggles collapse. State lives in
+  `state.collapsed` (`{ [blockKey]: true }`), **not** the DOM, so it survives the app's
+  re-render on every check-off; `saveState()` persists it across reloads and `finishSession`
+  clears it so a new session starts fully expanded. `renderBlock` wraps both render paths
+  (`renderToday`, `renderDaily`); the collapsed header shows a done/total count computed from
+  each block's slice of `renderedExercises` (skipped in day-preview). `normalizeState`
+  tolerates the field being absent in older saves.
+
+- **Storage persistence.** `init` makes a guarded, fire-and-forget
+  `navigator.storage.persist()` call so the browser marks the origin persistent and is less
+  likely to evict the localStorage progression data (esp. on Android). No UI; no-op where
+  unsupported.
+
+- **Split joint-friendly (was v3.4's single boolean).** The one `settings.jointFriendly`
+  toggle becomes **two independent** ones, `settings.jointFriendlyLegs` and
+  `settings.jointFriendlyArms` (each default off), rendered in both the Gym Adjust panel and
+  Settings (`renderJointFriendlyField`, shared `toggle-joint-friendly` handler keyed by
+  `data-region`). Per move, the boolean `jointFriendly` becomes an optional `jointStress`
+  **array** of the region(s) a move loads (`'legs'` = knees/ankles, `'arms'` =
+  shoulders/elbows/wrists); absent/empty = safe both ways. `selectMoves` drops a move when
+  `(jointFriendlyLegs && stresses legs) || (jointFriendlyArms && stresses arms)` via the pure
+  `jointStresses(ex, region)` helper. Seed reclassifies its six former high-impact moves:
+  Jump tucks / Broad jump stick landing / Straight jump to fast tuck → `["legs"]`; Handstand
+  wall hold / Bridge push-ups / Wall handstand shoulder taps → `["arms"]`. The validator
+  accepts `jointStress` absent, rejects a non-array or an unknown region. The Add-a-move form
+  swaps its single "joint-friendly" checkbox for two "Stresses …" checkboxes (**polarity
+  flipped** — checked now means *loads that region*); both unchecked omits the field. The
+  Moves-tab warn flag shows the region(s), e.g. "stresses knees/ankles".
+
+- **v10 migration.** `migrateRoutineV10` stamps `jointStress` onto each **seed-known** move by
+  name (unless the stored move already has its own array — a user edit survives); a user-added
+  move still carrying `jointFriendly:false` and no seed match migrates to `['legs','arms']`
+  (conservative — it was excluded before, so it stays excluded under either toggle); every
+  move's retired `jointFriendly` boolean is then removed. Settings migrate separately in
+  `normalizeState`: old `jointFriendly:true` → both new toggles on, then the old key is
+  deleted. Runs for any `routine.version < 10`, right after the v9 call; idempotent.
 
 ## Non-goals
 - No accounts, no server, no analytics
