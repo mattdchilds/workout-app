@@ -2,7 +2,7 @@
    Cache-first, offline-first. Bump CACHE on every asset change so the
    activate handler evicts the stale cache. */
 
-const CACHE = 'tumble-trainer-v3.9.4';
+const CACHE = 'tumble-trainer-v3.9.5';
 
 const ASSETS = [
   './',
@@ -17,8 +17,13 @@ const ASSETS = [
 ];
 
 self.addEventListener('install', (event) => {
+  // cache: 'reload' bypasses the browser HTTP cache (GitHub Pages max-age=600),
+  // otherwise a new worker can precache STALE copies fetched minutes earlier
+  // under the new cache name.
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(ASSETS)).then(() => self.skipWaiting())
+    caches.open(CACHE)
+      .then((cache) => cache.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting())
   );
 });
 
