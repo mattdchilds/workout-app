@@ -31,7 +31,8 @@ The app is deployed to GitHub Pages:
        install is then a bookmark, not a standalone PWA.
      iOS/Safari     — Share > "Add to Home Screen".
 4. Done. Turn on airplane mode, power off this PC — it still works.
-   Only the Ask tab needs a network (it calls the Anthropic API).
+   Only the Coach tab needs a network (it calls the OpenAI API, and
+   only if you've set your own key in Settings).
 
 Deploying an update: commit and `git push`. Pages rebuilds in ~1 min.
 Bump CACHE in sw.js or phones will keep serving the old cached copy.
@@ -64,9 +65,12 @@ data changes:
 
 Your data
 ---------
-Everything (routine, session log, progression levels, API key) lives in
-this browser's localStorage under the key "tumbleTrainer.v2". Use the
+Everything (routine, session log, progression levels) lives in this
+browser's localStorage under the key "tumbleTrainer.v2". Use the
 export/import options in the Settings tab to back up or move devices.
+The Coach's OpenAI API key is stored separately under
+"tumbleTrainer.openaiKey" and is deliberately NOT part of the backup
+export — it never leaves this device except in calls to OpenAI.
 
 Dev notes
 ---------

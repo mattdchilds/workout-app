@@ -77,80 +77,69 @@ Compute from state.log on app open:
    subtle "ready to add?" marker next to its stepper.
 All heuristics are suggestions, never silent changes.
 
-### Phase 5 — LLM integration (BYO Anthropic API key)
-PRIMARY PURPOSE: natural-language routine editing. The user types things like
-"I want to add layout as a goal", "swap leg press for something posterior
-chain", "I tweaked my shoulder, make A days shoulder-light for a while" —
-and the LLM restructures state.routine.
+### Phase 5 — Coach (LLM chat + staged routine edits)  [SHIPPED in v3.9]
+A single "Coach" tab: a chat that (1) answers training questions and (2) edits the
+routine through **function/tool calls**, staged for explicit user approval. This
+supersedes the original 2023-era design below (single-shot "return the whole routine
+as JSON" over the Anthropic API) — it was never built, then removed in v3.2. The
+shipped v3.9 design:
 
-Settings screen: password-type field for API key. Store in localStorage only.
-NEVER hardcode a key, never commit one, key never leaves the device except to
-api.anthropic.com. Show a note recommending a spend limit in the Anthropic Console.
+Provider / transport
+- OpenAI, model `gpt-5.6-sol` at `reasoning_effort: "medium"`, direct browser `fetch` to
+  `https://api.openai.com/v1/responses` (OpenAI allows CORS). NOT chat completions:
+  gpt-5.6-sol rejects function tools + reasoning_effort on `/v1/chat/completions`.
+  Uses Responses-style tool calling: flat `tools: [{type:"function", name, ...}]`, reads
+  `function_call` items from `output[]`, re-sends the model's output items (incl.
+  reasoning items — required) plus `function_call_output` items. Does NOT send
+  `temperature` (gpt-5.x rejects it); caps output with `max_output_tokens` (shared with
+  reasoning tokens, so the cap is generous).
+- API key: password field in Settings, stored in its OWN localStorage slot
+  (`tumbleTrainer.openaiKey`), NEVER in `state` — so export/import backups never carry
+  it. Settings shows a "set / not set" indicator and a Remove button. Never hardcode or
+  commit a key.
+- Chat history is ephemeral: `ui.coach.messages` (memory only), resets on reload. The
+  request replays prior user/assistant text plus a freshly built system prompt (which
+  already reflects the current, applied routine), so past tool-call plumbing is not
+  re-sent.
 
-Direct browser call (CORS-enabled by header):
-  fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": state.apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-      "anthropic-dangerous-direct-browser-access": "true"
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1500,
-      system: SYSTEM_PROMPT,
-      messages: [...]
-    })
-  })
-Handle: network fail (offline → queue nothing, just show "needs connection"),
-401 (bad key → point to settings), 429/overloaded (retry once, then message).
+System prompt (`coachSystemPrompt`) carries every turn: the full `state.routine` JSON,
+current generation settings (training-goal weights, tag priorities, superset bias,
+moves/session), a move schema description mirroring `validateRoutine`, and the editable
+`state.settings.coachProfile` athlete profile.
 
-Feature 5a — Routine editing (the core feature):
-"Edit routine" screen: free-text input + send.
-Request payload: system prompt (below) + user message containing:
-  - the full current state.routine JSON
-  - active goals and constraints blurb (2-3x/week, A/B structure, PF /
-    cubital tunnel / posture / sciatic care, joint recovery, stims by jumping)
-  - compact log summary (last ~10 sessions: completion %, skips, notes)
-  - the user's instruction
-System prompt requires the model to return ONLY JSON:
-  { routine: <complete new routine object, same schema>,
-    changes: [ "Added goal: layout (weight 40)",
-               "New core staple: straight-body hollow hold 3×20 sec",
-               "Replaced X with Y because ..." ],
-    warnings: [ "..." ]  // anything the user should double-check
-  }
-Flow: parse (strip markdown fences) → run the Phase 3 schema validator →
-if invalid, one automatic retry with the validator errors appended → if still
-invalid, show raw output and change nothing.
-If valid: render a DIFF screen — changes[] list plus computed added/removed/
-modified exercises (old vs new side by side). Buttons: Apply / Discard.
-Apply pushes old routine onto routineHistory, swaps in the new one.
-NEVER auto-apply. The model proposes; the user approves.
+Tools exposed (JSON schemas, `COACH_TOOLS`) — operate on `blocks.moves` (NEVER
+warmup/cooldown), tags, goals, and settings:
+`add_move`, `update_move`, `delete_move`, `set_move_disabled`, `add_tag`,
+`set_tag_priority`, `add_goal`, `set_goal_weight`.
 
-System prompt guardrails:
-  - Preserve the A/B day structure and block shapes unless explicitly asked
-  - Never remove health/rehab items (slow calf work, nerve care, row, tibialis)
-    unless the user explicitly names them for removal; flag it in warnings if
-    they do
-  - Respect known issues: no aggressive elbow-lockout pressing volume
-    (cubital tunnel), keep impact volume conservative (plantar fasciitis,
-    joint recovery), warmup is user-managed — never add warmup items
-  - Goal weights: new goals get an explicit weight; rebalance variety pools
-    to roughly match active goal weights
-  - Anything symptom/pain-related: adjust conservatively and add a warning
-    recommending a PT rather than prescribing rehab
+Edit flow (the safety mechanism), `coachRun` — an agentic loop (≤ 6 iterations):
+1. Send instructions + input + tools. If the reply has `function_call` items, apply each to a **trial** deep
+   clone of `{ routine, settings-slice(tagPriority) }`, then run
+   `validateRoutine(trialRoutine)` after the batch.
+2. Invalid (or a tool errored, e.g. name not found) → roll the trial back, reply to the
+   tool calls with the errors, let the model retry ONCE; a second failure surfaces the
+   error in chat and changes nothing.
+3. Valid → stage `ui.coach.pending = { routine, settingsPatch, deletedNames, summary[] }`,
+   reply "staged for user approval", and keep looping so the model writes its closing text.
+4. The pending changeset renders as a card (summary lines + Apply / Discard). **Apply**:
+   `pushHistory(state.routine)` → swap in the new routine → apply the settings patch →
+   tombstone deleted moves + clear their per-move state → `saveState()` → `render()`.
+   **Discard** drops it. A new user message also discards a stale pending. NEVER
+   auto-applied — the model proposes; the user approves. Each staged batch replaces the
+   previous pending.
 
-Model: start with "claude-haiku-4-5-20251001"; if edits are structurally
-sloppy, add a settings toggle for "claude-sonnet-4-6" (routine edits are rare,
-so per-edit cost is irrelevant — correctness wins).
+Guardrails (system prompt): never touch warmup/cooldown (tools can't anyway); be
+conservative with pain / rehab / `care` items and defer to a professional on symptoms;
+keep move names unique; prefer small targeted edits; when the user is only asking a
+question, just answer — don't force an edit.
 
-Feature 5b — Ask tab (secondary):
-Simple chat: question + context (current routine, today's list, recent log
-notes, goals) → free-text answer. In-memory history only. Technique/planning
-assistant, not medical advice. If the model suggests a routine change here,
-offer a button that forwards it to the 5a edit flow rather than applying.
+UI (`renderCoach`): scrollable message list (user right / coach left), markdown-lite
+rendering (paragraphs, `**bold**`, `` `code` ``, line breaks — no libs), textarea + Send,
+a busy/typing state (`ui.coach.busy`) that disables input, a "New chat" button, inline
+error display (401 → point at Settings; network fail → readable message), and — when no
+key is set — a setup notice linking to Settings. Settings gains a "Coach" panel (key
+field + athlete-profile textarea). The service worker ignores non-GET requests, so the
+cross-origin OpenAI POST passes through untouched.
 
 ## v2.3 — Goal tags, slots, ladders, set tracking
 Shipped on top of Phases 1–5. Storage stays `tumbleTrainer.v2`; a one-time
@@ -381,8 +370,10 @@ upgrades stored routines in place. `routine.version` is now 6; `sw.js` CACHE is
   Superset. Warm-up / cool-down entries keep their `goals` tag array.
 
 - **Goal-weighted selection (`scoreMove` / `selectMoves`).** Pure, deterministic, no
-  RNG/Date. Pool = `blocks.moves` filtered by `dayLock`. `baseScore = Σ trainingGoal.weight
-  × goalScore`; moves scoring 0 are excluded. A recency boost `effective = base ×
+  RNG/Date. Pool = `blocks.moves` minus disabled moves and any move a tag hard-avoids
+  (see v3.7 tags — the old hard `dayLock` filter is gone). `baseScore = Σ trainingGoal.weight
+  × goalScore`; moves scoring 0 are excluded. Surviving moves keep a per-tag score
+  multiplier applied to the recency-boosted score. A recency boost `effective = base ×
   (1 + 0.1 × min(sessionsSince, 6))` (never-completed → 6) favours variety. `settings.moves`
   picks are then taken **greedily with per-section diminishing returns**: each pick maximizes
   `effective × SECTION_DECAY^(already-picked in that move's section)` (`SECTION_DECAY = 0.85`),
@@ -602,6 +593,117 @@ upgrades stored routines in place.
   move's retired `jointFriendly` boolean is then removed. Settings migrate separately in
   `normalizeState`: old `jointFriendly:true` → both new toggles on, then the old key is
   deleted. Runs for any `routine.version < 10`, right after the v9 call; idempotent.
+
+## v3.7 — generic tags with 1–5 priority (replaces joint-friendly + dayLock)
+
+- **One mechanism, two retired systems.** The two joint-friendly toggles AND the hard
+  per-move `dayLock` filter collapse into a single **tag** system. The routine gains a
+  top-level `tags` array of `{ id, name, auto? }`; each move carries an optional `tags`
+  array of those ids. The seed ships four tags: `joint-stress-legs`, `joint-stress-arms`,
+  and the two **auto** day tags `day-a` / `day-b` (`auto: "day"`). Seed `version` → **11**.
+
+- **Priority + multipliers (`tagScoreFactor`, `TAG_PRIORITY_MULT`).** Each tag on a move
+  resolves to an effective **1–5 priority**. For non-auto tags that's `settings.tagPriority[id]`
+  (default 3). For an auto day tag it's derived from the session's A/B day — **today's day → 4,
+  the other day → 2** — a *soft* preference, **not** a hard lock (a B-tagged move can appear on
+  an A day if it still scores highest). Priority **1 excludes** the move from the pool;
+  otherwise the base score is multiplied per tag: **2 → ×0.6, 3 → ×1, 4 → ×1.5, 5 → ×2.5**
+  (one tunable table `TAG_PRIORITY_MULT`, in `app.js`, `tagMultiplier`). With every non-auto
+  tag at 3 the product is 1, so selection is byte-identical to pre-v3.7 for non-day-tagged moves.
+
+- **Settings.** `settings.tagPriority` maps each non-auto tag id → integer 1–5 (default 3).
+  Auto (day) tags never appear. UI: one slider per non-auto tag (`renderTagPriorityFields`,
+  `data-action="tag-priority"`), range 1–5, label shows the level meaning (1 Hard avoid,
+  2 Lower priority, 3 No effect, 4 Slight priority, 5 Higher priority), rendered in both the
+  Settings **Session** panel and the Gym **Adjust session** panel.
+
+- **Move editor.** The Add-a-move form replaces its Day `<select>` and the two "Stresses …"
+  checkboxes with a **tag-chip toggle per routine tag** (including `day-a`/`day-b`) plus a
+  **new-tag** field: typing a name adds `{ id: slugify(name) (collision-safe), name }` to
+  `routine.tags` and a `tagPriority` entry at 3 (`addTag`, `slugify`, `uniqueTagId`).
+
+- **v11 migration (`migrateRoutineV11`).** Adopts the seed's tag catalog, then rewrites every
+  move in the stored routine — seed-known **and** user-created — converting `jointStress ['legs'/'arms']`
+  → `joint-stress-legs`/`joint-stress-arms` and `dayLock "A"/"B"` → `day-a`/`day-b`, deleting the
+  retired fields. Runs for any `routine.version < 11`, right after v10; idempotent.
+  routineHistory snapshots are left untouched (matching every prior migration). Settings migrate
+  separately in `normalizeState`: `jointFriendlyLegs/Arms === true` → that region's tag priority 1,
+  else 3; every non-auto tag is then filled to 3 and clamped to int 1–5; the retired
+  `jointFriendly*` keys are deleted.
+
+- **Superset-bias headroom.** `settings.supersetBias` range widens **0–10 → 0–30** (slider min 0
+  step 1; clamp in `normalizeState`). The formula is unchanged (`×(1 + 0.1×bias)`), so 10 feels
+  as before and 30 reaches 4×.
+
+- **Validator.** `validateRoutine` validates the top-level `tags` array (each `{ id, name }`
+  present, ids unique, `auto` — when present — must be `"day"`) and rejects a move `tags` id
+  that isn't in the catalog, exactly as `goalScores` ids are checked.
+
+## v3.8 — coach data update (shins goal, shin moves, gym-only tag)
+
+- **New training goal `shins`** ("Stronger shins", weight 6, colorId **`lime`** — a new palette
+  entry; all ten prior colorIds were taken). Goals are data-driven, so it picks up a 0–10 weight
+  slider (Settings + Adjust-session) and goal-chip coloring automatically. Seed `version` → **12**.
+- **`gym-only` tag** (non-auto) added to the catalog and applied to every weights/machines seed
+  move (Hex bar deadlift, Overhead press, Face pulls, Bulgarian split squat, Chest-supported/cable
+  row, Leg press, Leg curl, Leg extension, Tibialis raises). Its `tagPriority` default (3) is
+  auto-filled by `normalizeState`; set the slider to 1 to hard-exclude gym gear for an at-home
+  bodyweight session. Home-eligible floor/bodyweight moves stay untagged.
+- **`steps` unit** added to `UNITS` (validator + Add-a-move unit dropdown) for the walking drills.
+- **Move changes.** `Arch rocks` (floor, back; core 7 / gym 6 / flip 3) **replaces** the retired
+  `Wall-sit hollow press`. `Hollow rocks` → 3×12 with the rep defined as one full back-and-forth,
+  plus a progression. Three home shin drills added to the floor section: `Heel walks`,
+  `Bent-knee (soleus) calf raises`, `Toe walks` (all serve the shins goal). `Tibialis raises`
+  un-day-locked (drops `day-b`), gains `shins: 8` and a progression. Lower-back rescoring:
+  `Arch (superman) hold` core 5 → 7; `Hex bar deadlift` core 3 → 4. Warm-up `Shin raises` adds
+  the shins goal.
+- **v12 migration (`migrateRoutineV12`).** Runs for any `routine.version < 12`, right after v11;
+  idempotent. Applies all of the above to stored routines **by name** (v8 precedent): adds the
+  shins goal + gym-only tag if absent; replaces Wall-sit hollow press wholesale with Arch rocks
+  (skipped if the move was deleted or Arch rocks already exists); lowers Hollow rocks to 12 **only
+  if currently >12** and raises core scores **upward only**, so user edits survive; inserts the
+  three shin moves via `insertSeedMove` (tombstones re-filtered by `normalizeState`, so a deleted
+  move never resurrects and duplicates aren't created).
+
+## v3.9 — Coach (OpenAI chat + tool-call routine edits)
+Storage stays `tumbleTrainer.v2`; no `routine.version` bump (no schema/migration change);
+`sw.js` CACHE is `tumble-trainer-v3.9.0`. Reinstates Phase 5 (removed in v3.2) with an
+entirely new design — see the rewritten Phase 5 section above.
+
+- **New "Coach" tab** (`renderCoach`) between Moves and Settings; `coach` added to the
+  `TABS` registry and to the `state.view` whitelist in `normalizeState`. A chat backed by
+  OpenAI `gpt-5.6-sol` (medium reasoning effort) via a direct browser call to
+  `api.openai.com/v1/responses` (tool calling; no `temperature`; `max_output_tokens`). Chat is **ephemeral** (`ui.coach.messages`,
+  memory only). Markdown-lite rendering (`coachMarkdown`): paragraphs, `**bold**`,
+  `` `code` ``, `<br>` — everything HTML-escaped first, no external libs.
+- **API key in its own slot.** Stored at `tumbleTrainer.openaiKey` (not in `state`), so
+  export/import backups never contain it. Settings → Coach has the password field
+  (set/not-set indicator + Remove) plus the editable **athlete profile**
+  (`state.settings.coachProfile`, seeded in `freshState` and back-filled in
+  `normalizeState`).
+- **Tool-call routine edits, always staged.** Eight function tools (`COACH_TOOLS`):
+  `add_move`, `update_move`, `delete_move`, `set_move_disabled`, `add_tag`,
+  `set_tag_priority`, `add_goal`, `set_goal_weight`. `coachRun` is an agentic loop
+  (≤ 6 iters): tool calls apply to a trial clone, the batch is checked with the existing
+  `validateRoutine`, invalid batches roll back and the model retries once, valid batches
+  stage `ui.coach.pending`. The user Applies (`pushHistory` → swap routine → settings
+  patch → tombstone deleted moves) or Discards; a new message discards a stale pending.
+  Nothing is auto-applied. Goal weights live on `routine.goals[].weight`; tag priorities
+  in `state.settings.tagPriority`; both edited on the trial and applied together.
+- **Service worker unchanged for correctness:** its fetch handler already returns early on
+  non-GET, so the cross-origin OpenAI POST is never intercepted. Only the CACHE name bumped.
+
+## v3.9.1 — Coach moved to the Responses API
+`/v1/chat/completions` returns 400 for gpt-5.6-sol when function tools are combined with
+`reasoning_effort` ("use /v1/responses or set reasoning_effort to 'none'"). Rather than
+dropping reasoning, `coachFetch`/`coachRun` now use `POST /v1/responses`: `instructions` +
+`input` items instead of `messages`; flat tool definitions (no nested `function` key);
+`function_call` items read from `output[]`; the model's output items (including reasoning
+items, which reasoning models require back) are re-sent along with `function_call_output`
+items; `max_output_tokens` replaces `max_completion_tokens`; reasoning effort is nested
+(`reasoning: {effort}` — top-level `reasoning_effort` is chat-completions-only and 400s
+here). Staging/validation flow unchanged. `sw.js` CACHE bumped to `tumble-trainer-v3.9.2`.
+Note: no org verification needed — it gates only streaming, which the Coach doesn't use.
 
 ## Non-goals
 - No accounts, no server, no analytics

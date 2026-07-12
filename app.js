@@ -27,9 +27,24 @@
 
 const V1_KEY = 'tumbleTrainer.v1';
 const V2_KEY = 'tumbleTrainer.v2';
+// v3.9 Coach: the OpenAI API key lives in its OWN localStorage slot — NEVER inside
+// `state` — so export/import backups never carry the secret off-device.
+const OPENAI_KEY = 'tumbleTrainer.openaiKey';
+const OPENAI_MODEL = 'gpt-5.6-sol';             // gpt-5.x: no `temperature`; tools+reasoning need /v1/responses
+const OPENAI_REASONING_EFFORT = 'medium';
+const COACH_MAX_ITERS = 6;                      // agentic loop cap (tool round-trips per send)
+
+// Seeded athlete profile — editable in Settings (state.settings.coachProfile).
+const DEFAULT_COACH_PROFILE =
+  '34M, child gymnast, getting back into it as an adult.\n\n' +
+  'Current moves: Backtuck, Backhandspring, Roundoff, Front handspring, ' +
+  'Handstand w/ walk, Bridge, Rolls, Frontflip (off springboard)';
+
+// colorId palette (mirrors styles.css c-* classes) — add_goal picks the first unused one.
+const GOAL_COLORS = ['purple', 'teal', 'coral', 'pink', 'gray', 'green', 'amber', 'blue', 'slate', 'orange', 'lime'];
 
 // Amount units the app understands. "sec/side" behaves like "sec".
-const UNITS = ['sec', 'sec/side', 'reps', 'reps/side', 'min'];
+const UNITS = ['sec', 'sec/side', 'reps', 'reps/side', 'min', 'steps'];
 
 // Fallback slider ranges if the routine omits structure.sliders (v3.0: one
 // unified "moves" slider replaces the four per-block sliders).
@@ -46,6 +61,7 @@ const TABS = [
   { id: 'today', label: 'Gym' },
   { id: 'daily', label: 'Daily' },    // warm-up + cool-down + the daily jumping stim
   { id: 'moves', label: 'Moves' },    // browse / add / delete the moves the generator picks from
+  { id: 'coach', label: 'Coach' },    // v3.9: LLM chat that answers questions + stages routine edits
   { id: 'settings', label: 'Settings' }
 ];
 
@@ -84,8 +100,20 @@ function inPreview() { return previewOffset > 0; }
 const ui = {
   expanded: new Set(),
   finishing: false,
-  adjustOpen: false               // v3.4: Gym-tab "Adjust session" panel open/collapsed (transient)
+  adjustOpen: false,              // v3.4: Gym-tab "Adjust session" panel open/collapsed (transient)
+  // v3.9 Coach: ALL transient / in-memory. messages = [{ role:'user'|'assistant', text }]
+  // (ephemeral chat — never persisted, resets on reload). pending = a staged changeset
+  // awaiting the user's Apply/Discard. busy = a request is in flight. error = last error.
+  coach: { messages: [], busy: false, pending: null, error: null }
 };
+
+// v3.7: default tag-priority map for a routine — every non-auto tag starts at 3
+// ("No effect"). Auto (day) tags are never included. Pure.
+function defaultTagPriority(routine) {
+  const tp = {};
+  ((routine && routine.tags) || []).forEach((t) => { if (t && t.id && !t.auto) tp[t.id] = 3; });
+  return tp;
+}
 
 function freshState(routine) {
   return {
@@ -94,11 +122,11 @@ function freshState(routine) {
     view: 'today',
     // v3.0: ONE "moves" slider = total goal-weighted moves per session; the four
     // per-block sliders (skill/core/wts/mach) collapsed into it. Default 10.
-    // v3.4/v3.6: two independent joint-friendly toggles restrict generation — legs
-    // (knees/ankles) and arms (shoulders/elbows/wrists), each default off. See selectMoves.
-    // v3.5: supersetBias 0–10 nudges the generator toward moves that pair into
+    // v3.7: tagPriority maps each non-auto routine tag id → integer 1–5 (default 3);
+    // 1 hard-avoids, 3 is neutral. Auto (day) tags never appear here. See selectMoves.
+    // v3.5/v3.7: supersetBias 0–30 nudges the generator toward moves that pair into
     // supersets (default 5; 0 = old behavior). See selectMoves.
-    settings: { moves: 10, cool: 2, jointFriendlyLegs: false, jointFriendlyArms: false, supersetBias: 5 },
+    settings: { moves: 10, cool: 2, supersetBias: 5, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
@@ -649,6 +677,194 @@ function migrateRoutineV10(routine, seed) {
 }
 
 /*
+ * v3.6 -> v3.7 migration: convert the per-move `jointStress` array and `dayLock`
+ * string into the generic `tags` system. The routine adopts the seed's tag catalog
+ * (joint-stress-legs / joint-stress-arms / day-a / day-b, plus any the seed adds), and
+ * every move in the stored routine — seed-known OR user-created — has its jointStress /
+ * dayLock rewritten to the matching tag ids, after which the retired fields are removed:
+ *   jointStress ['legs']  -> tag "joint-stress-legs"
+ *   jointStress ['arms']  -> tag "joint-stress-arms"
+ *   dayLock "A" / "B"     -> tag "day-a" / "day-b"
+ * Runs for any stored routine whose version is < 11. Pure; returns a new routine stamped
+ * version 11. Idempotent (once jointStress/dayLock are gone there is nothing to convert;
+ * an existing tag id is never duplicated).
+ *
+ * NOTE the seed's routine version is 11 even though the previous migration already
+ * stamped 10 — version 10 was taken by the jointStress split, so the tag conversion is
+ * the next link (11). routineHistory snapshots are left untouched, matching every prior
+ * migration (normalizeState never rewrites history snapshots).
+ */
+function migrateRoutineV11(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 11) return routine;
+  const r = deepClone(routine);
+  // Adopt the seed's tag catalog. Pre-v11 routines carry no tags; union defensively so a
+  // routine that somehow already has tags keeps them (seed tags fill in what's missing).
+  const seedTags = deepClone((seed && seed.tags) || []);
+  const have = {};
+  const tags = Array.isArray(r.tags) ? r.tags.slice() : [];
+  tags.forEach((t) => { if (t && t.id) have[t.id] = true; });
+  seedTags.forEach((t) => { if (t && t.id && !have[t.id]) { tags.push(t); have[t.id] = true; } });
+  r.tags = tags;
+  const moves = (r.blocks && r.blocks.moves) || [];
+  moves.forEach((m) => {
+    if (!m) return;
+    const mtags = Array.isArray(m.tags) ? m.tags.slice() : [];
+    const add = (id) => { if (mtags.indexOf(id) === -1) mtags.push(id); };
+    if (Array.isArray(m.jointStress)) {
+      if (m.jointStress.indexOf('legs') !== -1) add('joint-stress-legs');
+      if (m.jointStress.indexOf('arms') !== -1) add('joint-stress-arms');
+    }
+    if (m.dayLock === 'A') add('day-a');
+    else if (m.dayLock === 'B') add('day-b');
+    if (mtags.length) m.tags = mtags;
+    delete m.jointStress;
+    delete m.dayLock;
+  });
+  r.version = 11;
+  return r;
+}
+
+/*
+ * v3.7 -> v3.8 migration (coach data update). Runs for any stored routine whose
+ * version is < 12. Pure; returns a new routine stamped version 12. Idempotent.
+ * Applies the coach-approved edits to existing installs by NAME (matching the v8
+ * precedent), so seed-known moves adopt the change while user-added moves are left
+ * alone, and user-raised scores/lowered doses are never clobbered:
+ *   - adds the "shins" training goal (copied from the seed) if absent;
+ *   - adds the "gym-only" tag to the catalog and to every seed weights/machines move
+ *     by name (settings.tagPriority for it is auto-filled to 3 by normalizeState);
+ *   - replaces "Wall-sit hollow press" wholesale with the seed "Arch rocks" (skipped
+ *     if the move was deleted — then it's simply absent — or if "Arch rocks" exists);
+ *   - Hollow rocks: dose.amount -> 12 only if currently > 12, add progression, new why;
+ *   - Arch (superman) hold core -> 7 and Hex bar deadlift core -> 4 (upward only);
+ *   - Tibialis raises: drop the day-b tag, add shins:8, add progression;
+ *   - inserts the three home-friendly shin moves (tombstones filtered by normalizeState);
+ *   - warm-up "Shin raises (back against wall)": add the shins goal if absent.
+ */
+function migrateRoutineV12(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 12) return routine;
+  const r = deepClone(routine);
+
+  // 1. Add the shins training goal (copy from seed) if the install predates it.
+  const goals = r.goals || (r.goals = []);
+  if (!goals.some((g) => g && g.id === 'shins')) {
+    const seedShins = ((seed && seed.goals) || []).find((g) => g && g.id === 'shins');
+    if (seedShins) goals.push(deepClone(seedShins));
+  }
+
+  // 2. Add the gym-only tag to the catalog if missing (normalizeState fills its
+  //    tagPriority default of 3 — no settings work needed here).
+  const tags = Array.isArray(r.tags) ? r.tags : (r.tags = []);
+  if (!tags.some((t) => t && t.id === 'gym-only')) {
+    const seedTag = ((seed && seed.tags) || []).find((t) => t && t.id === 'gym-only');
+    tags.push(seedTag ? deepClone(seedTag) : { id: 'gym-only', name: 'Gym only' });
+  }
+
+  const moves = (r.blocks && r.blocks.moves) || [];
+  const findMove = (name) => moves.find((m) => m && m.name === name) || null;
+
+  // 3. Replace Wall-sit hollow press -> Arch rocks, wholesale, in place. If the move
+  //    was deleted it isn't here (so Arch rocks isn't added); if Arch rocks already
+  //    exists, skip to avoid a duplicate name.
+  if (!findMove('Arch rocks')) {
+    const idx = moves.findIndex((m) => m && m.name === 'Wall-sit hollow press');
+    if (idx !== -1) {
+      const seedArch = ((seed && seed.blocks && seed.blocks.moves) || [])
+        .find((m) => m && m.name === 'Arch rocks');
+      if (seedArch) moves[idx] = deepClone(seedArch);
+    }
+  }
+
+  // 4. Hollow rocks: lower dose to 12 only if the user hasn't already gone lower,
+  //    add the progression if absent, refresh the why.
+  const hollow = findMove('Hollow rocks');
+  if (hollow) {
+    if (hollow.dose && typeof hollow.dose.amount === 'number' && hollow.dose.amount > 12) {
+      hollow.dose.amount = 12;
+    }
+    if (!hollow.progression) hollow.progression = { step: 1, max: 15, maxSets: 3 };
+    hollow.why = 'Staple A — hollow under momentum (1 rep = one full back-and-forth)';
+  }
+
+  // 5. Lower-back rescoring — bump upward only (never lower a user-raised score).
+  const bumpCore = (name, to) => {
+    const ex = findMove(name);
+    if (!ex) return;
+    ex.goalScores = ex.goalScores || {};
+    if (typeof ex.goalScores.core !== 'number' || ex.goalScores.core < to) ex.goalScores.core = to;
+  };
+  bumpCore('Arch (superman) hold', 7);
+  bumpCore('Hex bar deadlift', 4);
+
+  // 6. Tibialis raises: drop the day-b tag, add the shins score, add the progression.
+  const tib = findMove('Tibialis raises');
+  if (tib) {
+    if (Array.isArray(tib.tags)) {
+      tib.tags = tib.tags.filter((t) => t !== 'day-b');
+      if (!tib.tags.length) delete tib.tags;
+    }
+    tib.goalScores = tib.goalScores || {};
+    if (typeof tib.goalScores.shins !== 'number') tib.goalScores.shins = 8;
+    if (!tib.progression) tib.progression = { step: 1, max: 20, maxSets: 3 };
+  }
+
+  // 7. Tag every seed weights/machines move (by name) gym-only. User-created moves in
+  //    those sections are the user's call and are left untouched.
+  ['Hex bar deadlift', 'Overhead press', 'Face pulls or band pull-aparts',
+    'Bulgarian split squat', 'Chest-supported or cable row', 'Leg press (light-moderate)',
+    'Leg curl', 'Leg extension', 'Tibialis raises'].forEach((name) => {
+    const ex = findMove(name);
+    if (!ex) return;
+    const t = Array.isArray(ex.tags) ? ex.tags : (ex.tags = []);
+    if (t.indexOf('gym-only') === -1) t.push('gym-only');
+  });
+
+  // 8. Insert the three home-friendly shin moves. insertSeedMove skips a name that is
+  //    already present; a name the user has tombstoned is re-filtered by normalizeState
+  //    after all migrations, so a deleted move never resurrects.
+  insertSeedMove(r, seed, 'Heel walks', ['moves']);
+  insertSeedMove(r, seed, 'Bent-knee (soleus) calf raises', ['moves']);
+  insertSeedMove(r, seed, 'Toe walks', ['moves']);
+
+  // 9. Warm-up Shin raises: add the shins goal if absent (keep plantar/recovery).
+  const wu = (r.blocks && r.blocks.warmup) || [];
+  const shinRaises = wu.find((ex) => ex && ex.name === 'Shin raises (back against wall)');
+  if (shinRaises) {
+    shinRaises.goals = shinRaises.goals || [];
+    if (shinRaises.goals.indexOf('shins') === -1) shinRaises.goals.unshift('shins');
+  }
+
+  r.version = 12;
+  return r;
+}
+
+/*
+ * v3.8 -> v3.8.1 migration (moveset audit). Runs for any stored routine whose
+ * version is < 13. Pure; returns a new routine stamped version 13. Idempotent.
+ * The audit found two moves that load the arms heavily but were missing the
+ * joint-stress-arms tag (their bodyweight peers — handstands, bridge push-ups —
+ * already carry it): Overhead press (shoulder/elbow pressing) and L-sit or tuck
+ * sit hold (full bodyweight through the wrists on floor). Stamped by NAME on
+ * seed-known moves only, matching the v12 precedent; user-added moves untouched.
+ */
+function migrateRoutineV13(routine) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 13) return routine;
+  const r = deepClone(routine);
+  const moves = (r.blocks && r.blocks.moves) || [];
+  ['Overhead press', 'L-sit or tuck sit hold'].forEach((name) => {
+    const ex = moves.find((m) => m && m.name === name);
+    if (!ex) return;
+    const t = Array.isArray(ex.tags) ? ex.tags : (ex.tags = []);
+    if (t.indexOf('joint-stress-arms') === -1) t.unshift('joint-stress-arms');
+  });
+  r.version = 13;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -718,6 +934,17 @@ function normalizeState(obj) {
   // seed-known moves by name; a user move that was excluded before stays excluded. Runs
   // for any stored routine.version < 10.
   if (seed) routine = migrateRoutineV10(routine, seed);
+  // v3.6 -> v3.7: convert per-move jointStress arrays + dayLock into the generic tag
+  // system (routine gains a `tags` catalog; moves gain `tags` ids). Runs for any stored
+  // routine.version < 11. See migrateRoutineV11 for the field mapping.
+  if (seed) routine = migrateRoutineV11(routine, seed);
+  // v3.7 -> v3.8: coach data update (shins goal + shin moves, gym-only tag, arch rocks
+  // replaces wall-sit hollow press, hollow-rocks 3×12, lower-back rescoring, tibialis
+  // un-day-locked). Runs for any stored routine.version < 12. See migrateRoutineV12.
+  if (seed) routine = migrateRoutineV12(routine, seed);
+  // v3.8 -> v3.8.1: moveset audit — stamp joint-stress-arms on Overhead press and
+  // L-sit or tuck sit hold (seed-known, by name). Runs for any version < 13.
+  routine = migrateRoutineV13(routine);
   // Move-viewer tombstones: a move the user deleted must never be resurrected by a
   // migration or a re-inserted seed move — filter deleted names after all migrations.
   const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
@@ -743,9 +970,11 @@ function normalizeState(obj) {
     autoSuperset: typeof obj.autoSuperset === 'boolean' ? obj.autoSuperset : true,
     deletedMoves: tombstones,
     routine: routine,
-    view: ['today', 'daily', 'moves', 'settings'].indexOf(obj.view) >= 0 ? obj.view : 'today'
+    view: ['today', 'daily', 'moves', 'coach', 'settings'].indexOf(obj.view) >= 0 ? obj.view : 'today'
   });
   delete merged.settings.aerial;   // obsolete — aerial is now a goal
+  // v3.9: seed the editable athlete profile on installs that predate the Coach.
+  if (typeof merged.settings.coachProfile !== 'string') merged.settings.coachProfile = DEFAULT_COACH_PROFILE;
 
   // v3.0: collapse the old four per-block sliders into one "moves" total. When any
   // legacy slider is stored, moves = clamp(skill+core+wts+mach, 3, 15); then drop
@@ -760,21 +989,40 @@ function normalizeState(obj) {
   ['skill', 'core', 'wts', 'mach'].forEach((k) => delete merged.settings[k]);
   if (typeof merged.settings.moves !== 'number') merged.settings.moves = base.settings.moves;
   merged.settings.moves = clamp(merged.settings.moves, 3, 15);
-  // v3.4/v3.6: joint-friendly is now two independent session toggles (legs / arms), each
-  // default off. Migrate the old single boolean: jointFriendly:true -> both on; then drop
-  // the retired key.
-  if (typeof merged.settings.jointFriendly === 'boolean') {
-    if (merged.settings.jointFriendly) {
-      merged.settings.jointFriendlyLegs = true;
-      merged.settings.jointFriendlyArms = true;
-    }
-    delete merged.settings.jointFriendly;
+  // v3.7: joint-friendly toggles are gone — map them onto the per-tag priority map.
+  // A recovering-region toggle that was ON (true) becomes priority 1 ("hard avoid") for
+  // that region's tag; OFF (or absent) becomes 3 ("no effect"). Then drop the retired
+  // keys. The old single v3.4 jointFriendly boolean, if still present, seeds BOTH.
+  // Read the STORED tagPriority (obj), not merged — merged already carries base's
+  // default-3 fill, which would otherwise pre-empt the toggle→priority mapping below.
+  const storedTP = (obj.settings && obj.settings.tagPriority && typeof obj.settings.tagPriority === 'object' &&
+    !Array.isArray(obj.settings.tagPriority)) ? obj.settings.tagPriority : {};
+  const tp = Object.assign({}, storedTP);
+  const legacyBoth = merged.settings.jointFriendly === true;
+  if (('jointFriendlyLegs' in merged.settings || 'jointFriendly' in merged.settings) &&
+      tp['joint-stress-legs'] == null) {
+    tp['joint-stress-legs'] = (merged.settings.jointFriendlyLegs === true || legacyBoth) ? 1 : 3;
   }
-  merged.settings.jointFriendlyLegs = !!merged.settings.jointFriendlyLegs;
-  merged.settings.jointFriendlyArms = !!merged.settings.jointFriendlyArms;
-  // v3.5: superset bias — integer 0–10 (default 5). Missing / non-number → 5; clamp + int.
+  if (('jointFriendlyArms' in merged.settings || 'jointFriendly' in merged.settings) &&
+      tp['joint-stress-arms'] == null) {
+    tp['joint-stress-arms'] = (merged.settings.jointFriendlyArms === true || legacyBoth) ? 1 : 3;
+  }
+  delete merged.settings.jointFriendly;
+  delete merged.settings.jointFriendlyLegs;
+  delete merged.settings.jointFriendlyArms;
+  // Every non-auto tag gets a priority (default 3); existing entries clamp to int 1–5.
+  // Auto (day) tags never appear here; orphaned/auto ids are dropped.
+  const validTag = {};
+  ((routine && routine.tags) || []).forEach((t) => {
+    if (!t || !t.id || t.auto) return;
+    validTag[t.id] = true;
+    tp[t.id] = (typeof tp[t.id] === 'number') ? clamp(tp[t.id] | 0, 1, 5) : 3;
+  });
+  Object.keys(tp).forEach((id) => { if (!validTag[id]) delete tp[id]; });
+  merged.settings.tagPriority = tp;
+  // v3.5/v3.7: superset bias — integer 0–30 (default 5). Missing / non-number → 5; clamp + int.
   merged.settings.supersetBias = typeof merged.settings.supersetBias === 'number'
-    ? clamp(merged.settings.supersetBias | 0, 0, 10) : 5;
+    ? clamp(merged.settings.supersetBias | 0, 0, 30) : 5;
 
   if (legacy) {
     merged.intensity = migrateIntensity(obj.intensity || {}, routine);
@@ -813,9 +1061,10 @@ async function loadSeed() {
  * v3.0 schema: goals have a `kind` ("training" | "care"); training goals carry a
  * numeric weight, care goals do not. blocks = { warmup[], moves[], cooldown[] }.
  * A `moves` entry has a `section` ("floor"|"weights"|"machines"), a `goalScores`
- * map (trainingGoalId -> integer 0..10), and an optional `care` array of care-goal
- * ids. warmup/cooldown entries keep a `goals` tag array. Extra fields (group,
- * rest, progression, dayLock, tempoNote, alwaysInShort, muscle) are allowed.
+ * map (trainingGoalId -> integer 0..10), an optional `care` array of care-goal ids,
+ * and (v3.7) an optional `tags` array of ids from the routine's top-level `tags`
+ * catalog. warmup/cooldown entries keep a `goals` tag array. Extra fields (group,
+ * rest, progression, tempoNote, alwaysInShort, muscle) are allowed.
  */
 const SECTIONS = ['floor', 'weights', 'machines'];
 
@@ -857,6 +1106,31 @@ function validateRoutine(routine) {
     });
   }
   const knownGoals = trainingIds.concat(careIds);
+
+  // v3.7: optional top-level `tags` catalog — [{ id, name, auto? }]. ids unique;
+  // `auto`, when present, must be "day". Move `tags` are validated against these ids.
+  const tagIds = [];
+  if ('tags' in routine) {
+    if (!Array.isArray(routine.tags)) {
+      errors.push('tags must be an array of { id, name, auto? }');
+    } else {
+      const seenTag = new Set();
+      routine.tags.forEach((t, i) => {
+        if (!t || typeof t !== 'object' || Array.isArray(t)) {
+          errors.push('tags[' + i + '] must be an object'); return;
+        }
+        if (typeof t.id !== 'string' || !t.id) errors.push('tags[' + i + '] missing string "id"');
+        if (typeof t.name !== 'string' || !t.name) errors.push('tags[' + i + '] missing string "name"');
+        if ('auto' in t && t.auto !== 'day') {
+          errors.push('tags[' + i + '] (' + (t.id || i) + ') "auto" must be "day" when present');
+        }
+        if (typeof t.id === 'string' && t.id) {
+          if (seenTag.has(t.id)) errors.push('tags: duplicate tag id "' + t.id + '"');
+          seenTag.add(t.id); tagIds.push(t.id);
+        }
+      });
+    }
+  }
 
   const blocks = routine.blocks;
   if (!blocks || typeof blocks !== 'object' || Array.isArray(blocks)) {
@@ -942,19 +1216,19 @@ function validateRoutine(routine) {
       }
     }
     // v3.4: optional per-move `disabled` boolean keeps a move out of the generator pool
-    // (Moves tab toggle). v3.6: optional `jointStress` array marks which joint region(s)
-    // a move loads ('legs' and/or 'arms'); absent/empty = safe both ways. Accept the
-    // field absent; reject a non-array or an unknown region value.
+    // (Moves tab toggle). v3.7: optional `tags` array of ids from the routine's top-level
+    // `tags` catalog; absent = no tags. Reject a non-array or an unknown id (same as
+    // goalScores ids are checked).
     if ('disabled' in ex && typeof ex.disabled !== 'boolean') {
       errors.push(path + ' (' + label + '): disabled must be a boolean');
     }
-    if ('jointStress' in ex) {
-      if (!Array.isArray(ex.jointStress)) {
-        errors.push(path + ' (' + label + '): jointStress must be an array of "legs"/"arms"');
+    if ('tags' in ex) {
+      if (!Array.isArray(ex.tags)) {
+        errors.push(path + ' (' + label + '): tags must be an array of tag ids');
       } else {
-        ex.jointStress.forEach((v) => {
-          if (v !== 'legs' && v !== 'arms') {
-            errors.push(path + ' (' + label + '): jointStress has unknown region "' + v + '"');
+        ex.tags.forEach((id) => {
+          if (tagIds.indexOf(id) === -1) {
+            errors.push(path + ' (' + label + '): tags references unknown tag "' + id + '"');
           }
         });
       }
@@ -1045,16 +1319,61 @@ function goalOrderIndex(id) {
   return i < 0 ? 999 : i;
 }
 
-// v3.0 eligibility for the STATIC blocks (warm-up / cool-down): dayLock only.
-// Their care tags are always active, and training moves are filtered by score.
-function eligible(ex, day) {
-  return !ex.dayLock || ex.dayLock === day;
+// v3.7: generic tag system (replaces the joint-friendly toggles AND the dayLock
+// filter). A routine carries a top-level `tags` list [{ id, name, auto? }]; a move
+// carries an optional `tags` array of those ids. Each tag resolves to a 1–5 priority
+// that either drops the move (1) or scales its score (see tagMultiplier).
+
+// Index the routine's tags by id (for O(1) lookup in the scorer). Pure.
+function tagIndex(routine) {
+  const out = {};
+  ((routine && routine.tags) || []).forEach((t) => { if (t && t.id) out[t.id] = t; });
+  return out;
 }
 
-// v3.6: does a move load the given joint region? `jointStress` is an optional array of
-// 'legs' (knees/ankles) and/or 'arms' (shoulders/elbows/wrists); absent/empty = safe.
-function jointStresses(ex, region) {
-  return !!(ex && Array.isArray(ex.jointStress) && ex.jointStress.indexOf(region) !== -1);
+function tagById(id) {
+  return ((state && state.routine && state.routine.tags) || []).find((t) => t && t.id === id) || null;
+}
+
+// Tag priority (1–5) → score multiplier. ONE tunable table. Priority 1 is handled
+// upstream as pool exclusion (never multiplied); anything outside 2–5 is neutral (×1).
+const TAG_PRIORITY_MULT = { 2: 0.6, 3: 1, 4: 1.5, 5: 2.5 };
+function tagMultiplier(priority) {
+  return Object.prototype.hasOwnProperty.call(TAG_PRIORITY_MULT, priority) ? TAG_PRIORITY_MULT[priority] : 1;
+}
+
+// Human-readable meaning of each 1–5 level (shared by the settings sliders).
+const TAG_LEVEL_LABEL = { 1: 'Hard avoid', 2: 'Lower priority', 3: 'No effect', 4: 'Slight priority', 5: 'Higher priority' };
+
+// Effective 1–5 priority of a tag for scoring. Auto "day" tags are a SOFT preference
+// derived from the session's A/B day (today's day → 4, the other → 2) — never a hard
+// lock. Every other tag reads settings.tagPriority (default 3). Pure.
+function tagEffectivePriority(tag, settings, day) {
+  if (!tag) return 3;
+  if (tag.auto === 'day') {
+    const isToday = (day === 'A' && tag.id === 'day-a') || (day === 'B' && tag.id === 'day-b');
+    return isToday ? 4 : 2;
+  }
+  const p = settings && settings.tagPriority && settings.tagPriority[tag.id];
+  return (typeof p === 'number') ? p : 3;
+}
+
+// Resolve a move's tags into { excluded, mult }: any tag at effective priority 1
+// excludes the move from the pool; otherwise the per-tag multipliers multiply
+// together. A move with no tags is neutral. Pure given (move, routine, settings, day).
+function tagScoreFactor(move, routine, settings, day) {
+  const ids = (move && Array.isArray(move.tags)) ? move.tags : [];
+  if (!ids.length) return { excluded: false, mult: 1 };
+  const byId = tagIndex(routine);
+  let mult = 1;
+  for (let i = 0; i < ids.length; i++) {
+    const tag = byId[ids[i]];
+    if (!tag) continue;                 // unknown id — ignore (validator rejects on save)
+    const p = tagEffectivePriority(tag, settings, day);
+    if (p <= 1) return { excluded: true, mult: 0 };
+    mult *= tagMultiplier(p);
+  }
+  return { excluded: false, mult: mult };
 }
 
 // Base goal-weighted score of a move: Σ over training goals of weight × score.
@@ -1152,7 +1471,7 @@ function sessionMoveCost(moves, autoSuperset) {
 
 /*
  * v3.0 move selection (replaces the staple/variety machinery). Pure given `st`.
- *   1. Pool = blocks.moves eligible for the day (dayLock).
+ *   1. Pool = blocks.moves, minus disabled moves and any move a tag hard-avoids.
  *   2. baseScore = Σ training goal weight × goalScore; drop moves scoring 0.
  *   3. Recency boost: sessionsSince = sessions since the move was last completed
  *      (never -> 6, capped at 6); effective = base × (1 + 0.1 × sessionsSince).
@@ -1164,17 +1483,21 @@ function sessionMoveCost(moves, autoSuperset) {
  */
 function selectMoves(st) {
   const b = (st.routine && st.routine.blocks) || {};
-  // v3.4/v3.6: drop moves the user disabled in the Moves tab, and — per the two
-  // joint-friendly toggles — any move that stresses a region whose toggle is on (a move
-  // that stresses neither, e.g. most moves, is always allowed). Then apply the day
-  // (dayLock) filter as before.
-  const sfLegs = !!(st.settings && st.settings.jointFriendlyLegs);
-  const sfArms = !!(st.settings && st.settings.jointFriendlyArms);
-  const pool = (b.moves || []).filter((ex) =>
-    ex && !ex.disabled &&
-    !(sfLegs && jointStresses(ex, 'legs')) &&
-    !(sfArms && jointStresses(ex, 'arms')) &&
-    eligible(ex, currentDay(st.session)));
+  // v3.7: drop moves the user disabled in the Moves tab, and any move a tag hard-avoids
+  // (a tag at effective priority 1). Surviving moves keep a per-tag score multiplier
+  // (mult) — priority 2→×0.6, 3→×1, 4→×1.5, 5→×2.5. Day A/B are auto tags: a SOFT
+  // same-day preference (no hard lock), so a B-tagged move can appear on an A day.
+  const day = currentDay(st.session);
+  const settings = st.settings || {};
+  const pool = [];
+  const tagMults = [];
+  (b.moves || []).forEach((ex) => {
+    if (!ex || ex.disabled) return;
+    const f = tagScoreFactor(ex, st.routine, settings, day);
+    if (f.excluded) return;
+    pool.push(ex);
+    tagMults.push(f.mult);
+  });
   const goals = ((st.routine && st.routine.goals) || []).filter((g) => g && g.kind === 'training');
   const log = st.log || [];
   const count = Math.max(st.settings.moves || 0, 0);
@@ -1185,7 +1508,7 @@ function selectMoves(st) {
     if (base <= 0) return;
     const last = lastCompletedIndex(move.name, log);
     const sessionsSince = last < 0 ? 6 : Math.min(log.length - last, 6);
-    scored.push({ move, i, section: move.section || 'floor', effective: base * (1 + 0.1 * sessionsSince) });
+    scored.push({ move, i, section: move.section || 'floor', effective: base * (1 + 0.1 * sessionsSince) * tagMults[i] });
   });
 
   const remaining = scored.slice();
@@ -1195,7 +1518,7 @@ function selectMoves(st) {
   // sessionMoveCost), so a supersetting session pulls in more actual moves. Cost is
   // measured over the chosen moves in pool order (matching how they render).
   const autoSuperset = st.autoSuperset !== false;
-  // v3.5: superset bias (settings.supersetBias, 0–10, default 5). While Auto superset
+  // v3.5/v3.7: superset bias (settings.supersetBias, 0–30, default 5). While Auto superset
   // is on, a candidate Floor move that would land in a superset group (>= 2) with the
   // already-chosen moves has its score multiplied by (1 + 0.1 * bias) — bias 10 = 2x,
   // bias 0 = no change (so bias 0 reproduces pre-v3.5 selection byte-for-byte). The
@@ -1229,7 +1552,7 @@ function selectMoves(st) {
  * Choice: cool === 1 -> "short" (only alwaysInShort items); cool >= 2 -> full list.
  */
 function buildCooldown(arr, cool, day) {
-  let list = (arr || []).filter((ex) => eligible(ex, day));
+  let list = (arr || []).slice();
   if (cool <= 1) list = list.filter((ex) => ex.alwaysInShort);
   return list;
 }
@@ -1253,7 +1576,7 @@ function buildSession(st) {
 
   if (b.warmup && b.warmup.length) {
     blocks.push({ key: 'warmup', title: 'Warm-up',
-      exercises: (b.warmup || []).filter((ex) => eligible(ex, day)) });
+      exercises: (b.warmup || []).slice() });
   }
 
   const selected = selectMoves(st);
@@ -1514,6 +1837,11 @@ function render() {
     renderedExercises = [];
     view.innerHTML = renderMoves();   // populates renderedMoves
     renderHeader(null, 'Moves');
+  } else if (state.view === 'coach') {
+    renderedExercises = [];
+    view.innerHTML = renderCoach();
+    renderHeader(null, 'Coach');
+    coachScrollToBottom();
   } else {
     const build = buildFutureSession(state, previewOffset);   // offset 0 = today
     view.innerHTML = renderToday(build);   // populates renderedExercises
@@ -1610,7 +1938,7 @@ function renderTabs() {
  * v3.4: the Gym tab's collapsible "Adjust session" panel. Default collapsed
  * (ui.adjustOpen, transient/in-memory). Reuses the shared session-tuning controls so
  * it's one source of truth with Settings. Changing any control fires the existing
- * onChange handlers (setting / goal-weight / toggle-joint-friendly), each of which
+ * onChange handlers (setting / goal-weight / tag-priority), each of which
  * re-renders — regenerating the visible session live; ui.adjustOpen keeps the panel
  * open across those re-renders.
  */
@@ -1623,7 +1951,7 @@ function renderAdjustPanel() {
     h += '<div class="adjust-body">' +
       renderSettingSlider('moves', 'Number of moves') +
       renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
-      renderJointFriendlyField() +
+      renderTagPriorityFields() +
       renderSupersetBiasField() +
       '<div class="adjust-goals-head">Goal weights</div>' +
       renderGoalWeightSliders() +
@@ -2212,10 +2540,12 @@ function renderMoveRow(m, idx, training) {
     '<span class="chip c-' + escapeHtml(goalColor(id)) + '">' + escapeHtml(goalName(id)) + '</span>').join(' ');
   const meta = [escapeHtml(formatDose(m.dose || { sets: 0, amount: 0, unit: '' }))];
   if (m.muscle) meta.push('muscle: ' + escapeHtml(m.muscle));
-  if (m.dayLock) meta.push('day ' + escapeHtml(m.dayLock));
-  // v3.6: flag which joint region(s) a move loads — it drops out when that toggle is on.
-  if (jointStresses(m, 'legs')) meta.push('<span class="mv-flag-warn">stresses knees/ankles</span>');
-  if (jointStresses(m, 'arms')) meta.push('<span class="mv-flag-warn">stresses shoulders/elbows/wrists</span>');
+  // v3.7: show the move's tags (auto day tags and priority-1 tags both matter to
+  // generation; the tag's own name explains what it is).
+  (m.tags || []).forEach((id) => {
+    const t = tagById(id);
+    meta.push('<span class="mv-tag">' + escapeHtml(t ? t.name : id) + '</span>');
+  });
   const disabled = !!m.disabled;
   return '<div class="mv-row' + (disabled ? ' mv-row-disabled' : '') + '">' +
     '<div class="mv-row-head">' +
@@ -2244,9 +2574,6 @@ function renderAddMoveForm(training) {
     '<div class="field"><label for="mv-section">Section</label><select id="mv-section">' +
       MOVE_SECTIONS.map((s) => '<option value="' + s.key + '">' + escapeHtml(s.title) + '</option>').join('') +
       '</select></div>' +
-    '<div class="field"><label for="mv-daylock">Day</label><select id="mv-daylock">' +
-      '<option value="">Both</option><option value="A">A only</option><option value="B">B only</option>' +
-      '</select></div>' +
     '</div>';
   h += '<div class="row wrap">' +
     '<div class="field"><label for="mv-sets">Sets</label><input type="number" id="mv-sets" min="1" max="6" step="1" value="3"></div>' +
@@ -2259,12 +2586,19 @@ function renderAddMoveForm(training) {
     '<div class="field"><label for="mv-muscle">Muscle (Floor supersets)</label><input type="text" id="mv-muscle" placeholder="optional, e.g. core"></div>' +
     '<div class="field"><label for="mv-why">Why</label><input type="text" id="mv-why" placeholder="optional purpose"></div>' +
     '</div>';
-  // v3.6: polarity flip vs the old single "is friendly" checkbox — each box now marks a
-  // region the move STRESSES (both off = jointStress omitted, i.e. safe both ways).
-  h += '<div class="field toggle"><label for="mv-joint-legs">Stresses knees/ankles</label>' +
-    '<input type="checkbox" id="mv-joint-legs"></div>';
-  h += '<div class="field toggle"><label for="mv-joint-arms">Stresses shoulders/elbows/wrists</label>' +
-    '<input type="checkbox" id="mv-joint-arms"></div>';
+  // v3.7: tag chips — every routine tag (including the auto Day A/B tags) is a toggle on
+  // the new move. Plus a "new tag" affordance: typing a name adds a tag to the routine
+  // (id slugified, collision-safe) and gives it a settings slider at 3.
+  const tags = (state.routine && state.routine.tags) || [];
+  h += '<div class="field"><label>Tags</label><div class="mv-tags">' +
+    (tags.length ? tags.map((t) =>
+      '<label class="mv-tag-chip"><input type="checkbox" data-mv-tag="' + escapeHtml(t.id) + '"> ' +
+        escapeHtml(t.name) + '</label>').join('')
+      : '<span class="muted">No tags yet.</span>') +
+    '</div>' +
+    '<div class="row"><input type="text" id="mv-new-tag" placeholder="New tag name"> ' +
+      '<button class="btn small" data-action="mv-add-tag">Add tag</button></div>' +
+    '</div>';
   h += '<div class="field"><label>Goal scores (0–10)</label><div class="mv-goal-scores">' +
     training.map((g) =>
       '<div class="mv-goal-field"><span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' +
@@ -2331,15 +2665,14 @@ function addMove() {
   if (!isNaN(w) && w > 0) move.dose.weight = w;
   const muscle = ((g('mv-muscle') && g('mv-muscle').value) || '').trim();
   if (muscle) move.muscle = muscle;
-  const day = g('mv-daylock').value;
-  if (day === 'A' || day === 'B') move.dayLock = day;
-  // v3.6: the two "stresses X" checkboxes write the jointStress array; both off omits it.
-  const stress = [];
-  const jLegs = g('mv-joint-legs');
-  const jArms = g('mv-joint-arms');
-  if (jLegs && jLegs.checked) stress.push('legs');
-  if (jArms && jArms.checked) stress.push('arms');
-  if (stress.length) move.jointStress = stress;
+  // v3.7: collect the checked tag chips into the move's `tags` array.
+  const tags = [];
+  if (typeof document.querySelectorAll === 'function') {
+    document.querySelectorAll('[data-mv-tag]').forEach((cb) => {
+      if (cb.checked) tags.push(cb.getAttribute('data-mv-tag'));
+    });
+  }
+  if (tags.length) move.tags = tags;
 
   (state.routine.goals || []).filter((x) => x && x.kind === 'training').forEach((gg) => {
     const el = g('mv-score-' + gg.id);
@@ -2357,6 +2690,40 @@ function addMove() {
   state.routine.blocks.moves.push(move);
   // If this name was previously tombstoned, adding it back un-tombstones it.
   state.deletedMoves = (state.deletedMoves || []).filter((n) => n !== name);
+  saveState();
+  render();
+}
+
+// v3.7: slugify a free-text tag name into a lowercase-hyphen id.
+function slugify(name) {
+  return String(name == null ? '' : name).toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+// Collision-safe tag id: append -2, -3, … if the base is already taken. Pure.
+function uniqueTagId(base, tags) {
+  const ids = new Set((tags || []).map((t) => t && t.id));
+  base = base || 'tag';
+  if (!ids.has(base)) return base;
+  let n = 2;
+  while (ids.has(base + '-' + n)) n++;
+  return base + '-' + n;
+}
+
+// v3.7: create a routine tag from the "new tag" field, give it a settings slider at 3,
+// and re-render so it appears as a move chip. (Re-render clears the add-move form — an
+// accepted trade-off for adding a tag mid-edit.)
+function addTag() {
+  if (typeof document === 'undefined') return;
+  const el = document.getElementById('mv-new-tag');
+  const name = ((el && el.value) || '').trim();
+  if (!name) return;
+  state.routine.tags = state.routine.tags || [];
+  const id = uniqueTagId(slugify(name), state.routine.tags);
+  if (!id) return;
+  state.routine.tags.push({ id: id, name: name });
+  state.settings.tagPriority = state.settings.tagPriority || {};
+  state.settings.tagPriority[id] = 3;
   saveState();
   render();
 }
@@ -2394,19 +2761,22 @@ function renderGoalWeightSliders() {
   }).join('');
 }
 
-// Joint-friendly toggles (v3.4; split legs/arms in v3.6). Each hides moves that stress
-// its region from generation. data-region tells the shared onChange which toggle fired.
-function renderJointFriendlyField() {
-  return '<div class="field toggle">' +
-    '<label for="joint-friendly-legs">Joint-friendly: legs (knees/ankles)</label>' +
-    '<input type="checkbox" id="joint-friendly-legs" data-action="toggle-joint-friendly" data-region="legs"' +
-      (state.settings.jointFriendlyLegs ? ' checked' : '') + '>' +
-    '</div>' +
-    '<div class="field toggle">' +
-    '<label for="joint-friendly-arms">Joint-friendly: arms (shoulders/elbows/wrists)</label>' +
-    '<input type="checkbox" id="joint-friendly-arms" data-action="toggle-joint-friendly" data-region="arms"' +
-      (state.settings.jointFriendlyArms ? ' checked' : '') + '>' +
+// v3.7: one 1–5 priority slider per non-auto routine tag (auto "day" tags get none).
+// 1 hard-avoids the move, 3 is neutral, 5 boosts it — the label shows the current
+// level's meaning. data-tag carries the tag id to the shared onChange handler.
+function renderTagPriorityFields() {
+  const tags = ((state.routine && state.routine.tags) || []).filter((t) => t && t.id && !t.auto);
+  if (!tags.length) return '';
+  return tags.map((t) => {
+    const raw = state.settings.tagPriority && state.settings.tagPriority[t.id];
+    const val = clamp(typeof raw === 'number' ? raw : 3, 1, 5);
+    return '<div class="field">' +
+      '<label>' + escapeHtml(t.name) +
+        ' <span class="val">' + escapeHtml(TAG_LEVEL_LABEL[val] || String(val)) + '</span></label>' +
+      '<input type="range" data-action="tag-priority" data-tag="' + escapeHtml(t.id) + '" ' +
+        'min="1" max="5" step="1" value="' + val + '">' +
     '</div>';
+  }).join('');
 }
 
 // Auto-superset toggle.
@@ -2418,14 +2788,15 @@ function renderAutoSupersetField() {
     '</div>';
 }
 
-// Superset-bias slider (v3.5): 0–10, higher = the generator prefers moves that pair
-// into supersets (applies only while Auto superset is on). Range is hard-coded 0–10 —
-// NOT sourced from routine.structure.sliders — and shows its value like a goal slider.
+// Superset-bias slider (v3.5; range widened to 0–30 in v3.7): higher = the generator
+// prefers moves that pair into supersets (applies only while Auto superset is on). Range
+// is hard-coded 0–30 — NOT sourced from routine.structure.sliders. The formula is
+// unchanged (×(1 + 0.1×bias)), so 10 feels as before and 30 reaches 4×.
 function renderSupersetBiasField() {
-  const val = clamp(typeof state.settings.supersetBias === 'number' ? state.settings.supersetBias : 5, 0, 10);
+  const val = clamp(typeof state.settings.supersetBias === 'number' ? state.settings.supersetBias : 5, 0, 30);
   return '<div class="field">' +
     '<label>Superset bias <span class="val">' + val + '</span></label>' +
-    '<input type="range" data-action="setting" data-key="supersetBias" min="0" max="10" step="1" value="' + val + '">' +
+    '<input type="range" data-action="setting" data-key="supersetBias" min="0" max="30" step="1" value="' + val + '">' +
     '</div>';
 }
 
@@ -2439,14 +2810,15 @@ function renderSettings() {
   html += '<section class="panel"><h3>Session</h3>' +
     renderSettingSlider('moves', 'Number of moves') +
     renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
-    renderJointFriendlyField() +
+    renderTagPriorityFields() +
     renderAutoSupersetField() +
     renderSupersetBiasField() +
-    '<p class="muted">Joint-friendly mode limits the session to moves that are easy on ' +
-      'recovering joints. Auto superset groups same-muscle-free Floor moves into supersets — ' +
-      'one card, alternate the moves, rest after each round. ' +
-      'Higher superset bias makes the generator prefer moves that pair into supersets; ' +
-      'it only applies while Auto superset is on.</p>' +
+    '<p class="muted">Each tag slider tunes how its moves are picked: 1 hard-avoids them, ' +
+      '3 is neutral, 5 favours them (e.g. drop joint-stress: legs to 1 to spare recovering ' +
+      'knees/ankles). Day A/B are automatic — the current day is softly preferred, not locked. ' +
+      'Auto superset groups same-muscle-free Floor moves into supersets — one card, alternate ' +
+      'the moves, rest after each round. Higher superset bias makes the generator prefer moves ' +
+      'that pair into supersets; it only applies while Auto superset is on.</p>' +
     '</section>';
 
   // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
@@ -2463,6 +2835,32 @@ function renderSettings() {
       '<span class="chip c-' + escapeHtml(g.colorId || 'gray') + '">' + escapeHtml(g.name) + '</span>'
     ).join(' ') + '</div>' +
     '<p class="muted">These are always on — no need to weight them.</p>' +
+    '</section>';
+
+  // Coach (v3.9) — OpenAI key (own localStorage slot, never in state/backups) + the
+  // editable athlete profile the Coach reads as context.
+  const hasKey = !!getOpenAIKey();
+  html += '<section class="panel"><h3>Coach</h3>' +
+    '<div class="field">' +
+      '<label>OpenAI API key ' +
+        (hasKey ? '<span class="val" style="color:var(--green)">set</span>' : '<span class="val" style="color:var(--muted)">not set</span>') +
+      '</label>' +
+      '<input type="password" id="coach-key" class="coach-key-input" autocomplete="off" spellcheck="false" placeholder="' +
+        (hasKey ? '•••••••• (stored on this device)' : 'sk-...') + '">' +
+      '<div class="row wrap">' +
+        '<button class="btn small primary" data-action="coach-save-key">Save key</button>' +
+        (hasKey ? '<button class="btn small danger" data-action="coach-clear-key">Remove key</button>' : '') +
+      '</div>' +
+    '</div>' +
+    '<p class="muted">Uses OpenAI\'s <code>' + escapeHtml(OPENAI_MODEL) + '</code> via a direct browser call. ' +
+      'The key is stored only on this device (separate from your routine data, so it is never in a backup export). ' +
+      'Set a spend limit in your OpenAI account. Chat history is not saved — it clears on reload.</p>' +
+    '<div class="field">' +
+      '<label for="coach-profile">Athlete profile</label>' +
+      '<textarea id="coach-profile" data-action="coach-profile" spellcheck="false">' +
+        escapeHtml(state.settings.coachProfile || '') + '</textarea>' +
+    '</div>' +
+    '<p class="muted">The Coach reads this plus your full routine and generation settings as context.</p>' +
     '</section>';
 
   // Data
@@ -2504,6 +2902,528 @@ function renderSettings() {
   return html;
 }
 
+/* --- 6b. Coach (LLM chat + staged routine edits, v3.9) -------------------- *
+ * A chat tab backed by OpenAI (gpt-5.6-sol at medium reasoning effort, the
+ * user's own key). The model answers
+ * training questions AND proposes routine edits through function/tool calls.
+ * EVERY edit is applied to a throwaway trial clone, validated with the existing
+ * validateRoutine(), and staged as ui.coach.pending — never auto-applied. The
+ * user reviews a summary and taps Apply (pushHistory → swap routine) or Discard.
+ * Chat is ephemeral (ui.coach.messages, memory only); the API key lives in its
+ * own localStorage slot (OPENAI_KEY), never in `state`, so backups never leak it.
+ */
+
+function getOpenAIKey() {
+  try { return localStorage.getItem(OPENAI_KEY) || ''; } catch (e) { return ''; }
+}
+function setOpenAIKey(v) {
+  try { if (v) localStorage.setItem(OPENAI_KEY, v); else localStorage.removeItem(OPENAI_KEY); } catch (e) { /* ignore */ }
+}
+
+// Markdown-lite: escape, then **bold**, `code`, blank-line paragraphs, single \n → <br>.
+function coachMarkdown(text) {
+  const esc = escapeHtml(String(text == null ? '' : text));
+  return esc.split(/\n{2,}/).map((block) => {
+    const inline = block
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+    return '<p>' + inline + '</p>';
+  }).join('');
+}
+
+function coachScrollToBottom() {
+  if (typeof document === 'undefined') return;
+  const list = document.getElementById('coach-messages');
+  if (list) list.scrollTop = list.scrollHeight;
+}
+
+/* --- Tool schemas exposed to the model --- */
+const COACH_MOVE_SCHEMA = {
+  type: 'object',
+  description: 'A generator move (blocks.moves entry).',
+  properties: {
+    name: { type: 'string' },
+    section: { type: 'string', enum: SECTIONS },
+    why: { type: 'string', description: 'one-line rationale shown on the card' },
+    dose: {
+      type: 'object',
+      properties: {
+        sets: { type: 'integer', minimum: 1, maximum: 6 },
+        amount: { type: 'number', description: '> 0' },
+        unit: { type: 'string', enum: UNITS },
+        weight: { type: 'number', description: 'optional load in lb (> 0)' }
+      },
+      required: ['sets', 'amount', 'unit']
+    },
+    goalScores: {
+      type: 'object',
+      description: 'map of training-goal id -> integer 0..10 (omit goals scoring 0)',
+      additionalProperties: { type: 'integer', minimum: 0, maximum: 10 }
+    },
+    care: { type: 'array', items: { type: 'string' }, description: 'care-goal ids this move also serves' },
+    tags: { type: 'array', items: { type: 'string' }, description: 'tag ids from routine.tags' },
+    muscle: { type: 'string' },
+    rest: { type: 'integer', description: 'rest seconds (> 0)' },
+    progression: { type: 'object' },
+    disabled: { type: 'boolean' }
+  },
+  required: ['name', 'section', 'why', 'dose', 'goalScores']
+};
+
+// Responses-API tool format: flat { type, name, description, parameters }
+// (the older chat-completions format nested these under a `function` key).
+const COACH_TOOLS = [
+  { type: 'function',
+    name: 'add_move',
+    description: 'Add a new generator move to blocks.moves.',
+    parameters: { type: 'object', properties: { move: COACH_MOVE_SCHEMA }, required: ['move'] }
+  },
+  { type: 'function',
+    name: 'update_move',
+    description: 'Shallow-merge a patch onto the move matched by exact name. dose, goalScores, progression, tags and care are replaced wholesale when present in the patch.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' },
+      patch: { type: 'object', description: 'partial move fields to overwrite' }
+    }, required: ['name', 'patch'] }
+  },
+  { type: 'function',
+    name: 'delete_move',
+    description: 'Remove the move with this exact name (also tombstoned so seed updates never revive it).',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  { type: 'function',
+    name: 'set_move_disabled',
+    description: 'Keep a move in the list but in/exclude it from the generator pool.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' }, disabled: { type: 'boolean' }
+    }, required: ['name', 'disabled'] }
+  },
+  { type: 'function',
+    name: 'add_tag',
+    description: 'Create a routine tag ("bool") and seed its priority slider to 3 (neutral).',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  { type: 'function',
+    name: 'set_tag_priority',
+    description: 'Set a tag\'s selection priority (1 hard-avoid, 3 neutral, 5 favour).',
+    parameters: { type: 'object', properties: {
+      tagId: { type: 'string' }, priority: { type: 'integer', minimum: 1, maximum: 5 }
+    }, required: ['tagId', 'priority'] }
+  },
+  { type: 'function',
+    name: 'add_goal',
+    description: 'Add a goal. training goals carry a 0..10 weight and can be scored by moves; care goals are always-on (warm-up/cool-down) and take no weight.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' },
+      kind: { type: 'string', enum: ['training', 'care'] },
+      weight: { type: 'integer', minimum: 0, maximum: 10, description: 'training only; default 5' }
+    }, required: ['name', 'kind'] }
+  },
+  { type: 'function',
+    name: 'set_goal_weight',
+    description: 'Set a training goal\'s weight 0..10 (0 turns it off).',
+    parameters: { type: 'object', properties: {
+      goalId: { type: 'string' }, weight: { type: 'integer', minimum: 0, maximum: 10 }
+    }, required: ['goalId', 'weight'] }
+  }
+];
+
+// Fresh trial the tool calls mutate: a deep clone of the routine plus the one
+// settings slice tools can touch (tagPriority) and a list of names deleted this run.
+function coachTrialBase() {
+  return {
+    routine: deepClone(state.routine),
+    settings: { tagPriority: deepClone(state.settings.tagPriority || {}) },
+    deletedMoves: []
+  };
+}
+
+// Apply one tool call to `trial`. Returns { ok:true, summary } or { ok:false, error }.
+function applyCoachTool(name, args, trial) {
+  const ok = (summary) => ({ ok: true, summary: summary });
+  const err = (msg) => ({ ok: false, error: msg });
+  args = args || {};
+  const moves = () => (trial.routine.blocks && trial.routine.blocks.moves) || [];
+  const findMove = (n) => moves().find((x) => x && x.name === n);
+
+  switch (name) {
+    case 'add_move': {
+      const m = args.move;
+      if (!m || typeof m !== 'object') return err('add_move: missing "move" object');
+      if (!m.name) return err('add_move: move.name is required');
+      trial.routine.blocks = trial.routine.blocks || {};
+      trial.routine.blocks.moves = trial.routine.blocks.moves || [];
+      if (findMove(m.name)) return err('add_move: a move named "' + m.name + '" already exists');
+      trial.routine.blocks.moves.push(deepClone(m));
+      return ok('Add move: ' + m.name);
+    }
+    case 'update_move': {
+      if (!args.name) return err('update_move: "name" is required');
+      if (!args.patch || typeof args.patch !== 'object') return err('update_move: "patch" object is required');
+      const mv = findMove(args.name);
+      if (!mv) return err('update_move: no move named "' + args.name + '"');
+      Object.assign(mv, deepClone(args.patch));   // dose/goalScores/progression/tags/care replace wholesale
+      return ok('Update move: ' + args.name + ' (' + Object.keys(args.patch).join(', ') + ')');
+    }
+    case 'delete_move': {
+      if (!args.name) return err('delete_move: "name" is required');
+      const arr = moves();
+      const at = arr.findIndex((x) => x && x.name === args.name);
+      if (at === -1) return err('delete_move: no move named "' + args.name + '"');
+      arr.splice(at, 1);
+      if (trial.deletedMoves.indexOf(args.name) === -1) trial.deletedMoves.push(args.name);
+      return ok('Delete move: ' + args.name);
+    }
+    case 'set_move_disabled': {
+      if (!args.name) return err('set_move_disabled: "name" is required');
+      const mv = findMove(args.name);
+      if (!mv) return err('set_move_disabled: no move named "' + args.name + '"');
+      if (args.disabled === true) mv.disabled = true; else delete mv.disabled;
+      return ok((args.disabled === true ? 'Disable' : 'Enable') + ' move: ' + args.name);
+    }
+    case 'add_tag': {
+      if (!args.name) return err('add_tag: "name" is required');
+      trial.routine.tags = trial.routine.tags || [];
+      const id = uniqueTagId(slugify(args.name), trial.routine.tags);
+      trial.routine.tags.push({ id: id, name: args.name });
+      trial.settings.tagPriority[id] = 3;
+      return ok('Add tag: ' + args.name + ' (id ' + id + ', priority 3)');
+    }
+    case 'set_tag_priority': {
+      if (!args.tagId) return err('set_tag_priority: "tagId" is required');
+      const tag = (trial.routine.tags || []).find((t) => t && t.id === args.tagId && !t.auto);
+      if (!tag) return err('set_tag_priority: no editable tag "' + args.tagId + '"');
+      if (typeof args.priority !== 'number' || !isFinite(args.priority)) return err('set_tag_priority: "priority" must be a number 1-5');
+      trial.settings.tagPriority[args.tagId] = clamp(Math.round(args.priority), 1, 5);
+      return ok('Set tag priority: ' + args.tagId + ' → ' + trial.settings.tagPriority[args.tagId]);
+    }
+    case 'add_goal': {
+      if (!args.name) return err('add_goal: "name" is required');
+      if (args.kind !== 'training' && args.kind !== 'care') return err('add_goal: "kind" must be "training" or "care"');
+      trial.routine.goals = trial.routine.goals || [];
+      const id = uniqueTagId(slugify(args.name), trial.routine.goals);
+      const used = new Set(trial.routine.goals.map((g) => g && g.colorId));
+      const colorId = GOAL_COLORS.find((c) => !used.has(c)) || 'gray';
+      const goal = { id: id, name: args.name, kind: args.kind, colorId: colorId };
+      if (args.kind === 'training') {
+        goal.weight = (typeof args.weight === 'number' && isFinite(args.weight)) ? clamp(Math.round(args.weight), 0, 10) : 5;
+      }
+      trial.routine.goals.push(goal);
+      return ok('Add ' + args.kind + ' goal: ' + args.name + (args.kind === 'training' ? ' (weight ' + goal.weight + ')' : ''));
+    }
+    case 'set_goal_weight': {
+      if (!args.goalId) return err('set_goal_weight: "goalId" is required');
+      const g = (trial.routine.goals || []).find((x) => x && x.id === args.goalId);
+      if (!g) return err('set_goal_weight: no goal "' + args.goalId + '"');
+      if (g.kind !== 'training') return err('set_goal_weight: "' + args.goalId + '" is a care goal and has no weight');
+      if (typeof args.weight !== 'number' || !isFinite(args.weight)) return err('set_goal_weight: "weight" must be a number 0-10');
+      g.weight = clamp(Math.round(args.weight), 0, 10);
+      return ok('Set goal weight: ' + args.goalId + ' → ' + g.weight);
+    }
+    default:
+      return err('Unknown tool: ' + name);
+  }
+}
+
+function coachStagePending(trial, summary) {
+  ui.coach.pending = {
+    routine: deepClone(trial.routine),
+    settingsPatch: { tagPriority: deepClone(trial.settings.tagPriority) },
+    deletedNames: trial.deletedMoves.slice(),
+    summary: summary.slice()
+  };
+}
+
+// Compact human-readable settings snapshot for the system prompt.
+function coachSettingsContext() {
+  const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training')
+    .map((g) => g.id + '=' + (typeof g.weight === 'number' ? g.weight : 0));
+  const tp = state.settings.tagPriority || {};
+  const tags = ((state.routine.tags || []).filter((t) => t && t.id && !t.auto))
+    .map((t) => t.id + '=' + (typeof tp[t.id] === 'number' ? tp[t.id] : 3));
+  return 'Training goal weights (0-10): ' + (training.join(', ') || '(none)') + '\n' +
+    'Tag priorities (1 avoid … 3 neutral … 5 favour): ' + (tags.join(', ') || '(none)') + '\n' +
+    'Superset bias: ' + (state.settings.supersetBias != null ? state.settings.supersetBias : 5) +
+    ' · moves/session: ' + state.settings.moves;
+}
+
+function coachSystemPrompt() {
+  return [
+    'You are the in-app training coach for "Tumble Trainer", a gymnastics-and-strength workout PWA.',
+    'You do two things: (1) answer the athlete\'s training questions (form checks, rep definitions,',
+    'programming advice) directly and briefly, and (2) edit their routine through the provided tools.',
+    '',
+    'HOW EDITS WORK — read carefully:',
+    '- Your tool calls do NOT take effect immediately. They are collected, validated, and STAGED for the',
+    '  athlete, who must tap "Apply" before anything changes. Nothing you do is applied until they approve.',
+    '- If a batch of tool calls fails validation you will get the errors back — fix them and resend the',
+    '  whole batch. After staging, briefly explain in chat what you proposed and why.',
+    '- When the athlete is only asking a question, just answer. Do not force an edit.',
+    '',
+    'SCOPE OF TOOLS:',
+    '- Tools edit ONLY blocks.moves (the generator pool), routine.tags, routine.goals, tag priorities and',
+    '  goal weights. You CANNOT and MUST NOT touch the warm-up or cool-down — they are athlete-managed.',
+    '- A valid move needs: name, section (one of ' + SECTIONS.join(', ') + '), why, dose',
+    '  { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ' }, and goalScores',
+    '  (map of training-goal id -> integer 0-10; omit goals scoring 0). Optional: care[] (care-goal ids),',
+    '  tags[] (ids from routine.tags), muscle, rest (seconds), progression, dose.weight (lb), disabled.',
+    '- goalScores keys must be existing TRAINING goal ids; care[] must be existing CARE goal ids; tags[]',
+    '  must be existing tag ids. Create a goal or tag first (add_goal / add_tag) if you need a new one.',
+    '- Move names are unique. update_move/delete_move/set_move_disabled match by EXACT name.',
+    '',
+    'GUARDRAILS:',
+    '- Be conservative with anything touching pain, rehab, or care items (plantar fasciitis, cubital',
+    '  tunnel, posture, sciatic, joint recovery, splits). Do not remove care-serving work casually, and',
+    '  for symptom/pain topics advise seeing a professional rather than prescribing rehab.',
+    '- Prefer small, targeted edits over sweeping rewrites. Keep names unique. Explain reasoning briefly.',
+    '',
+    'CURRENT GENERATION SETTINGS:',
+    coachSettingsContext(),
+    '',
+    'ATHLETE PROFILE:',
+    (state.settings.coachProfile || '(none provided)'),
+    '',
+    'CURRENT ROUTINE (JSON — warm-up/cool-down included for context only, not editable):',
+    JSON.stringify(state.routine)
+  ].join('\n');
+}
+
+// Responses API, not chat completions: gpt-5.6-sol rejects function tools +
+// reasoning_effort on /v1/chat/completions ("use /v1/responses").
+async function coachFetch(key, instructions, input, tools) {
+  let res;
+  try {
+    res = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        instructions: instructions,
+        input: input,
+        tools: tools,
+        tool_choice: 'auto',
+        reasoning: { effort: OPENAI_REASONING_EFFORT },   // Responses API nests it (chat used reasoning_effort)
+        max_output_tokens: 12000          // shared with reasoning tokens; no `temperature` — gpt-5.x rejects it
+      })
+    });
+  } catch (e) { throw { coachKind: 'network' }; }
+  if (res.status === 401) throw { coachKind: 'auth' };
+  if (!res.ok) {
+    let detail = '';
+    try { const j = await res.json(); detail = (j && j.error && j.error.message) || ''; } catch (e2) { /* non-JSON */ }
+    throw { coachKind: 'http', status: res.status, detail: detail };
+  }
+  return res.json();
+}
+
+function coachErrorText(e) {
+  if (e && e.coachKind === 'auth') return 'OpenAI rejected the API key (401). Check or replace it in Settings.';
+  if (e && e.coachKind === 'network') return 'Network error — the Coach needs a connection. Check you are online and try again.';
+  if (e && e.coachKind === 'http') return 'OpenAI error ' + e.status + (e.detail ? ': ' + e.detail : '') + '.';
+  return 'Something went wrong: ' + (e && e.message ? e.message : String(e));
+}
+
+// The agentic loop: send messages+tools; apply/validate/stage any tool calls;
+// let the model retry once on invalid, then produce its closing text.
+async function coachRun() {
+  const key = getOpenAIKey();
+  if (!key) { ui.coach.busy = false; ui.coach.error = 'Add an OpenAI API key in Settings first.'; render(); return; }
+
+  const instructions = coachSystemPrompt();
+  const input = ui.coach.messages.map((m) => ({ role: m.role, content: m.text }));
+
+  let trial = coachTrialBase();
+  let invalidRetries = 0;
+  let closed = false;
+  try {
+    for (let iter = 0; iter < COACH_MAX_ITERS; iter++) {
+      const data = await coachFetch(key, instructions, input, COACH_TOOLS);
+      const output = (data && data.output) || [];
+      // Re-send everything the model produced (incl. reasoning items — required
+      // for reasoning models when returning function_call_output).
+      output.forEach((item) => input.push(item));
+      const calls = output.filter((it) => it && it.type === 'function_call');
+      if (!calls.length) {
+        const text = output.filter((it) => it && it.type === 'message')
+          .map((m) => ((m.content || []).filter((c) => c && c.type === 'output_text')
+            .map((c) => c.text).join('')))
+          .join('\n\n').trim();
+        ui.coach.messages.push({ role: 'assistant', text: text || '(no reply)' });
+        closed = true;
+        break;
+      }
+
+      const snapshot = deepClone(trial);                    // roll back cleanly if the batch is invalid
+      const results = calls.map((tc) => {
+        let args = {};
+        try { args = JSON.parse(tc.arguments || '{}'); }
+        catch (e) { return { id: tc.call_id, error: 'Invalid JSON arguments' }; }
+        const r = applyCoachTool(tc.name || '', args, trial);
+        return { id: tc.call_id, summary: r.ok ? r.summary : null, error: r.ok ? null : r.error };
+      });
+      const anyErr = results.some((r) => r.error);
+      const v = validateRoutine(trial.routine);
+
+      if (anyErr || !v.valid) {
+        trial = snapshot;                                   // discard the bad batch
+        const errLines = results.filter((r) => r.error).map((r) => r.error).concat(v.valid ? [] : v.errors);
+        calls.forEach((tc) => {
+          const own = results.find((r) => r.id === tc.call_id);
+          const content = (own && own.error) ? own.error
+            : 'Batch rejected — fix and resend ALL edits together:\n' + errLines.join('\n');
+          input.push({ type: 'function_call_output', call_id: tc.call_id, output: content });
+        });
+        invalidRetries++;
+        if (invalidRetries > 1) {
+          ui.coach.messages.push({ role: 'assistant',
+            text: 'I could not build a valid change:\n' + errLines.join('\n') + '\n\nNothing was changed.' });
+          closed = true;
+          break;
+        }
+        continue;                                           // one retry
+      }
+
+      // Valid batch → stage it (replacing any earlier pending) and report back.
+      coachStagePending(trial, results.filter((r) => r.summary).map((r) => r.summary));
+      calls.forEach((tc) => {
+        const own = results.find((r) => r.id === tc.call_id);
+        input.push({ type: 'function_call_output', call_id: tc.call_id,
+          output: 'Staged for user approval: ' + (own && own.summary ? own.summary : 'ok') });
+      });
+      // loop again so the model can add its closing explanation
+    }
+  } catch (e) {
+    ui.coach.error = coachErrorText(e);
+  }
+  if (!closed && !ui.coach.error) {
+    ui.coach.messages.push({ role: 'assistant',
+      text: ui.coach.pending ? 'I\'ve staged the changes above — review and tap Apply when ready.'
+        : 'I ran out of steps before finishing. Try rephrasing.' });
+  }
+  ui.coach.busy = false;
+  render();
+}
+
+function coachSend() {
+  if (typeof document === 'undefined') return;
+  if (ui.coach.busy) return;
+  const ta = document.getElementById('coach-input');
+  const text = ((ta && ta.value) || '').trim();
+  if (!text) return;
+  if (!getOpenAIKey()) { ui.coach.error = 'Add an OpenAI API key in Settings first.'; render(); return; }
+  ui.coach.pending = null;                 // a new message discards any stale staged edit
+  ui.coach.error = null;
+  ui.coach.messages.push({ role: 'user', text: text });
+  ui.coach.busy = true;
+  render();
+  coachRun();
+}
+
+function coachApplyPending() {
+  const p = ui.coach.pending;
+  if (!p) return;
+  pushHistory(state.routine);
+  state.routine = deepClone(p.routine);
+  if (p.settingsPatch && p.settingsPatch.tagPriority) state.settings.tagPriority = deepClone(p.settingsPatch.tagPriority);
+  (p.deletedNames || []).forEach((name) => {
+    state.deletedMoves = state.deletedMoves || [];
+    if (state.deletedMoves.indexOf(name) === -1) state.deletedMoves.push(name);
+    delete state.intensity[name];
+    delete state.checks[name];
+    delete state.setsDone[name];
+    if (ui.expanded.has(name)) ui.expanded.delete(name);
+  });
+  state.swaps = {};                        // a routine change can invalidate per-session keys (mirrors rollback)
+  state.dismissed = {};
+  ui.coach.pending = null;
+  ui.coach.messages.push({ role: 'assistant', text: 'Applied — your routine is updated. (Undo via Settings → Routine history.)' });
+  saveState();
+  render();
+}
+
+function coachDiscardPending() {
+  ui.coach.pending = null;
+  render();
+}
+
+function coachNewChat() {
+  ui.coach.messages = [];
+  ui.coach.pending = null;
+  ui.coach.error = null;
+  ui.coach.busy = false;
+  render();
+}
+
+function coachSaveKey() {
+  if (typeof document === 'undefined') return;
+  const el = document.getElementById('coach-key');
+  const v = ((el && el.value) || '').trim();
+  if (!v) return;
+  setOpenAIKey(v);
+  ui.coach.error = null;
+  render();
+}
+
+function coachClearKey() {
+  setOpenAIKey('');
+  render();
+}
+
+function coachSaveProfile(el) {
+  state.settings.coachProfile = (el && el.value) || '';
+  saveState();
+}
+
+function renderCoach() {
+  if (!getOpenAIKey()) {
+    return '<div class="coach"><div class="coach-setup">' +
+      '<h3>Set up the Coach</h3>' +
+      '<p class="muted">The Coach uses OpenAI (<code>' + escapeHtml(OPENAI_MODEL) + '</code>) to answer training ' +
+        'questions and propose routine edits you approve. Add your OpenAI API key to get started.</p>' +
+      '<button class="btn primary" data-action="tab" data-view="settings">Open Settings</button>' +
+      '</div></div>';
+  }
+  const c = ui.coach;
+  let msgs;
+  if (!c.messages.length) {
+    msgs = '<div class="coach-empty muted">Ask about form, rep definitions, or programming — or tell me how to ' +
+      'change your routine. I stage edits for you to review; nothing changes until you tap Apply.</div>';
+  } else {
+    msgs = c.messages.map((m) =>
+      '<div class="coach-msg coach-' + (m.role === 'user' ? 'user' : 'bot') + '">' + coachMarkdown(m.text) + '</div>'
+    ).join('');
+  }
+  let pending = '';
+  if (c.pending) {
+    pending = '<div class="coach-pending">' +
+      '<div class="coach-pending-title">Proposed routine changes</div>' +
+      '<ul>' + (c.pending.summary.length
+        ? c.pending.summary.map((s) => '<li>' + escapeHtml(s) + '</li>').join('')
+        : '<li>(no summary)</li>') + '</ul>' +
+      '<div class="row">' +
+        '<button class="btn primary" data-action="coach-apply">Apply</button>' +
+        '<button class="btn ghost" data-action="coach-discard">Discard</button>' +
+      '</div></div>';
+  }
+  const err = c.error ? '<div class="errors show">' + escapeHtml(c.error) + '</div>' : '';
+  const busy = c.busy;
+  return '<div class="coach">' +
+    '<div class="coach-head">' +
+      '<span class="muted">Ephemeral chat · edits need your Apply</span>' +
+      '<button class="btn small ghost" data-action="coach-new"' + (busy ? ' disabled' : '') + '>New chat</button>' +
+    '</div>' +
+    '<div id="coach-messages" class="coach-messages">' + msgs +
+      (busy ? '<div class="coach-msg coach-bot coach-typing"><span></span><span></span><span></span></div>' : '') +
+    '</div>' +
+    pending + err +
+    '<div class="coach-compose">' +
+      '<textarea id="coach-input" placeholder="Ask the coach…"' + (busy ? ' disabled' : '') + '></textarea>' +
+      '<button class="btn primary" data-action="coach-send"' + (busy ? ' disabled' : '') + '>' +
+        (busy ? 'Sending…' : 'Send') + '</button>' +
+    '</div></div>';
+}
+
 /* --- 7. Event handling & mutations ---------------------------------------- */
 
 function onClick(e) {
@@ -2542,6 +3462,13 @@ function onClick(e) {
     case 'suggest-dismiss': dismissSuggestion(+el.dataset.sidx); break;
     case 'mv-delete': deleteMove(+el.dataset.idx); break;   // idx into renderedMoves
     case 'mv-add': addMove(); break;
+    case 'mv-add-tag': addTag(); break;                     // v3.7 create a routine tag
+    case 'coach-send': coachSend(); break;                  // v3.9 Coach
+    case 'coach-new': coachNewChat(); break;
+    case 'coach-apply': coachApplyPending(); break;
+    case 'coach-discard': coachDiscardPending(); break;
+    case 'coach-save-key': coachSaveKey(); break;
+    case 'coach-clear-key': coachClearKey(); break;
     default: break;
   }
 }
@@ -2591,14 +3518,19 @@ function onChange(e) {
     state.autoSuperset = el.checked;   // v2.5 Auto Superset on/off
     saveState();
     render();
-  } else if (action === 'toggle-joint-friendly') {
-    // v3.6: one handler for both region toggles; data-region says which one fired.
-    if (el.dataset.region === 'legs') state.settings.jointFriendlyLegs = el.checked;
-    else if (el.dataset.region === 'arms') state.settings.jointFriendlyArms = el.checked;
+  } else if (action === 'tag-priority') {
+    // v3.7: one 1–5 priority slider per non-auto tag; data-tag says which one fired.
+    const id = el.dataset.tag;
+    if (id) {
+      state.settings.tagPriority = state.settings.tagPriority || {};
+      state.settings.tagPriority[id] = clamp(+el.value, 1, 5);
+    }
     saveState();
     render();
   } else if (action === 'mv-toggle') {
     toggleMoveDisabled(+el.dataset.idx);         // v3.4 Moves-tab enable/disable
+  } else if (action === 'coach-profile') {
+    coachSaveProfile(el);                        // v3.9 persist the athlete profile on edit (no re-render)
   } else if (action === 'import') {
     importFile(el.files && el.files[0]);
   }
@@ -3038,8 +3970,8 @@ function moveGoalIds(ex) {
 
 /*
  * Pick a replacement for a skipped move (v3.0). Candidates come from blocks.moves,
- * share at least one goal/care id with the skipped move, are day-eligible, have a
- * positive goal-weighted score, and aren't already shown/proposed/itself. Ranked
+ * share at least one goal/care id with the skipped move, aren't hard-avoided by a tag,
+ * have a positive goal-weighted score, and aren't already shown/proposed/itself. Ranked
  * least-recently-completed (consistent with the variety guarantee), pool order.
  */
 function pickReplacement(name, st, shownNames, proposed, day) {
@@ -3054,7 +3986,7 @@ function pickReplacement(name, st, shownNames, proposed, day) {
   pool.forEach((ex) => {
     if (!ex || ex.name === name) return;
     if (!moveGoalIds(ex).some((g) => baseIds.indexOf(g) !== -1)) return;
-    if (!eligible(ex, day)) return;
+    if (tagScoreFactor(ex, routine, st.settings || {}, day).excluded) return;
     if (scoreMove(ex, goals) <= 0) return;
     if (shownNames.has(ex.name) || proposed.has(ex.name)) return;
     if (!cands.some((c) => c.name === ex.name)) cands.push(ex);
@@ -3228,10 +4160,13 @@ if (typeof module !== 'undefined' && module.exports) {
     validateRoutine, formatDose, effectiveDose, buildSession, buildFutureSession,
     migrateFromV1, freshState, currentDay,
     // v3.0 — goal-weighted generator (pure)
-    eligible, jointStresses, goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
+    goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
+    // v3.7 — generic tag system (pure)
+    tagIndex, tagMultiplier, tagEffectivePriority, tagScoreFactor, defaultTagPriority,
+    slugify, uniqueTagId,
     cardGoalIds, moveChipIds, moveGoalIds, buildCooldown,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
     // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate
     groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
     // Phase 4 heuristics (pure — take log/state as args)
@@ -3239,6 +4174,8 @@ if (typeof module !== 'undefined' && module.exports) {
     volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
     pickReplacement, progressionReady, isDismissed, computeSuggestions,
     findExerciseByName, collectPools, recentAppearances,
+    // v3.9 Coach (pure-ish — applyCoachTool mutates the trial it's given)
+    applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS,
     _ui: ui,
     _set: (s) => { state = s; },
     _setSeed: (s) => { SEED_ROUTINE = s; }
