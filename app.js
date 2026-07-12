@@ -865,6 +865,26 @@ function migrateRoutineV13(routine) {
 }
 
 /*
+ * v3.8.1 -> v3.9.1 migration (audit gap-fill). Runs for any stored routine whose
+ * version is < 14. Pure; returns a new routine stamped version 14. Idempotent.
+ * Inserts the seven researched moves that fill the audit's coverage gaps — home
+ * pulling (posture), anti-rotation core, adductor strength, home hamstring/quad
+ * eccentrics, lateral-plane plyo, one-leg hinge. insertSeedMove skips names
+ * already present, and tombstoned (user-deleted) names are re-filtered by
+ * normalizeState after all migrations, so nothing resurrects or duplicates.
+ */
+function migrateRoutineV14(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 14) return routine;
+  const r = deepClone(routine);
+  ['Prone Y-T-W raises', 'Copenhagen plank', 'Nordic hamstring curl',
+    'Reverse Nordic curl', 'Lateral bound (stick landing)', 'Single-leg RDL',
+    'Pallof press'].forEach((name) => insertSeedMove(r, seed, name, ['moves']));
+  r.version = 14;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -944,7 +964,13 @@ function normalizeState(obj) {
   if (seed) routine = migrateRoutineV12(routine, seed);
   // v3.8 -> v3.8.1: moveset audit — stamp joint-stress-arms on Overhead press and
   // L-sit or tuck sit hold (seed-known, by name). Runs for any version < 13.
-  routine = migrateRoutineV13(routine);
+  // Doesn't use the seed, but is gated on it like the others so a failed seed
+  // load can never stamp the version past the seed-dependent migrations above.
+  if (seed) routine = migrateRoutineV13(routine);
+  // v3.8.1 -> v3.9.1: audit gap-fill — insert the seven researched moves (home
+  // pull, anti-rotation, adductor, hamstring/quad eccentrics, lateral plyo,
+  // one-leg hinge). Runs for any version < 14. See migrateRoutineV14.
+  if (seed) routine = migrateRoutineV14(routine, seed);
   // Move-viewer tombstones: a move the user deleted must never be resurrected by a
   // migration or a re-inserted seed move — filter deleted names after all migrations.
   const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
