@@ -48,7 +48,7 @@ const UNITS = ['sec', 'sec/side', 'reps', 'reps/side', 'min', 'steps'];
 
 // Fallback slider ranges if the routine omits structure.sliders (v3.0: one
 // unified "moves" slider replaces the four per-block sliders).
-const DEFAULT_RANGES = { moves: [3, 15], cool: [1, 2] };
+const DEFAULT_RANGES = { moves: [3, 15] };   // v4.4: the `cool` slider retired for cooldownMode
 
 // v1 category id -> new goal id(s), for migrating LLM-added / hand-edited moves
 // that don't match a seed move by name (Feature A migration, step 2).
@@ -64,16 +64,6 @@ const TABS = [
   { id: 'coach', label: 'Coach' },    // v3.9: LLM chat that answers questions + stages routine edits
   { id: 'settings', label: 'Settings' }
 ];
-
-// The "Daily" tab shows the static warm-up and cool-down plus this fixed daily
-// plyometric stim (the user stims by jumping). It is NOT part of the generated Gym
-// session — it renders only on the Daily tab, right after the warm-up.
-const DAILY_TUCK_JUMPS = {
-  name: 'Tuck jumps',
-  dose: { sets: 3, amount: 10, unit: 'reps' },
-  goals: ['flip', 'recovery'],
-  why: 'Daily plyometric stim — light, springy jumps through the feet'
-};
 
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const deepClone = (o) => JSON.parse(JSON.stringify(o));
@@ -194,7 +184,10 @@ function freshState(routine) {
     // v3.5/v3.7: supersetBias 0–30 nudges the generator toward moves that pair into
     // supersets (default 5; 0 = old behavior). See selectMoves.
     // v4.0: weeklyClasses (0|1|2, default 1) = gymnastics classes expected this week; scales the impact budget.
-    settings: { moves: 10, cool: 2, supersetBias: 5, weeklyClasses: 1, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
+    // v4.3: warmupMode (short|standard|long, default standard) drives buildWarmup's length. Toggled on the warm-up block header.
+    // v4.4: cooldownMode (short|standard|long, default standard; reuses WARMUP_MODES) drives buildCooldown's length; the old `cool` slider retired.
+    // v4.5: dailyMode (short|standard|long, default standard; reuses WARMUP_MODES) drives buildDaily's length. Toggled on the Daily-tab practice block header.
+    settings: { moves: 10, cooldownMode: 'standard', dailyMode: 'standard', supersetBias: 5, weeklyClasses: 1, warmupMode: 'standard', tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
@@ -987,6 +980,149 @@ function migrateRoutineV15(routine, seed) {
 }
 
 /*
+ * v4.2 -> v4.3 migration (Phase 5, warm-up engine). Replaces the flat blocks.warmup list
+ * (moves + `group` strings) with blocks.warmupModules. Gated `version < 16`, idempotent.
+ *
+ * The new module set is taken from the v16 seed (deep-cloned; gated on `seed` in
+ * normalizeState exactly like every seed migration since V3). We then walk the OLD warmup:
+ *   - a move whose NAME matches one in the new modules carries the USER's dose (and
+ *     progression, if the stored move set one) onto that new move — a user-progressed base
+ *     dose must survive. (The ladder LEVEL lives in state.intensity keyed by name, so it
+ *     migrates for free — the module keeps the same move names.)
+ *   - an unrecognized (user-added) move is preserved verbatim, appended to the module its old
+ *     `group` maps to (Wall→posture, Plantar fasciitis/Feet→plantar, Nerves→nerves,
+ *     Circles/Shoulders→shoulders, Standing→hips, Wrists→wrists, Core warmup→core-activate);
+ *     an unknown group becomes its own care module (id slugified, pinned everywhere) so a
+ *     customization is never dropped.
+ * New seed moves are present because the module set IS the seed; nothing is added by name.
+ */
+const WARMUP_GROUP_TO_MODULE = {
+  'Wall': 'posture', 'Plantar fasciitis': 'plantar', 'Feet': 'plantar', 'Nerves': 'nerves',
+  'Circles': 'shoulders', 'Shoulders': 'shoulders', 'Standing': 'hips', 'Wrists': 'wrists',
+  'Core warmup': 'core-activate'
+};
+function migrateRoutineV16(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 16) return routine;
+  const r = deepClone(routine);
+  const b = r.blocks || (r.blocks = {});
+  const oldWarmup = Array.isArray(b.warmup) ? b.warmup : [];
+  const modules = deepClone((seed && seed.blocks && seed.blocks.warmupModules) || []);
+  const moveByName = {};
+  const moduleById = {};
+  modules.forEach((m) => {
+    if (!m || !m.id) return;
+    moduleById[m.id] = m;
+    (m.moves || []).forEach((mv) => { if (mv && mv.name) moveByName[mv.name] = mv; });
+  });
+  oldWarmup.forEach((ex) => {
+    if (!ex || typeof ex !== 'object' || !ex.name) return;
+    const known = moveByName[ex.name];
+    if (known) {
+      // Carry the user's persisted base dose + progression onto the same-name new move.
+      if (ex.dose && typeof ex.dose === 'object') known.dose = deepClone(ex.dose);
+      if (ex.progression && typeof ex.progression === 'object') known.progression = deepClone(ex.progression);
+      return;
+    }
+    // User-added move the name map doesn't recognize — never drop it. Append to the module its
+    // old group maps to, else spin up a dedicated care module so it still renders.
+    let mid = WARMUP_GROUP_TO_MODULE[ex.group];
+    let mod = mid && moduleById[mid];
+    if (!mod) {
+      mid = slugify(ex.group || 'warmup-custom') || 'warmup-custom';
+      mod = moduleById[mid];
+      if (!mod) {
+        mod = { id: mid, name: ex.group || 'Warm-up', role: 'care', pinnedIn: WARMUP_CONTEXTS.slice(), moves: [] };
+        moduleById[mid] = mod;
+        modules.push(mod);
+      }
+    }
+    mod.moves = mod.moves || [];
+    if (!mod.moves.some((mv) => mv && mv.name === ex.name)) {
+      const carried = deepClone(ex);
+      delete carried.group;   // group lived on the flat entry; the module now owns membership
+      mod.moves.push(carried);
+    }
+  });
+  b.warmupModules = modules;
+  delete b.warmup;
+  r.version = 16;
+  return r;
+}
+
+/*
+ * v4.3 -> v4.4 (Phase 6): cool-down engine. Gated (version < 17), idempotent. Same by-name
+ * pattern as V16: replace the flat blocks.cooldown list with blocks.cooldownModules from the v17
+ * seed (deep-cloned), carrying the user's persisted dose (+ progression) onto same-name seed
+ * moves. A user-added cool-down move the name map doesn't recognize is NEVER dropped: it becomes
+ * its own care module keyed by the slug of its name — pinned everywhere if it had `alwaysInShort`
+ * (preserving today's always-present semantics), else eligible everywhere so it joins the
+ * standard-mode rotation pool. The old `alwaysInShort` flag is stripped (superseded by pinnedIn).
+ */
+function migrateRoutineV17(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 17) return routine;
+  const r = deepClone(routine);
+  const b = r.blocks || (r.blocks = {});
+  const oldCooldown = Array.isArray(b.cooldown) ? b.cooldown : [];
+  const modules = deepClone((seed && seed.blocks && seed.blocks.cooldownModules) || []);
+  const moveByName = {};
+  const moduleById = {};
+  modules.forEach((m) => {
+    if (!m || !m.id) return;
+    moduleById[m.id] = m;
+    (m.moves || []).forEach((mv) => { if (mv && mv.name) moveByName[mv.name] = mv; });
+  });
+  oldCooldown.forEach((ex) => {
+    if (!ex || typeof ex !== 'object' || !ex.name) return;
+    const known = moveByName[ex.name];
+    if (known) {
+      // Carry the user's persisted base dose + progression onto the same-name new move.
+      if (ex.dose && typeof ex.dose === 'object') known.dose = deepClone(ex.dose);
+      if (ex.progression && typeof ex.progression === 'object') known.progression = deepClone(ex.progression);
+      return;
+    }
+    // User-added cool-down move — never drop it. Give it its own module keyed by a slug of the
+    // move name; alwaysInShort → pinned everywhere, else eligible everywhere (rotation pool).
+    const mid = slugify(ex.name) || 'cooldown-custom';
+    let mod = moduleById[mid];
+    if (!mod) {
+      mod = { id: mid, name: ex.name, role: 'care', moves: [] };
+      if (ex.alwaysInShort) mod.pinnedIn = WARMUP_CONTEXTS.slice();
+      moduleById[mid] = mod;
+      modules.push(mod);
+    }
+    mod.moves = mod.moves || [];
+    if (!mod.moves.some((mv) => mv && mv.name === ex.name)) {
+      const carried = deepClone(ex);
+      delete carried.alwaysInShort;   // superseded by the module's pinnedIn
+      mod.moves.push(carried);
+    }
+  });
+  b.cooldownModules = modules;
+  delete b.cooldown;
+  r.version = 17;
+  return r;
+}
+
+/*
+ * v4.4 -> v4.5 (Phase 7): daily practice engine. Gated (version < 18), idempotent. There is no
+ * legacy block to carry (the old daily stim was a hardcoded app constant, DAILY_TUCK_JUMPS, never
+ * in the routine), so this simply installs blocks.dailyModules from the v18 seed (deep-cloned).
+ * The move name "Tuck jumps" is preserved verbatim in the seed, so the user's state.checks and any
+ * ladder level keyed by that name survive.
+ */
+function migrateRoutineV18(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 18) return routine;
+  const r = deepClone(routine);
+  const b = r.blocks || (r.blocks = {});
+  b.dailyModules = deepClone((seed && seed.blocks && seed.blocks.dailyModules) || []);
+  r.version = 18;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -1077,6 +1213,17 @@ function normalizeState(obj) {
   // family/loads/fatigue/qualitySensitive onto seed-known moves by name (no overwrite of
   // existing fields). Runs for any version < 15. See migrateRoutineV15.
   if (seed) routine = migrateRoutineV15(routine, seed);
+  // v4.2 -> v4.3: Phase 5 warm-up engine — replace blocks.warmup with blocks.warmupModules,
+  // carrying user doses/progression by name and preserving any user-added warm-up moves.
+  // Runs for any version < 16. See migrateRoutineV16.
+  if (seed) routine = migrateRoutineV16(routine, seed);
+  // v4.3 -> v4.4: Phase 6 cool-down engine — replace blocks.cooldown with blocks.cooldownModules,
+  // carrying user doses/progression by name and preserving any user-added cool-down moves.
+  // Runs for any version < 17. See migrateRoutineV17.
+  if (seed) routine = migrateRoutineV17(routine, seed);
+  // v4.4 -> v4.5: Phase 7 daily practice engine — install blocks.dailyModules (no legacy block to
+  // carry; the old daily stim was a hardcoded constant). Runs for any version < 18. See migrateRoutineV18.
+  if (seed) routine = migrateRoutineV18(routine, seed);
   // Move-viewer tombstones: a move the user deleted must never be resurrected by a
   // migration or a re-inserted seed move — filter deleted names after all migrations.
   const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
@@ -1158,6 +1305,25 @@ function normalizeState(obj) {
   // v4.0: weeklyClasses — integer 0–2 (default 1). Missing / non-number → 1; clamp + int.
   merged.settings.weeklyClasses = typeof merged.settings.weeklyClasses === 'number'
     ? clamp(merged.settings.weeklyClasses | 0, 0, 2) : 1;
+  // v4.3: warmupMode — one of short|standard|long (default standard). Unknown/garbage → standard.
+  merged.settings.warmupMode = WARMUP_MODES.indexOf(merged.settings.warmupMode) >= 0
+    ? merged.settings.warmupMode : 'standard';
+  // v4.4: cooldownMode — short|standard|long (default standard; reuses WARMUP_MODES). If the STORED
+  // settings lack a valid cooldownMode, derive it from the retired `cool` slider (cool ≤ 1 → short,
+  // else standard; missing → standard). Read obj.settings, not merged — merged already carries
+  // base's default 'standard', which would otherwise pre-empt the legacy mapping. Then drop cool.
+  const storedCoolMode = obj.settings && obj.settings.cooldownMode;
+  if (WARMUP_MODES.indexOf(storedCoolMode) >= 0) {
+    merged.settings.cooldownMode = storedCoolMode;
+  } else {
+    const legacyCool = obj.settings && obj.settings.cool;
+    merged.settings.cooldownMode = (typeof legacyCool === 'number' && legacyCool <= 1) ? 'short' : 'standard';
+  }
+  delete merged.settings.cool;
+  // v4.5: dailyMode — one of short|standard|long (default standard; reuses WARMUP_MODES). No
+  // legacy field to derive from (the daily stim was a hardcoded constant). Unknown/garbage → standard.
+  merged.settings.dailyMode = WARMUP_MODES.indexOf(merged.settings.dailyMode) >= 0
+    ? merged.settings.dailyMode : 'standard';
   // v4.1 (Phase 3): per-session readiness + intent (survive a mid-session reload; cleared on
   // finish). Any unknown/garbage value snaps back to its default. Not in settings/routine.
   merged.sessionIntent = sessionIntent(merged);   // reads merged.sessionIntent; unknown → 'default'
@@ -1213,6 +1379,23 @@ const SECTIONS = ['floor', 'weights', 'machines'];
 // `loads` object may carry. Both are data facts the Phase 2 generator reasons over.
 const FAMILY_PHASES = ['power', 'strength', 'skill-strength', 'trunk', 'accessory'];
 const LOAD_KEYS = ['impact', 'shin', 'knee', 'foot', 'wrist', 'elbow', 'lumbar'];
+// v4.3 (Phase 5): warm-up engine. Modules carry a role and are eligible in a subset of the
+// three delivery contexts; buildWarmup assembles them by context + mode + rotation + readiness.
+const WARMUP_CONTEXTS = ['gym-impact', 'gym-lift', 'daily'];
+const WARMUP_ROLES = ['care', 'raise', 'mobilize', 'activate', 'potentiate'];
+const WARMUP_MODES = ['short', 'standard', 'long'];
+// Output ordering of assembled warm-up moves: raise → care → mobilize → activate → potentiate.
+const WARMUP_ROLE_ORDER = ['raise', 'care', 'mobilize', 'activate', 'potentiate'];
+// v4.4 (Phase 6): cool-down engine. Modules reuse the warm-up module shape/contexts; roles are
+// flex → care → downshift, which is also the assembled output order. (Two consts for symmetry
+// with WARMUP_ROLES / WARMUP_ROLE_ORDER even though they're currently equal.)
+const COOLDOWN_ROLES = ['flex', 'care', 'downshift'];
+const COOLDOWN_ROLE_ORDER = ['flex', 'care', 'downshift'];
+// v4.5 (Phase 7): daily practice engine. Modules reuse the warm-up module shape; roles are
+// stim → skill → armor, which is also the assembled output order. Daily is UNLOGGED — its loads
+// gate on readiness only (like the cool-down); they never feed recency or region-status decay.
+const DAILY_ROLES = ['stim', 'skill', 'armor'];
+const DAILY_ROLE_ORDER = ['stim', 'skill', 'armor'];
 
 function validateRoutine(routine) {
   const errors = [];
@@ -1479,8 +1662,93 @@ function validateRoutine(routine) {
     });
   }
 
-  validateArray(blocks.warmup, 'warmup', validateStatic);
-  validateArray(blocks.cooldown, 'cooldown', validateStatic);
+  // v4.3 (Phase 5): a warm-up module move keeps the static shape (name/dose/goals/why +
+  // optional progression, via validateStatic) and may additionally carry `loads` (real
+  // tissue work — same 0..3 LOAD_KEYS as pool moves; potentiate/ankle moves use it).
+  function validateWarmupMove(ex, path) {
+    validateStatic(ex, path);
+    if (!ex || typeof ex !== 'object') return;
+    const label = ex.name ? '"' + ex.name + '"' : path;
+    if ('loads' in ex) {
+      const ld = ex.loads;
+      if (!ld || typeof ld !== 'object' || Array.isArray(ld)) {
+        errors.push(path + ' (' + label + '): loads must be an object of load-region -> 0..3');
+      } else {
+        Object.keys(ld).forEach((k) => {
+          if (LOAD_KEYS.indexOf(k) === -1) {
+            errors.push(path + ' (' + label + '): loads has unknown region "' + k + '" (allowed: ' + LOAD_KEYS.join(', ') + ')');
+          }
+          const v = ld[k];
+          if (!Number.isInteger(v) || v < 0 || v > 3) {
+            errors.push(path + ' (' + label + '): loads.' + k + ' must be an integer 0–3 (got ' + JSON.stringify(v) + ')');
+          }
+        });
+      }
+    }
+  }
+
+  // v4.3/v4.4: a module list (warm-up or cool-down). Each module: unique string id, name, a role
+  // from `roles`, optional contexts/pinnedIn subsets of the three context ids (pinnedIn ⊆ effective
+  // contexts), optional positive-int pick ≤ moves.length, and a non-empty moves array validated
+  // like static entries (+ optional loads). `listLabel` is the blocks.* key for error paths.
+  function validateModuleList(list, listLabel, roles) {
+    if (!Array.isArray(list) || list.length === 0) {
+      errors.push('blocks.' + listLabel + ' must be a non-empty array'); return;
+    }
+    const seenId = new Set();
+    list.forEach((m, i) => {
+      const path = 'blocks.' + listLabel + '[' + i + ']';
+      if (!m || typeof m !== 'object' || Array.isArray(m)) { errors.push(path + ' must be an object'); return; }
+      const label = m.id ? '"' + m.id + '"' : path;
+      if (typeof m.id !== 'string' || !m.id) errors.push(path + ': module missing string "id"');
+      else {
+        if (seenId.has(m.id)) errors.push('blocks.' + listLabel + ': duplicate module id "' + m.id + '"');
+        seenId.add(m.id);
+      }
+      if (typeof m.name !== 'string' || !m.name) errors.push(path + ' (' + label + '): module missing string "name"');
+      if (roles.indexOf(m.role) === -1) {
+        errors.push(path + ' (' + label + '): role must be one of ' + roles.join(', ') + ' (got ' + JSON.stringify(m.role) + ')');
+      }
+      let effContexts = WARMUP_CONTEXTS;
+      if ('contexts' in m) {
+        if (!Array.isArray(m.contexts) || m.contexts.some((c) => WARMUP_CONTEXTS.indexOf(c) === -1)) {
+          errors.push(path + ' (' + label + '): contexts must be a subset of ' + WARMUP_CONTEXTS.join(', '));
+        } else effContexts = m.contexts;
+      }
+      if ('pinnedIn' in m) {
+        if (!Array.isArray(m.pinnedIn) || m.pinnedIn.some((c) => WARMUP_CONTEXTS.indexOf(c) === -1)) {
+          errors.push(path + ' (' + label + '): pinnedIn must be a subset of ' + WARMUP_CONTEXTS.join(', '));
+        } else if (m.pinnedIn.some((c) => effContexts.indexOf(c) === -1)) {
+          errors.push(path + ' (' + label + '): pinnedIn must be a subset of its contexts');
+        }
+      }
+      if (!Array.isArray(m.moves) || m.moves.length === 0) {
+        errors.push(path + ' (' + label + '): moves must be a non-empty array');
+      } else {
+        if ('pick' in m && !(Number.isInteger(m.pick) && m.pick > 0 && m.pick <= m.moves.length)) {
+          errors.push(path + ' (' + label + '): pick must be a positive integer ≤ moves.length (got ' + JSON.stringify(m.pick) + ')');
+        }
+        const seenMove = new Set();
+        m.moves.forEach((mv, j) => {
+          validateWarmupMove(mv, path + '.moves[' + j + ']');
+          if (mv && mv.name) {
+            if (seenMove.has(mv.name)) errors.push(path + ' (' + label + '): duplicate move name "' + mv.name + '"');
+            seenMove.add(mv.name);
+          }
+        });
+      }
+    });
+  }
+  // blocks.warmupModules (replaces blocks.warmup), blocks.dailyModules (replaces the hardcoded
+  // daily stim) and blocks.cooldownModules (replaces blocks.cooldown). The old flat blocks.warmup
+  // / blocks.cooldown are no longer required or validated.
+  function validateWarmupModules() { validateModuleList(blocks.warmupModules, 'warmupModules', WARMUP_ROLES); }
+  function validateDailyModules() { validateModuleList(blocks.dailyModules, 'dailyModules', DAILY_ROLES); }
+  function validateCooldownModules() { validateModuleList(blocks.cooldownModules, 'cooldownModules', COOLDOWN_ROLES); }
+
+  validateWarmupModules();
+  validateDailyModules();
+  validateCooldownModules();
 
   if (!Array.isArray(blocks.moves)) {
     errors.push('blocks.moves must be an array');
@@ -2029,15 +2297,258 @@ function selectMoves(st) {
   return chosen.map((o) => o.move);
 }
 
-/*
- * Cooldown interpretation: the seed marks two items `alwaysInShort` and the
- * slider range is [1,2] over three items, so a count doesn't map cleanly.
- * Choice: cool === 1 -> "short" (only alwaysInShort items); cool >= 2 -> full list.
+/* --- v4.3 (Phase 5): warm-up engine ---------------------------------------- *
+ * buildWarmup assembles the warm-up from blocks.warmupModules — pure & deterministic,
+ * same contract as the generator (no RNG, no Date; all state via `st`). See REDESIGN §6.
  */
-function buildCooldown(arr, cool, day) {
-  let list = (arr || []).slice();
-  if (cool <= 1) list = list.filter((ex) => ex.alwaysInShort);
-  return list;
+// The active warm-up length. Unknown/garbage → 'standard'. Accepts a settings object.
+function warmupMode(settings) {
+  const m = settings && settings.warmupMode;
+  return WARMUP_MODES.indexOf(m) >= 0 ? m : 'standard';
+}
+// The warm-up modules on a routine (never null). Pure.
+function warmupModules(routine) {
+  return (routine && routine.blocks && Array.isArray(routine.blocks.warmupModules))
+    ? routine.blocks.warmupModules : [];
+}
+// Deterministic rotation index — the count of FINISHED sessions, derived from state exactly
+// as the A/B day alternation counts them (currentDay reads st.session; session starts at 1 and
+// +1 on each finish). A future preview advances st.session, so the rotation advances with it.
+function warmupRotationIndex(st) {
+  return Math.max(0, ((st && st.session) | 0) - 1);
+}
+// Is a module eligible in `context`? (contexts omitted = all three.) Pure.
+function warmupModuleEligible(m, context) {
+  return !Array.isArray(m.contexts) || m.contexts.indexOf(context) >= 0;
+}
+// Is a module PINNED (always included) in `context`? Pure.
+function warmupModulePinned(m, context) {
+  return Array.isArray(m.pinnedIn) && m.pinnedIn.indexOf(context) >= 0;
+}
+// Pick `n` items from `pool` (in its own order) starting at (R mod len), wrapping, no repeats.
+// n ≥ pool.length returns the whole pool in order. Deterministic. Pure.
+function warmupRotatePick(pool, R, n) {
+  const len = pool.length;
+  if (!len || n <= 0) return [];
+  if (n >= len) return pool.slice();
+  const start = ((R % len) + len) % len;
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(pool[(start + i) % len]);
+  return out;
+}
+/*
+ * Assemble the warm-up for `context` ('gym-impact'|'gym-lift'|'daily'). Pure given `st`.
+ * Steps: choose which eligible modules are IN (by mode + pinned + rotation), pick which moves
+ * each `pick: n` module shows (same rotation), drop moves whose loads exceed today's readiness
+ * caps (potentiate dropped whole when back is 'sensitive'), drop any module emptied by gating.
+ * Output is a flat exercise list, each entry stamped `group` = module name and ordered
+ * raise → care → mobilize → activate → potentiate (seed order within a role), so warmupGroups /
+ * renderWarmupGroupCard, 'warmup:'+group checks, and per-group logging keep working unchanged.
+ */
+function buildWarmup(st, context) {
+  const r = st.routine;
+  const all = warmupModules(r);
+  const mode = warmupMode(st.settings);
+  const caps = readinessCaps(st);
+  const R = warmupRotationIndex(st);
+  const isGym = context === 'gym-impact' || context === 'gym-lift';
+  const backSensitive = !!(st.readiness && st.readiness.back === 'sensitive');
+  const moduleIndex = {};
+  all.forEach((m, i) => { if (m && m.id) moduleIndex[m.id] = i; });
+  const eligible = all.filter((m) => m && warmupModuleEligible(m, context));
+
+  const chosen = [];
+  const seenId = {};
+  const add = (m) => { if (m && m.id && !seenId[m.id]) { seenId[m.id] = true; chosen.push(m); } };
+
+  // Pinned modules are always in (in every mode).
+  eligible.forEach((m) => { if (warmupModulePinned(m, context)) add(m); });
+
+  if (mode === 'long') {
+    eligible.forEach(add);                                   // every eligible module (potentiate still gated below)
+  } else if (isGym) {
+    eligible.filter((m) => m.role === 'raise').forEach(add); // short & standard: pinned care + raise (+ core-activate, pinned)
+    if (mode === 'standard') {
+      // 2 rotating mobilize slots. The pool is the non-pinned mobilize modules PLUS the posture
+      // module (pinned only on daily, so it joins the mobilize rotation on gym days), in seed order.
+      const pool = eligible.filter((m) => !warmupModulePinned(m, context) &&
+        (m.role === 'mobilize' || m.id === 'posture'));
+      warmupRotatePick(pool, R, 2).forEach(add);
+      // glutes + potentiate where eligible (non-pinned activate/potentiate — impact days only).
+      eligible.filter((m) => !warmupModulePinned(m, context) &&
+        (m.role === 'activate' || m.role === 'potentiate')).forEach(add);
+    }
+  } else if (mode === 'standard') {
+    // Daily standard: pinned-in-daily + 1 rotating mobilize slot. (short daily = pinned only.)
+    const pool = eligible.filter((m) => !warmupModulePinned(m, context) && m.role === 'mobilize');
+    warmupRotatePick(pool, R, 1).forEach(add);
+  }
+
+  // Resolve each chosen module's moves (pick rotation → readiness gating → drop-if-empty),
+  // then emit flat, ordered by role then module seed order, moves in module order.
+  const prepared = [];
+  chosen.forEach((m) => {
+    if (m.role === 'potentiate' && backSensitive) return;   // back sensitive drops potentiate entirely
+    let moves = (m.moves || []).slice();
+    if (typeof m.pick === 'number' && m.pick > 0 && m.pick < moves.length) {
+      moves = warmupRotatePick(moves, R, m.pick);
+    }
+    moves = moves.filter((mv) => passesReadiness(mv, caps));  // drop moves whose loads exceed caps
+    if (!moves.length) return;                                // module emptied by gating falls out
+    prepared.push({ role: m.role, name: m.name, mi: (m.id in moduleIndex) ? moduleIndex[m.id] : 999, moves });
+  });
+
+  const out = [];
+  WARMUP_ROLE_ORDER.forEach((role) => {
+    prepared.filter((p) => p.role === role).sort((a, b) => a.mi - b.mi).forEach((p) => {
+      p.moves.forEach((mv) => out.push(Object.assign({}, mv, { group: p.name })));
+    });
+  });
+  return out;
+}
+
+// Delivery context for the assembled warm-up given the session's selected moves: 'gym-impact'
+// if any selected move lands impact ≥ 1, else 'gym-lift'. Pure. (Daily uses 'daily' directly.)
+function warmupContext(selected) {
+  return (selected || []).some((m) => moveLoad(m, 'impact') >= 1) ? 'gym-impact' : 'gym-lift';
+}
+
+/* --- v4.4 (Phase 6): cool-down engine -------------------------------------- *
+ * buildCooldown mirrors buildWarmup, reusing the same generic module helpers
+ * (warmupModuleEligible / warmupModulePinned / warmupRotatePick / warmupRotationIndex /
+ * readinessCaps / passesReadiness). Pure & deterministic. See REDESIGN §7.
+ */
+// The active cool-down length. Unknown/garbage → 'standard'. Reuses WARMUP_MODES. Pure.
+function cooldownMode(settings) {
+  const m = settings && settings.cooldownMode;
+  return WARMUP_MODES.indexOf(m) >= 0 ? m : 'standard';
+}
+// The cool-down modules on a routine (never null). Pure.
+function cooldownModules(routine) {
+  return (routine && routine.blocks && Array.isArray(routine.blocks.cooldownModules))
+    ? routine.blocks.cooldownModules : [];
+}
+/*
+ * Assemble the cool-down for `context` ('gym-impact'|'gym-lift'|'daily'). Pure given `st`.
+ * Modes: short = pinned only; standard = pinned + ONE rotating non-pinned flex/care module + all
+ * eligible downshift modules; long = every eligible module. Per chosen module: apply pick-n
+ * rotation, then drop moves whose loads exceed readiness caps (module emptied by gating falls
+ * out). No back-sensitive special case (unlike the warm-up's potentiate). Output is a flat list
+ * ordered flex → care → downshift (seed order within a role), each move stamped `group` = module
+ * name so rendering stays per-move cards keyed by move name.
+ */
+function buildCooldown(st, context) {
+  const r = st.routine;
+  const all = cooldownModules(r);
+  const mode = cooldownMode(st.settings);
+  const caps = readinessCaps(st);
+  const R = warmupRotationIndex(st);
+  const isGym = context === 'gym-impact' || context === 'gym-lift';
+  const moduleIndex = {};
+  all.forEach((m, i) => { if (m && m.id) moduleIndex[m.id] = i; });
+  const eligible = all.filter((m) => m && warmupModuleEligible(m, context));
+
+  const chosen = [];
+  const seenId = {};
+  const add = (m) => { if (m && m.id && !seenId[m.id]) { seenId[m.id] = true; chosen.push(m); } };
+
+  // Pinned modules are always in (every mode) — includes the splits routine in every context.
+  eligible.forEach((m) => { if (warmupModulePinned(m, context)) add(m); });
+
+  if (mode === 'long') {
+    eligible.forEach(add);                                        // every eligible module (still gated below)
+  } else if (mode === 'standard') {
+    // One rotating slot from the non-pinned eligible flex/care pool (seed order), then every
+    // eligible downshift module (gym days). short = pinned only (nothing added here).
+    const pool = eligible.filter((m) => !warmupModulePinned(m, context) &&
+      (m.role === 'flex' || m.role === 'care'));
+    warmupRotatePick(pool, R, 1).forEach(add);
+    if (isGym) eligible.filter((m) => m.role === 'downshift').forEach(add);
+  }
+
+  // Resolve each chosen module's moves (pick rotation → readiness gating → drop-if-empty),
+  // then emit flat, ordered by role then module seed order, moves in module order.
+  const prepared = [];
+  chosen.forEach((m) => {
+    let moves = (m.moves || []).slice();
+    if (typeof m.pick === 'number' && m.pick > 0 && m.pick < moves.length) {
+      moves = warmupRotatePick(moves, R, m.pick);
+    }
+    moves = moves.filter((mv) => passesReadiness(mv, caps));      // drop moves whose loads exceed caps
+    if (!moves.length) return;                                    // module emptied by gating falls out
+    prepared.push({ role: m.role, name: m.name, mi: (m.id in moduleIndex) ? moduleIndex[m.id] : 999, moves });
+  });
+
+  const out = [];
+  COOLDOWN_ROLE_ORDER.forEach((role) => {
+    prepared.filter((p) => p.role === role).sort((a, b) => a.mi - b.mi).forEach((p) => {
+      p.moves.forEach((mv) => out.push(Object.assign({}, mv, { group: p.name })));
+    });
+  });
+  return out;
+}
+
+/* --- v4.5 (Phase 7): daily practice engine --------------------------------- *
+ * buildDaily is a simpler cousin of buildCooldown — always the 'daily' context, no rotating slot
+ * (just 3 modules). Pure & deterministic, reusing the same generic module helpers. The Daily tab
+ * is UNLOGGED: loads on daily moves gate on readiness ONLY (like the cool-down) and never feed
+ * recency or region-status decay. See REDESIGN §8.
+ */
+// The active daily-practice length. Unknown/garbage → 'standard'. Reuses WARMUP_MODES. Pure.
+function dailyMode(settings) {
+  const m = settings && settings.dailyMode;
+  return WARMUP_MODES.indexOf(m) >= 0 ? m : 'standard';
+}
+// The daily modules on a routine (never null). Pure.
+function dailyModules(routine) {
+  return (routine && routine.blocks && Array.isArray(routine.blocks.dailyModules))
+    ? routine.blocks.dailyModules : [];
+}
+/*
+ * Assemble the Daily-tab practice block (always context 'daily'). Pure given `st`.
+ * Modes: short = pinned only (the jump stim + shin armor); standard AND long = all eligible
+ * modules (they are identical for the daily block — only 3 modules, no rotating slot — but both
+ * modes are kept so the shared header toggle cycles uniformly with the warm-up / cool-down). Each
+ * chosen module: pick-n rotation (for generality; the seed has no picks), then readiness gating,
+ * dropping any module emptied by gating. Output is flat, ordered stim → skill → armor (seed order
+ * within a role), each move stamped `group` = module name.
+ */
+function buildDaily(st) {
+  const context = 'daily';
+  const all = dailyModules(st.routine);
+  const mode = dailyMode(st.settings);
+  const caps = readinessCaps(st);
+  const R = warmupRotationIndex(st);
+  const moduleIndex = {};
+  all.forEach((m, i) => { if (m && m.id) moduleIndex[m.id] = i; });
+  const eligible = all.filter((m) => m && warmupModuleEligible(m, context));
+
+  const chosen = [];
+  const seenId = {};
+  const add = (m) => { if (m && m.id && !seenId[m.id]) { seenId[m.id] = true; chosen.push(m); } };
+
+  // Pinned modules are always in (every mode). standard/long add every remaining eligible module.
+  eligible.forEach((m) => { if (warmupModulePinned(m, context)) add(m); });
+  if (mode !== 'short') eligible.forEach(add);
+
+  const prepared = [];
+  chosen.forEach((m) => {
+    let moves = (m.moves || []).slice();
+    if (typeof m.pick === 'number' && m.pick > 0 && m.pick < moves.length) {
+      moves = warmupRotatePick(moves, R, m.pick);
+    }
+    moves = moves.filter((mv) => passesReadiness(mv, caps));      // drop moves whose loads exceed caps
+    if (!moves.length) return;                                    // module emptied by gating falls out
+    prepared.push({ role: m.role, name: m.name, mi: (m.id in moduleIndex) ? moduleIndex[m.id] : 999, moves });
+  });
+
+  const out = [];
+  DAILY_ROLE_ORDER.forEach((role) => {
+    prepared.filter((p) => p.role === role).sort((a, b) => a.mi - b.mi).forEach((p) => {
+      p.moves.forEach((mv) => out.push(Object.assign({}, mv, { group: p.name })));
+    });
+  });
+  return out;
 }
 
 // Section -> block title. Order here is the on-page order of the move blocks.
@@ -2051,18 +2562,19 @@ const MOVE_SECTIONS = [
 // Order: Warm-up, Floor, Weights, Machines, Cool-down (empty blocks skipped).
 function buildSession(st) {
   const r = st.routine;
-  const s = st.settings;
   const session = st.session;
   const day = currentDay(session);
-  const b = r.blocks || {};
   const blocks = [];
 
-  if (b.warmup && b.warmup.length) {
-    blocks.push({ key: 'warmup', title: 'Warm-up',
-      exercises: (b.warmup || []).slice() });
-  }
-
+  // v4.3: the warm-up context depends on the selected middle sections (impact vs lift), so
+  // selectMoves runs FIRST; the warm-up block is still pushed first so it renders at the top.
   const selected = selectMoves(st);
+  // v4.4: warm-up and cool-down share the SAME delivery context (they must agree on the kind
+  // of day), so compute it once from the selected middle sections.
+  const context = warmupContext(selected);
+  const warmup = buildWarmup(st, context);
+  if (warmup.length) blocks.push({ key: 'warmup', title: 'Warm-up', exercises: warmup });
+
   MOVE_SECTIONS.forEach((sec) => {
     // v4.0 (Phase 2): within each section, stable-sort by family phase rank so power /
     // quality-sensitive work lands while fresh and low-fatigue accessories close.
@@ -2070,7 +2582,7 @@ function buildSession(st) {
     if (exercises.length) blocks.push({ key: sec.key, title: sec.title, exercises: exercises });
   });
 
-  const cooldown = buildCooldown(b.cooldown, s.cool, day);
+  const cooldown = buildCooldown(st, context);
   if (cooldown.length) blocks.push({ key: 'cooldown', title: 'Cool-down', exercises: cooldown });
 
   return { session, day, blocks: applySwaps(blocks, st) };
@@ -2090,7 +2602,15 @@ function buildSession(st) {
 function simulatedLogEntry(sim, build) {
   const exercises = [];
   build.blocks.forEach((bl) => {
-    if (bl.key === 'warmup' || bl.key === 'cooldown') return;   // recency only tracks moves
+    if (bl.key === 'cooldown') return;                          // cool-down never tracks recency
+    if (bl.key === 'warmup') {
+      // v4.3: warm-up moves that carry `loads` are real tissue work — they count toward region
+      // recency/status like pool moves; loadless prep (chin tucks) still doesn't.
+      bl.exercises.forEach((ex) => {
+        if (LOAD_KEYS.some((k) => moveLoad(ex, k) >= 1)) exercises.push({ name: ex.name, done: true });
+      });
+      return;
+    }
     bl.exercises.forEach((ex) => exercises.push({ name: ex.name, done: true }));
   });
   return { session: sim.session, day: build.day, exercises: exercises };
@@ -2129,8 +2649,14 @@ function findExerciseByName(routine, name) {
 function collectPools(routine) {
   const b = (routine && routine.blocks) || {};
   const pools = [];
-  ['warmup', 'moves', 'weightsA', 'weightsB', 'machinesA', 'machinesB', 'cooldown']
+  ['warmup', 'moves', 'weightsA', 'weightsB', 'machinesA', 'machinesB']
     .forEach((k) => { if (Array.isArray(b[k])) pools.push(b[k]); });
+  // v4.3/v4.4/v4.5: warm-up, cool-down and daily-practice moves live inside their modules'
+  // .moves — surface each module's list so name lookups (ladders, intensity clamping, the splits
+  // routine, tibialis raises) and migrations resolve them too.
+  [b.warmupModules, b.cooldownModules, b.dailyModules].forEach((list) => {
+    if (Array.isArray(list)) list.forEach((m) => { if (m && Array.isArray(m.moves)) pools.push(m.moves); });
+  });
   ['skill', 'core'].forEach((k) => {
     if (b[k]) {
       if (Array.isArray(b[k].staples)) pools.push(b[k].staples);
@@ -2451,7 +2977,6 @@ function renderAdjustPanel() {
   if (open) {
     h += '<div class="adjust-body">' +
       renderSettingSlider('moves', 'Number of moves') +
-      renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
       renderWeeklyClassesField() +
       renderTagPriorityFields() +
       renderSupersetBiasField() +
@@ -2605,7 +3130,7 @@ function renderReadinessPanel() {
  * header's done/total count reads the exact same state.checks data the cards do.
  * The count is skipped in preview, where state.checks reflects today, not the peek.
  */
-function renderBlock(key, title, inner, units) {
+function renderBlock(key, title, inner, units, headerExtra) {
   const collapsed = !!(state.collapsed && state.collapsed[key]);
   let countHtml = '';
   if (!inPreview() && units && units.length) {
@@ -2615,8 +3140,38 @@ function renderBlock(key, title, inner, units) {
   return '<section class="block' + (collapsed ? ' is-collapsed' : '') + '">' +
     '<h2 class="block-title" data-action="toggle-block" data-block="' + escapeHtml(key) + '">' +
     '<span class="block-chevron" aria-hidden="true"></span>' +
-    '<span class="block-name">' + escapeHtml(title) + '</span>' + countHtml + '</h2>' +
+    '<span class="block-name">' + escapeHtml(title) + '</span>' + countHtml + (headerExtra || '') + '</h2>' +
     '<div class="block-cards">' + inner + '</div></section>';
+}
+
+// v4.3: small warm-up-length toggle on the warm-up block header (Gym tab only). Cycles
+// Short → Standard → Long, persisting settings.warmupMode. Its own data-action means a tap
+// cycles the mode without also firing the header's collapse toggle (closest-match wins).
+function renderWarmupModeToggle() {
+  const mode = warmupMode(state.settings);
+  const label = { short: 'Short', standard: 'Standard', long: 'Long' }[mode];
+  return ' <button class="btn small ghost wu-mode" data-action="warmup-mode" ' +
+    'aria-label="Warm-up length: ' + label + ' (tap to change)">' + escapeHtml(label) + '</button>';
+}
+
+// v4.4: the cool-down length toggle on the cool-down block header (Gym tab only). Cycles
+// Short → Standard → Long, persisting settings.cooldownMode. Reuses the warm-up toggle's .wu-mode
+// style; its own data-action means a tap cycles the mode without firing the header's collapse.
+function renderCooldownModeToggle() {
+  const mode = cooldownMode(state.settings);
+  const label = { short: 'Short', standard: 'Standard', long: 'Long' }[mode];
+  return ' <button class="btn small ghost wu-mode" data-action="cooldown-mode" ' +
+    'aria-label="Cool-down length: ' + label + ' (tap to change)">' + escapeHtml(label) + '</button>';
+}
+
+// v4.5: the daily-practice length toggle on the Daily-tab practice block header. Cycles Short →
+// Standard → Long, persisting settings.dailyMode. Reuses the .wu-mode style; its own data-action
+// means a tap cycles the mode without firing the header's collapse.
+function renderDailyModeToggle() {
+  const mode = dailyMode(state.settings);
+  const label = { short: 'Short', standard: 'Standard', long: 'Long' }[mode];
+  return ' <button class="btn small ghost wu-mode" data-action="daily-mode" ' +
+    'aria-label="Daily practice length: ' + label + ' (tap to change)">' + escapeHtml(label) + '</button>';
 }
 
 function renderToday(build) {
@@ -2696,7 +3251,14 @@ function renderToday(build) {
       });
     }
     if (!inner) return;   // every move here was absorbed into a superset anchored elsewhere
-    html += renderBlock(bl.key, bl.title, inner, renderedExercises.slice(startIdx));
+    // v4.3/v4.4: the warm-up and cool-down headers carry a length toggle (Gym tab, live only —
+    // not in preview).
+    let headerExtra = '';
+    if (!preview) {
+      if (bl.key === 'warmup') headerExtra = renderWarmupModeToggle();
+      else if (bl.key === 'cooldown') headerExtra = renderCooldownModeToggle();
+    }
+    html += renderBlock(bl.key, bl.title, inner, renderedExercises.slice(startIdx), headerExtra);
   });
   if (!preview) html += renderFinish();   // no finishing a future preview
   return html;
@@ -2729,9 +3291,12 @@ function warmupGroups(exercises) {
   return items;
 }
 
-// One card for a whole warm-up group: union chips, group name as the title, a
-// compact "Name — dose[, tempoNote]" line per move, and a single group checkbox.
-// No steppers/set-circles (warm-up has no progression UI); no expand affordance.
+// One card for a whole warm-up module: union chips, module name as the title, a compact
+// "Name — dose[, tempoNote]" line per move, and a single group checkbox. v4.3: the dose on each
+// line reflects the persisted ladder (effectiveDose), a raised move shows a "modified" marker,
+// and a module carrying real ladders (calf raise, pogos) becomes tap-to-expand, revealing the
+// standard progression controls per laddered move — the same mechanism the cool-down uses
+// (dose reflects state.intensity), reusing renderProgression via a member index like supersets.
 function renderWarmupGroupCard(card, idx) {
   const preview = inPreview();
   const goals = card.goals.length ? card.goals : ['recovery'];
@@ -2742,16 +3307,31 @@ function renderWarmupGroupCard(card, idx) {
       escapeHtml(goalName(id)) + '</span>').join('');
   const list = card.moves.map((m) => {
     const tempo = (m.dose && m.dose.tempoNote) ? ', ' + escapeHtml(m.dose.tempoNote) : '';
+    const meff = effectiveDose(m);
+    const over = !preview && currentLevel(m) > 0;
     return '<li class="wu-move">' + escapeHtml(m.name) + ' — ' +
-      escapeHtml(formatDose(effectiveDose(m))) + tempo + '</li>';
+      escapeHtml(formatDose(meff)) + tempo + easedTag(meff) +
+      (over ? ' <span class="mod">modified</span>' : '') + '</li>';
   }).join('');
+  // Moves with a real ladder (more than the base step) get progression controls behind expand.
+  const ladderMoves = preview ? [] : card.moves
+    .map((m, i) => ({ m: m, i: i }))
+    .filter((o) => progressionLadder(o.m).length > 1);
+  const expandable = ladderMoves.length > 0;
+  const expanded = expandable && ui.expanded.has(card.name);
+  const mainAttrs = (preview || !expandable) ? '' : ' data-action="expand" data-idx="' + idx + '"';
   const check = preview ? '' :
     '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
       (done ? ' checked' : '') + ' aria-label="Mark ' + escapeHtml(card.groupName) + ' done">';
+  const prog = expanded ? '<div class="ss-prog">' + ladderMoves.map((o) =>
+    '<div class="ss-prog-move">' +
+      '<div class="ss-prog-name">' + escapeHtml(o.m.name) + '</div>' +
+      renderProgression(o.m, idx, o.i) +
+    '</div>').join('') + '</div>' : '';
 
   return '' +
-    '<div class="card cat-' + escapeHtml(mainColor) + (done ? ' is-done' : '') + '">' +
-      '<div class="card-main">' +
+    '<div class="card cat-' + escapeHtml(mainColor) + (done ? ' is-done' : '') + (expanded ? ' is-open' : '') + '">' +
+      '<div class="card-main"' + mainAttrs + '>' +
         '<div class="card-body">' +
           '<div class="chips">' + chips + '</div>' +
           '<div class="card-name">' + escapeHtml(card.groupName) + '</div>' +
@@ -2759,6 +3339,7 @@ function renderWarmupGroupCard(card, idx) {
         '</div>' +
         check +
       '</div>' +
+      prog +
     '</div>';
 }
 
@@ -2980,7 +3561,9 @@ function renderCard(ex, idx, blockKey) {
   const done = !preview && !!state.checks[ex.name];
   const overridden = currentLevel(ex) > 0;
   const expanded = !preview && ui.expanded.has(ex.name);
-  const showProg = expanded && blockKey !== 'warmup' && blockKey !== 'cooldown' && blockKey !== 'daily';
+  // v4.4/v4.5: cool-down and daily-practice cards expose the ladder behind expand (splits 5→8 min;
+  // tibialis raises, handstand hold). Warm-up moves still surface their ladder via the group card.
+  const showProg = expanded && blockKey !== 'warmup';
 
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
@@ -3040,7 +3623,8 @@ function renderRestClock(ex, blockKey, eff) {
     escapeHtml(restClockText(elapsed, target, done)) + '</div>';
 }
 
-// Progression ladder controls (Feature D) — behind expand, hidden for warmup/cooldown.
+// Progression ladder controls (Feature D) — behind expand. Hidden for warm-up cards (their
+// ladder surfaces on the group card); v4.4 surfaces it on cool-down cards (splits 5→8 min).
 function renderProgression(ex, idx, memberIdx) {
   const ladder = progressionLadder(ex);
   const level = clamp(currentLevel(ex), 0, ladder.length - 1);
@@ -3109,11 +3693,13 @@ function renderFinish() {
  */
 function renderDaily() {
   renderedExercises = [];
-  const b = (state.routine && state.routine.blocks) || {};
   let html = '';
 
-  // Warm-up — same grouped-card rendering / check-off as the Gym view.
-  const warmup = (b.warmup || []);
+  // Warm-up — same grouped-card rendering / check-off as the Gym view. v4.3: the Daily tab uses
+  // the 'daily' context (pinned care + posture + core; standard/long add a rotating slot). v4.5:
+  // the length toggle is now surfaced here too (the Daily tab is never a preview, so it always
+  // shows) — previously the daily warm-up silently inherited settings.warmupMode with no UI.
+  const warmup = buildWarmup(state, 'daily');
   if (warmup.length) {
     const startIdx = renderedExercises.length;
     let inner = '';
@@ -3127,19 +3713,28 @@ function renderDaily() {
         inner += renderCard(item.ex, idx, 'warmup');
       }
     });
-    html += renderBlock('warmup', 'Warm-up', inner, renderedExercises.slice(startIdx));
+    html += renderBlock('warmup', 'Warm-up', inner, renderedExercises.slice(startIdx), renderWarmupModeToggle());
   }
 
-  // Tuck jumps — the daily jumping stim, placed right after the warm-up.
-  {
-    const idx = renderedExercises.length;
-    renderedExercises.push(DAILY_TUCK_JUMPS);
-    html += renderBlock('daily', 'Jumps', renderCard(DAILY_TUCK_JUMPS, idx, 'daily'),
-      renderedExercises.slice(idx));
+  // v4.5: the daily practice block — assembled by buildDaily (pinned jump stim + shin armor;
+  // standard/long add the handstand touch). Flat per-move cards keyed by move name (so "Tuck
+  // jumps" stays checked across sessions). Its own length toggle on the header.
+  const daily = buildDaily(state);
+  if (daily.length) {
+    const startIdx = renderedExercises.length;
+    let inner = '';
+    daily.forEach((ex) => {
+      const idx = renderedExercises.length;
+      renderedExercises.push(ex);
+      inner += renderCard(ex, idx, 'daily');
+    });
+    html += renderBlock('daily', 'Practice', inner, renderedExercises.slice(startIdx), renderDailyModeToggle());
   }
 
-  // Cool-down — full list, same rendering / check-off as the Gym view.
-  const cooldown = (b.cooldown || []);
+  // Cool-down — v4.4: assembled by buildCooldown in the 'daily' context (pinned splits + calf/
+  // plantar + pec/thoracic; standard/long add a rotating flex/care slot). v4.5: length toggle
+  // surfaced here too.
+  const cooldown = buildCooldown(state, 'daily');
   if (cooldown.length) {
     const startIdx = renderedExercises.length;
     let inner = '';
@@ -3148,7 +3743,7 @@ function renderDaily() {
       renderedExercises.push(ex);
       inner += renderCard(ex, idx, 'cooldown');
     });
-    html += renderBlock('cooldown', 'Cool-down', inner, renderedExercises.slice(startIdx));
+    html += renderBlock('cooldown', 'Cool-down', inner, renderedExercises.slice(startIdx), renderCooldownModeToggle());
   }
 
   return html;
@@ -3389,13 +3984,13 @@ function addTag() {
 }
 
 /* --- Shared session-tuning controls (rendered in Settings AND the Gym tab) --
- * v3.4: one source of truth for the moves/cool sliders, the training-goal weight
+ * v3.4: one source of truth for the moves slider, the training-goal weight
  * sliders, and the joint-friendly + auto-superset toggles. Settings composes them
  * into its panels; the Gym tab's collapsible "Adjust session" panel reuses the same
  * markup so both stay in sync. All read live state and carry the same data-action
  * hooks, so onChange's existing handlers re-generate the session either place. */
 
-// One session slider (moves / cool). Range comes from routine.structure.sliders.
+// One session slider (moves). Range comes from routine.structure.sliders.
 function renderSettingSlider(key, label) {
   const ranges = (state.routine.structure && state.routine.structure.sliders) || DEFAULT_RANGES;
   const [lo, hi] = ranges[key] || DEFAULT_RANGES[key];
@@ -3505,7 +4100,6 @@ function renderSettings() {
   // joint-friendly toggle beside auto superset).
   html += '<section class="panel"><h3>Session</h3>' +
     renderSettingSlider('moves', 'Number of moves') +
-    renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
     renderWeeklyClassesField() +
     renderTagPriorityFields() +
     renderAutoSupersetField() +
@@ -3915,7 +4509,9 @@ function coachSystemPrompt() {
     '',
     'SCOPE OF TOOLS:',
     '- Tools edit ONLY blocks.moves (the generator pool), routine.tags, routine.goals, tag priorities and',
-    '  goal weights. You CANNOT and MUST NOT touch the warm-up or cool-down — they are athlete-managed.',
+    '  goal weights. You CANNOT and MUST NOT touch the warm-up, the daily practice block, or the cool-down —',
+    '  all three are now assembled by the session planner from modules (warm-up / daily / cool-down modules)',
+    '  and are completely off-limits to you (the athlete explicitly declined Coach access to them).',
     '- A valid move needs: name, section (one of ' + SECTIONS.join(', ') + '), why, dose',
     '  { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ' }, and goalScores',
     '  (map of training-goal id -> integer 0-10; omit goals scoring 0). Optional: care[] (care-goal ids),',
@@ -3948,7 +4544,7 @@ function coachSystemPrompt() {
     'ATHLETE PROFILE:',
     (state.settings.coachProfile || '(none provided)'),
     '',
-    'CURRENT ROUTINE (JSON — warm-up/cool-down included for context only, not editable):',
+    'CURRENT ROUTINE (JSON — warm-up / daily / cool-down modules included for context only, not editable):',
     JSON.stringify(state.routine)
   ].join('\n');
 }
@@ -4199,7 +4795,11 @@ function onClick(e) {
   // Superset member actions carry data-member; resolve the member off the card
   // (members aren't in renderedExercises — only the synthetic card is).
   const memberIdx = el.dataset.member != null ? +el.dataset.member : null;
-  const progEx = (memberIdx != null && ex && ex.members) ? ex.members[memberIdx].ex : ex;
+  // Superset cards carry members ({ex,block}); v4.3 warm-up group cards carry a flat `moves`
+  // array. Either way, a member index resolves the individual move off the synthetic card.
+  const progEx = (memberIdx != null && ex)
+    ? (ex.members ? ex.members[memberIdx].ex : (ex.moves ? ex.moves[memberIdx] : ex))
+    : ex;
 
   switch (action) {
     case 'check': return;                       // handled by onChange
@@ -4216,6 +4816,9 @@ function onClick(e) {
     case 'prev-day': setPreviewOffset(previewOffset - 1); break;
     case 'next-day': setPreviewOffset(previewOffset + 1); break;
     case 'back-to-today': setPreviewOffset(0); break;
+    case 'warmup-mode': cycleWarmupMode(); break;   // v4.3 warm-up length toggle
+    case 'cooldown-mode': cycleCooldownMode(); break;   // v4.4 cool-down length toggle
+    case 'daily-mode': cycleDailyMode(); break;   // v4.5 daily-practice length toggle
     case 'toggle-adjust': ui.adjustOpen = !ui.adjustOpen; render(); break;   // v3.4 Gym panel
     case 'toggle-readiness': ui.readinessOpen = !ui.readinessOpen; render(); break;   // v4.1 check-in panel
     case 'readiness-set': setReadiness(el.dataset.region, el.dataset.level); break;    // v4.1 one region
@@ -4482,6 +5085,27 @@ function resetReadiness() {
   saveState();
   render();
 }
+// v4.3: cycle the warm-up length Short → Standard → Long and re-generate live.
+function cycleWarmupMode() {
+  const cur = warmupMode(state.settings);
+  state.settings.warmupMode = WARMUP_MODES[(WARMUP_MODES.indexOf(cur) + 1) % WARMUP_MODES.length];
+  saveState();
+  render();
+}
+// v4.4: cycle the cool-down length Short → Standard → Long and re-generate live.
+function cycleCooldownMode() {
+  const cur = cooldownMode(state.settings);
+  state.settings.cooldownMode = WARMUP_MODES[(WARMUP_MODES.indexOf(cur) + 1) % WARMUP_MODES.length];
+  saveState();
+  render();
+}
+// v4.5: cycle the daily-practice length Short → Standard → Long and re-generate live.
+function cycleDailyMode() {
+  const cur = dailyMode(state.settings);
+  state.settings.dailyMode = WARMUP_MODES[(WARMUP_MODES.indexOf(cur) + 1) % WARMUP_MODES.length];
+  saveState();
+  render();
+}
 
 /* --- v4.2 (Phase 4): 24-hour feedback loop mutations ----------------------- */
 // Green answers immediately; yellow/red open a transient region step (re-renders the card).
@@ -4595,14 +5219,28 @@ function finishSession(note) {
     const snap = {};
     activeRegions.forEach((region) => { snap[region] = rs[region].light; });
     entry.regionStatus = snap;
-    const loaded = {};   // region → did some done, non-warmup move load it this session?
+    const loaded = {};   // region → did some done move load it this session?
+    const markLoaded = (ex) => activeRegions.forEach((region) => {
+      if ((REGION_KEYS[region] || []).some((k) => moveLoad(ex, k) >= 1)) loaded[region] = true;
+    });
     built.blocks.forEach((bl) => {
-      if (bl.key === 'warmup') return;
+      // v4.4: cool-down loads exist ONLY for readiness gating (Child's pose knee:1) — they must
+      // not count toward region-status decay or recency. Skip the whole cool-down block.
+      if (bl.key === 'cooldown') return;
+      if (bl.key === 'warmup') {
+        // v4.3: warm-up moves that carry `loads` count toward region status — a session with
+        // done pogos loaded the shins. A warm-up move is "done" when its group card is checked;
+        // loadless prep contributes nothing regardless (no load keys to match).
+        warmupGroups(bl.exercises).forEach((item) => {
+          const checkName = item.kind === 'group' ? item.card.name : item.ex.name;
+          if (!state.checks[checkName]) return;
+          (item.kind === 'group' ? item.moves : [item.ex]).forEach(markLoaded);
+        });
+        return;
+      }
       bl.exercises.forEach((ex) => {
         if (!state.checks[ex.name]) return;
-        activeRegions.forEach((region) => {
-          if ((REGION_KEYS[region] || []).some((k) => moveLoad(ex, k) >= 1)) loaded[region] = true;
-        });
+        markLoaded(ex);
       });
     });
     activeRegions.forEach((region) => {
@@ -4734,11 +5372,11 @@ function saveRoutineFromEditor() {
  */
 
 const DISMISS_COOLDOWN = 3;                    // sessions to suppress an identical dismissed key
-// v3.0: two knobs remain — the unified moves count and the cool-down length.
-const ALL_KNOBS = ['moves', 'cool'];
-// Only "moves" is an effort knob the nudge raises; cool-down is structural.
+// v4.4: the cool-down length is now a mode toggle (settings.cooldownMode), not a volume-nudge
+// knob — only the unified moves count remains.
+const ALL_KNOBS = ['moves'];
 const RAISE_KNOBS = ['moves'];
-const KNOB_LABEL = { moves: 'number of moves', cool: 'cool-down' };
+const KNOB_LABEL = { moves: 'number of moves' };
 
 function sliderRanges(routine) {
   return (routine && routine.structure && routine.structure.sliders) || DEFAULT_RANGES;
@@ -4752,13 +5390,13 @@ function sessionCompletion(entry) {
 }
 
 // name -> knob map, derived from the routine so old logs still resolve. v3.0:
-// every selectable move maps to the single "moves" knob; cool-down to "cool".
+// every selectable move maps to the single "moves" knob. v4.4: cool-down moves no longer map to
+// a knob (the cool-down is engine-assembled, length set by cooldownMode); warm-up never did.
 function buildKnobMap(routine) {
   const b = (routine && routine.blocks) || {};
   const map = {};
   const add = (arr, knob) => (arr || []).forEach((ex) => { if (ex && ex.name) map[ex.name] = knob; });
   add(b.moves, 'moves');
-  add(b.cooldown, 'cool');   // warmup intentionally omitted (static, no knob)
   // Tolerate pre-v3.0 logs whose names still live under the old block shape.
   if (b.skill) { add(b.skill.staples, 'moves'); add(b.skill.varietyPool, 'moves'); }
   if (b.core) { add(b.core.staples, 'moves'); add(b.core.varietyPool, 'moves'); }
@@ -5092,9 +5730,15 @@ if (typeof module !== 'undefined' && module.exports) {
     // v3.7 — generic tag system (pure)
     tagIndex, tagMultiplier, tagEffectivePriority, tagScoreFactor, defaultTagPriority,
     slugify, uniqueTagId,
-    cardGoalIds, moveChipIds, moveGoalIds, buildCooldown,
+    cardGoalIds, moveChipIds, moveGoalIds,
+    // v4.3 (Phase 5) — warm-up engine (pure)
+    buildWarmup, warmupContext, warmupMode, warmupModules, warmupRotationIndex, warmupModuleEligible, warmupModulePinned, warmupRotatePick,
+    // v4.4 (Phase 6) — cool-down engine (pure)
+    buildCooldown, cooldownMode, cooldownModules,
+    // v4.5 (Phase 7) — daily practice engine (pure)
+    buildDaily, dailyMode, dailyModules, DAILY_ROLES,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, migrateRoutineV16, migrateRoutineV17, migrateRoutineV18, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
     // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate; v4.0 shares supersetPairOk (above)
     groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
     // Phase 4 heuristics (pure — take log/state as args)

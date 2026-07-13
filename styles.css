@@ -107,6 +107,15 @@ html, body {
   color: var(--muted);
 }
 .block.is-collapsed .block-cards { display: none; }
+/* v4.3: warm-up length toggle on the warm-up block header. Sits at the far right; its own
+   tap cycles short/standard/long without collapsing the block. */
+.block-title .wu-mode {
+  margin-left: 8px;
+  padding: 3px 10px;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
 
 /* --- Exercise card --- */
 .card {

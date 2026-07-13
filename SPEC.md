@@ -1049,6 +1049,271 @@ New pure exports: `normalizeRegionStatus`, `moveImplicated`, `doseCutLevel`,
 `feedbackPromptEntry`, `REGION_KEYS` (`readinessCaps`, `sessionBudgets`, `progressionReady`,
 `unmodifiedEntry` already exported).
 
+## v4.3 — Warm-up engine (Phase 5 of REDESIGN.md §6)
+
+The flat 17-item warm-up becomes a session-aware engine. Tissue care that needs frequency
+(plantar work, nerve glides, calf eccentrics) is *pinned* — always present, never rotated —
+while preparation (raise → mobilize → activate → potentiate) rotates for weekly coverage and
+gates on readiness. Routine schema **version 16**; `sw.js` CACHE `tumble-trainer-v4.3.0`.
+**Supersedes** the "Warm-up and cool-down are static" note in `structure.notes[0]` and the v3.x
+`blocks.warmup` schema described in earlier sections — the warm-up is now assembled by
+`buildWarmup` from `blocks.warmupModules`; the cool-down stays static.
+
+### Schema (`blocks.warmupModules`, replaces `blocks.warmup`)
+
+Each module: `{ id, name, role, contexts?, pinnedIn?, pick?, moves[] }`.
+- `role` ∈ `care | raise | mobilize | activate | potentiate` (also the output order).
+- `contexts` — subset of `["gym-impact","gym-lift","daily"]` the module is eligible in (omit =
+  all three). `pinnedIn` — subset (⊆ contexts) where the module is *always* included (omit = none).
+- `pick: n` — show `n` of the module's moves per session, rotating (omit = all).
+- `moves[]` — the static shape (`name/dose/goals/why`, optional `progression`); potentiate and
+  ankle moves may additionally carry `loads` (same 0..3 `LOAD_KEYS` as pool moves — real tissue
+  work). Seeded modules: `plantar`/`nerves` (care, pinned everywhere), `posture` (care, pinned on
+  daily, joins the gym mobilize rotation), `raise` (gym, pick 1), `shoulders`/`wrists` (mobilize;
+  wrists pinned on gym-impact)/`hips`/`ankles` (pick 2)/`thoracic` (pick 1), `core-activate`
+  (activate, pinned in gym+daily, pick 2), `glutes` (activate, gym-impact), `potentiate`
+  (potentiate, gym-impact, readiness-gated).
+
+### Selection (`buildWarmup(state, context)`) — pure, deterministic
+
+Same contract as the generator (no RNG, no `Date`; all state via args).
+- **Context** — `buildSession` runs `selectMoves` FIRST, then `warmupContext(selected)` returns
+  `gym-impact` if any selected move lands `impact ≥ 1`, else `gym-lift`; the Daily tab passes
+  `daily`. The warm-up block is still pushed first so it renders at the top.
+- **Mode** (`settings.warmupMode` = `short|standard|long`, default standard, toggled on the
+  warm-up block header). Gym: *short* = pinned + `raise`; *standard* = + 2 rotating mobilize slots
+  (the pool adds `posture`) + `glutes`/`potentiate` where eligible; *long* = every eligible module.
+  Daily: pinned-in-daily always; standard/long add 1 rotating mobilize slot; short adds none.
+- **Rotation** — `warmupRotationIndex(state)` = finished-session count (`state.session − 1`, the
+  same counter A/B day alternation reads); a preview advances `state.session`, so the rotation
+  advances with the offset. `warmupRotatePick(pool, R, n)` fills `n` slots starting at `R mod
+  len`, wrapping, no repeats — used both for which mobilize modules fill the slots and which moves
+  a `pick: n` module shows.
+- **Readiness gating** — reuses `readinessCaps`/`passesReadiness` **exactly** as the generator: a
+  warm-up move whose `loads` exceed a cap is dropped (shins `stop` or a red shins region caps
+  `shin ≤ 0` → ankle pogos out, loadless calf work stays); a module emptied by gating falls out;
+  `back` `sensitive` drops the whole `potentiate` module. (Note: REDESIGN §6.2's "shins yellow →
+  pogos out" does not hold under the reused v4.2 semantics — yellow adds no cap; only
+  `stop`/red/`upper`-intent cap a leg key to 0. See "Interpretation notes".)
+- **Output** — a flat exercise list, each entry stamped `group` = module name and ordered
+  `raise → care → mobilize → activate → potentiate` (seed order within a role), so `warmupGroups`
+  / `renderWarmupGroupCard`, `'warmup:'+group` checks and per-group logging keep working unchanged.
+
+### Feedback & progression
+
+`finishSession`'s blanket warm-up skip in the **region-status decay** becomes per-move: a done
+warm-up move (its module card checked) that carries `loads` now counts toward whether the session
+loaded a region (done pogos load the shins); loadless prep still contributes nothing. The
+**recency simulation** (`simulatedLogEntry`) likewise includes load-bearing warm-up moves. Contact
+logging is unchanged (it keys off `family`, which warm-up moves don't carry). The warm-up group
+card surfaces ladder state the way the cool-down does — the per-move dose reflects `effectiveDose`
+(persisted `state.intensity` level) and shows a "modified" marker — and a module carrying a real
+ladder (calf raise, pogos) becomes tap-to-expand, revealing the standard `renderProgression`
+controls per laddered move (reusing the superset card's member-index mechanism).
+
+### Migration V16 (`migrateRoutineV16`, gated `version < 16`, idempotent)
+
+Takes the new module set from the v16 seed (deep-cloned; gated on `seed` in `normalizeState` like
+every seed migration since V3), then walks the old `blocks.warmup`: a move whose **name** matches
+one in the new modules carries the user's persisted `dose` (+ `progression`) onto it — the ladder
+*level* lives in `state.intensity` keyed by name, so it migrates for free. An unrecognized
+(user-added) move is preserved verbatim, appended to the module its old `group` maps to
+(`Wall→posture`, `Plantar fasciitis`/`Feet→plantar`, `Nerves→nerves`, `Circles`/`Shoulders→
+shoulders`, `Standing→hips`, `Wrists→wrists`, `Core warmup→core-activate`); an unknown group
+becomes its own care module (slugified id, pinned everywhere) so a customization is never dropped.
+`blocks.warmup` is deleted, `version` set to 16. `settings.warmupMode` defaults to `standard`
+(`freshState` + `normalizeState` backfill). `collectPools` now also surfaces
+`warmupModules[].moves` so name lookups (ladders, intensity clamping) resolve them.
+
+### Validator
+
+`validateRoutine` requires a non-empty `blocks.warmupModules` (unique string `id`, `name`, valid
+`role`; `contexts`/`pinnedIn` ⊆ the three contexts and `pinnedIn` ⊆ effective contexts; positive-
+int `pick ≤ moves.length`; non-empty `moves` each validated like a static entry plus optional
+`loads`). `blocks.warmup` is no longer required or validated. New consts `WARMUP_CONTEXTS`,
+`WARMUP_ROLES`, `WARMUP_MODES`, `WARMUP_ROLE_ORDER`.
+
+### Coach
+
+The warm-up stays off-limits to the Coach (selector-managed, not chat-managed); the system-prompt
+guardrail wording updated so it no longer implies the warm-up is a hand-edited static list.
+
+New pure exports: `buildWarmup`, `warmupContext`, `warmupMode`, `warmupModules`,
+`warmupRotationIndex`, `warmupModuleEligible`, `warmupModulePinned`, `warmupRotatePick`,
+`migrateRoutineV16`.
+
+## v4.4 — Cool-down engine (Phase 6 of REDESIGN.md §7)
+
+The static 3-item cool-down becomes a session-aware engine, the same module treatment as the
+warm-up but smaller. The athlete's own front-split routine is the anchor — never rewritten,
+rotated, or gated: **pinned in every context including `daily`** (split progress is driven by
+frequency of exposure). Around it, three jobs in output order: **flex** (a rotating adductor/
+straddle vs knee-friendly figure-4 slot — no duplicate front-split-line work), **care** (impact
+day pins the calf + plantar stretch, lift day the doorway pec + thoracic stretch, daily gets
+both), and **downshift** (legs-up-the-wall / child's-pose breathing on gym days). Net new moves:
+4. Routine schema **version 17**; `sw.js` CACHE `tumble-trainer-v4.4.0`. **Supersedes** every
+"the cool-down stays static / v4.3 keeps the cool-down static" statement — the cool-down is now
+assembled by `buildCooldown` from `blocks.cooldownModules`.
+
+### Schema (`blocks.cooldownModules`, replaces `blocks.cooldown`)
+
+The **same module shape as `warmupModules`**: `{ id, name, role, contexts?, pinnedIn?, pick?,
+moves[] }`, validated by the shared `validateModuleList` helper (now parameterized by role set;
+`validateWarmupModules`/`validateCooldownModules` are one-line wrappers). `role` ∈
+`COOLDOWN_ROLES = ['flex','care','downshift']`, which is also the output order
+(`COOLDOWN_ROLE_ORDER`). Moves keep the static shape and may carry `loads` (validated by the same
+`validateWarmupMove` — real, gating-relevant tissue facts). Seeded modules:
+
+| Module | Role | Contexts / pinned | Moves |
+|---|---|---|---|
+| `splits` | flex | pinned everywhere (all 3 contexts, incl. short) | Splits routine (incl. sciatic floss) — verbatim, keeps its 5→8 min ladder |
+| `hips-extra` | flex | `gym-impact` + `daily`, pick 1 | ★Seated straddle / pancake reach; ★Figure-4 glute stretch |
+| `calves-feet` | care | pinned on `gym-impact` + `daily` | Calf + plantar fascia stretch |
+| `posture` | care | pinned on `gym-lift` + `daily` | Doorway pec stretch + thoracic extension |
+| `downshift` | downshift | `gym-impact` + `gym-lift`, pick 1 | ★Legs up the wall + slow breathing; ★Child's pose breathing (`loads.knee` 1) |
+
+### Selection (`buildCooldown(state, context)`) — pure, deterministic
+
+Mirrors `buildWarmup`, reusing the v4.3 helpers unchanged (`warmupModuleEligible`,
+`warmupModulePinned`, `warmupRotatePick`, rotation index `warmupRotationIndex` = finished-session
+count, `readinessCaps`/`passesReadiness`).
+- **Context** — the SAME `warmupContext(selected)` value the warm-up uses (`buildSession` computes
+  it once and passes it to both, so warm-up and cool-down always agree on the kind of day). The
+  Daily tab passes `daily` (and now calls the selector instead of reading `blocks.cooldown` raw).
+- **Mode** (`settings.cooldownMode` = `short|standard|long`, default standard, reuses
+  `WARMUP_MODES`; toggled on the cool-down block header exactly like the warm-up). *short* = pinned
+  only (preserves the old `alwaysInShort` semantics); *standard* = pinned + ONE rotating non-pinned
+  flex/care module (from the seed-ordered pool, via `warmupRotatePick(pool, R, 1)`) + all eligible
+  downshift modules (gym days only); *long* = every eligible module.
+- **Per-module** — pick-n rotation (`warmupRotatePick` over the moves with `R`), then
+  `passesReadiness` gating; a module emptied by gating falls out. **No** back-sensitive special
+  case (unlike the warm-up's potentiate).
+- **Readiness gating (loads are gating-only)** — the only loaded cool-down move is Child's pose
+  (`knee: 1`); a knee `stop` / red-knee cap removes it (safety: nothing kneels on a bad knee),
+  leaving the loadless Legs-up-the-wall alternative. The splits routine is loadless + pinned, so
+  it is never gated. Cool-down loads are used **only** for this gating — they are excluded from
+  `simulatedLogEntry` recency and from the `finishSession` region-status decay (an explicit
+  `if (bl.key === 'cooldown')` skip), so previews stay deterministic and Child's pose can't burn a
+  yellow-knee session.
+- **Output** — a flat list ordered flex → care → downshift (seed order within a role), each entry
+  stamped `group` = module name; rendering stays per-move `renderCard`s keyed by move name (checks
+  survive the migration untouched).
+
+### Rendering & progression
+
+Cards remain individual `renderCard`s. The `showProg` exclusion for `'cooldown'` is **removed**:
+a cool-down card is now tap-to-expand and surfaces the standard `renderProgression` ladder —
+finally exposing the splits routine's existing 5→8 min progression (post-session, warm, is when
+the extra minutes pay off). Warm-up cards still surface their ladder on the group card, not here.
+
+### The `cool` slider retires
+
+`settings.cool` (1/2) is gone. Settings and the Adjust panel drop both
+`renderSettingSlider('cool', …)` calls; `structure.sliders` becomes `{ moves: [3,15] }`;
+`buildKnobMap` no longer maps cool-down moves to a `cool` knob; `ALL_KNOBS`/`KNOB_LABEL`/
+`DEFAULT_RANGES` lose their `cool` entries (so the volume nudge's `sameKnobs` check keeps working
+for stored logs that still carry `settings.cool`). The `normalizeState` backfill derives
+`cooldownMode` from the retired slider when the stored settings lack a valid one: `cool ≤ 1 →
+short`, else `standard` (missing → standard), then deletes `settings.cool`.
+
+### Migration V17 (`migrateRoutineV17`, gated `version < 17`, idempotent)
+
+Same by-name pattern as V16, registered in `normalizeState` right after the V16 line. Takes the
+v17 seed's `cooldownModules` (deep-cloned), then walks the old `blocks.cooldown`: a move whose
+**name** matches carries the user's persisted `dose` (+ `progression`) onto the seed move (the
+ladder *level* lives in `state.intensity` keyed by name → migrates free). A user-added move gets
+its own module keyed by the slug of its name — pinned everywhere if it had `alwaysInShort` (old
+always-present semantics), else eligible everywhere so it joins the standard-mode rotation pool;
+`alwaysInShort` is stripped (superseded by `pinnedIn`). `blocks.cooldown` is deleted, `version` set
+to 17. `collectPools` now surfaces `cooldownModules[].moves` (so the splits routine resolves for
+intensity/ladder lookups); the legacy `cooldown` block-key is dropped from its list.
+
+### Coach
+
+The cool-down is **fully locked out** of the Coach (athlete decision, 2026-07) — selector-managed,
+not chat-managed. The system-prompt guardrail now states both warm-up and cool-down are assembled
+by the session planner from modules and are completely off-limits; the "routine JSON is for
+context only" note reflects `cooldownModules`. `COACH_TOOLS` unchanged.
+
+New consts: `COOLDOWN_ROLES`, `COOLDOWN_ROLE_ORDER`. New pure exports: `buildCooldown`,
+`cooldownMode`, `cooldownModules`, `migrateRoutineV17`.
+
+## v4.5 — Daily practice engine (Phase 7 of REDESIGN.md §8)
+
+The Daily tab's middle block — until now a single hardcoded app constant `DAILY_TUCK_JUMPS`
+(not in the seed, unvalidated, no `loads`/progression, invisible to readiness) — becomes a real
+module engine, the same treatment as the warm-up/cool-down. Routine schema **version 18**;
+`sw.js` CACHE `tumble-trainer-v4.5.0`. **Supersedes** the v3.2 "the Daily tab shows … plus a fixed
+daily Tuck jumps stim (`DAILY_TUCK_JUMPS`)" description — the daily practice block is now assembled
+by `buildDaily` from `blocks.dailyModules`. The Daily tab stays **unlogged**: no finish path, no
+`state.log`, no recency/decay contribution — `loads` on daily moves gate on readiness **only**
+(the cool-down rule).
+
+### Schema (`blocks.dailyModules`, replaces the `DAILY_TUCK_JUMPS` constant)
+
+The **same module shape** as `warmupModules`/`cooldownModules` (`{ id, name, role, contexts?,
+pinnedIn?, pick?, moves[] }`), validated by the shared `validateModuleList` helper with
+`DAILY_ROLES = ['stim','skill','armor']` (also `DAILY_ROLE_ORDER`, the output order).
+
+| Module | Role | Contexts / pinned | Moves |
+|---|---|---|---|
+| `jumps` | stim | `daily`, pinned | Tuck jumps — **name preserved verbatim** (existing `state.checks` survives); new `loads` impact 1 / shin 1 |
+| `handstand` | skill | `daily`, not pinned | ★Wall handstand hold (`loads` wrist 1; 30→60 s ladder; goal `aerial`) |
+| `shin-armor` | armor | `daily`, pinned | ★Wall tibialis raises (loadless; 15→25 rep ladder; goal `shins`) |
+
+### Selection (`buildDaily(state)`) — pure, deterministic
+
+A simpler cousin of `buildCooldown`, always context `daily`, reusing the same helpers
+(`warmupModuleEligible`, `warmupModulePinned`, `warmupRotatePick`, `readinessCaps`/
+`passesReadiness`).
+- **Mode** (`settings.dailyMode` = `short|standard|long`, default standard, toggled on the
+  practice-block header). `short` = pinned only (jump stim + shin armor); `standard`/`long` =
+  every eligible module (adds the handstand). **standard ≡ long** for the daily block — only three
+  modules, no rotating slot; both modes are kept only so the shared header toggle cycles uniformly.
+  Pick-n rotation is supported for generality (the seed has no picks), applied before gating.
+- **Readiness gating (loads are gating-only)** — `passesReadiness` over `readinessCaps(state)`,
+  exactly as the other engines: shins `stop`/red caps `shin ≤ 0` → the tuck-jump stim drops (its
+  module empties); arms `stop`/red caps `wrist ≤ 0` → the handstand drops. Yellow adds no cap; a
+  module emptied by gating falls out. Daily `loads` **never** feed `simulatedLogEntry` recency or
+  the `finishSession` region-status decay (no finish path exists for the Daily tab).
+- **Output** — flat, ordered stim → skill → armor (seed order within a role), each move stamped
+  `group` = module name; per-move `renderCard`s keyed by move name.
+
+### Rendering, migration & Coach
+
+`renderDaily` builds the middle block from `buildDaily(state)` (block key stays `daily`, title
+`Jumps` → **`Practice`**, flat cards). The Daily tab now surfaces a length toggle on **all three**
+block headers — new `renderDailyModeToggle` (`.wu-mode`, `data-action="daily-mode"` →
+`cycleDailyMode`) on the practice block, plus the existing `renderWarmupModeToggle`/
+`renderCooldownModeToggle` on the daily warm-up/cool-down headers (which previously inherited the
+gym settings with no on-tab control; the Daily tab is never a preview, so they always show).
+`showProg` now includes `'daily'` so the tibialis/handstand ladders surface behind expand.
+`collectPools` surfaces `dailyModules[].moves`.
+
+Migration `migrateRoutineV18(routine, seed)` is gated (`version < 18`) and idempotent; with no
+legacy block to carry (the stim was a hardcoded constant) it simply installs `blocks.dailyModules`
+from the v18 seed, `version` → 18, registered in `normalizeState` right after V17.
+`settings.dailyMode` defaults to `standard` (`freshState` + backfill). `finishSession`,
+`simulatedLogEntry`, the volume-nudge knobs and `buildKnobMap` are **untouched** — daily stays out
+of all of them.
+
+The daily practice block is **fully locked out** of the Coach (athlete decision, consistent with
+warm-up/cool-down): selector-managed, not chat-managed. The guardrail now names all three blocks
+(warm-up, daily practice, cool-down) as off-limits; the routine-JSON note reflects all three
+module sets.
+
+New consts: `DAILY_ROLES`, `DAILY_ROLE_ORDER`. New pure exports: `buildDaily`, `dailyMode`,
+`dailyModules`, `DAILY_ROLES`, `migrateRoutineV18`.
+
+**Deviations from the phase brief** (both forced by existing `readinessCaps`/`REGION_KEYS`
+semantics, per the deterministic-selection contract): the handstand carries `loads.wrist: 1`, not
+the briefed `loads.armSupport: 1` — `armSupport` is a derived *budget* concept, not a `LOAD_KEY`;
+`REGION_KEYS.arms = ['wrist','elbow']`, so `wrist: 1` is what an arms `stop`/red actually gates
+(and what passes validation). Tuck jumps carry `loads.impact: 1, shin: 1`, not the briefed
+`impact: 1` alone — `REGION_KEYS.shins = ['shin']` (no region maps to `impact`), so a `shin` load
+is required for shins `stop`/red to gate the stim (matching the Ankle-pogos precedent). The
+handstand goal is `aerial` (no `handstand` goal exists in the seed).
+
 ## Non-goals
 - No accounts, no server, no analytics
 - No LLM calls without explicit user action (cost + privacy)

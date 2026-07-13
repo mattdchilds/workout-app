@@ -1,5 +1,5 @@
 {
-  "version": 15,
+  "version": 18,
   "goals": [
     { "id": "flip", "name": "Backflip power & endurance", "kind": "training", "weight": 8, "colorId": "teal" },
     { "id": "aerial", "name": "Aerial", "kind": "training", "weight": 0, "colorId": "coral" },
@@ -40,24 +40,63 @@
     { "id": "posture-accessory", "name": "Posture accessory", "phase": "accessory" }
   ],
   "blocks": {
-    "warmup": [
-      { "name": "Wall neck stretch", "group": "Wall", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["posture"], "why": "Releases the neck before overhead and inverted work" },
-      { "name": "Chin tucks", "group": "Wall", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Resets forward-head posture before loading" },
-      { "name": "Wall angels", "group": "Wall", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Opens the shoulders and grooves overhead position" },
-      { "name": "Shin raises (back against wall)", "group": "Wall", "dose": { "sets": 1, "amount": 15, "unit": "reps" }, "goals": ["shins", "plantar", "recovery"], "why": "Wakes tibialis for landings and shin health" },
-      { "name": "Arch curls (foot doming)", "group": "Plantar fasciitis", "dose": { "sets": 1, "amount": 15, "unit": "reps/side" }, "goals": ["plantar"], "why": "Wakes the foot arch — plantar fascia's support crew" },
-      { "name": "Calf raise (slow eccentric)", "group": "Plantar fasciitis", "dose": { "sets": 3, "amount": 10, "unit": "reps", "tempoNote": "3 sec down" }, "goals": ["plantar"], "why": "Slow loading primes the fascia — different job than your jumping", "progression": { "step": 2, "max": 15, "maxSets": 3 } },
-      { "name": "Ulnar nerve glides", "group": "Nerves", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["cubital"], "why": "Cubital tunnel care — glide, never stretch to pain" },
-      { "name": "Arm circles (small→large, both ways)", "group": "Circles", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Blood into the shoulders through full range" },
-      { "name": "Shoulder lifts", "group": "Shoulders", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Wakes the shoulders before overhead and inverted work" },
-      { "name": "Misc", "group": "Shoulders", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Odds-and-ends shoulder prep" },
-      { "name": "Standing calf stretch", "group": "Standing", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["plantar"], "why": "Lengthens the calf before impact work" },
-      { "name": "Knee clocks", "group": "Standing", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["recovery"], "why": "Knee tracking control through full circles" },
-      { "name": "Wrist stretch", "group": "Wrists", "dose": { "sets": 1, "amount": 20, "unit": "sec" }, "goals": ["recovery", "cubital"], "why": "Preps the wrists for any hand-loading" },
-      { "name": "Wrist lifts", "group": "Wrists", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["recovery"], "why": "Wakes the forearms and wrist extensors" },
-      { "name": "Curl-ups", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Switches on the deep core before hollow work" },
-      { "name": "Leg lifts", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Lower-ab activation before the main core block" },
-      { "name": "Curl + leg lift combo", "group": "Core warmup", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Ties upper and lower core together before hollow work" }
+    "warmupModules": [
+      { "id": "plantar", "name": "Plantar fasciitis", "role": "care", "pinnedIn": ["gym-impact", "gym-lift", "daily"], "moves": [
+        { "name": "Arch curls (foot doming)", "dose": { "sets": 1, "amount": 15, "unit": "reps/side" }, "goals": ["plantar"], "why": "Wakes the foot arch — plantar fascia's support crew" },
+        { "name": "Calf raise (slow eccentric)", "dose": { "sets": 3, "amount": 10, "unit": "reps", "tempoNote": "3 sec down" }, "goals": ["plantar"], "why": "Slow loading primes the fascia — different job than your jumping", "progression": { "step": 2, "max": 15, "maxSets": 3 } },
+        { "name": "Standing calf stretch", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["plantar"], "why": "Lengthens the calf before impact work" }
+      ] },
+      { "id": "nerves", "name": "Nerves", "role": "care", "pinnedIn": ["gym-impact", "gym-lift", "daily"], "moves": [
+        { "name": "Ulnar nerve glides", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["cubital"], "why": "Cubital tunnel care — glide, never stretch to pain" }
+      ] },
+      { "id": "posture", "name": "Posture reset", "role": "care", "pinnedIn": ["daily"], "moves": [
+        { "name": "Wall neck stretch", "dose": { "sets": 1, "amount": 20, "unit": "sec/side" }, "goals": ["posture"], "why": "Releases the neck before overhead and inverted work" },
+        { "name": "Chin tucks", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Resets forward-head posture before loading" },
+        { "name": "Wall angels", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture"], "why": "Opens the shoulders and grooves overhead position" }
+      ] },
+      { "id": "raise", "name": "Pulse raiser", "role": "raise", "contexts": ["gym-impact", "gym-lift"], "pick": 1, "moves": [
+        { "name": "Jumping jacks", "dose": { "sets": 1, "amount": 30, "unit": "sec" }, "goals": ["recovery"], "why": "Whole-body pulse-raiser to warm the blood and joints" },
+        { "name": "Skipping / light bounce", "dose": { "sets": 1, "amount": 30, "unit": "sec" }, "goals": ["recovery"], "why": "You stim by jumping — put it to work warming up" }
+      ] },
+      { "id": "shoulders", "name": "Shoulders", "role": "mobilize", "moves": [
+        { "name": "Arm circles (small→large, both ways)", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Blood into the shoulders through full range" },
+        { "name": "Shoulder lifts", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Wakes the shoulders before overhead and inverted work" },
+        { "name": "Misc", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Odds-and-ends shoulder prep" }
+      ] },
+      { "id": "wrists", "name": "Wrists", "role": "mobilize", "pinnedIn": ["gym-impact"], "moves": [
+        { "name": "Wrist stretch", "dose": { "sets": 1, "amount": 20, "unit": "sec" }, "goals": ["recovery", "cubital"], "why": "Preps the wrists for any hand-loading" },
+        { "name": "Wrist lifts", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["recovery"], "why": "Wakes the forearms and wrist extensors" },
+        { "name": "Tiger claws", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["cubital", "recovery"], "why": "Wakes the hands and forearms before weight goes through them" },
+        { "name": "Weight-bearing wrist rocks", "dose": { "sets": 1, "amount": 8, "unit": "reps" }, "goals": ["recovery", "gym"], "why": "On all fours, rocking over the hands to prep for handstands and tumbling" }
+      ] },
+      { "id": "hips", "name": "Hips & knees", "role": "mobilize", "pick": 2, "moves": [
+        { "name": "Knee clocks", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["recovery"], "why": "Knee tracking control through full circles" },
+        { "name": "Leg swings", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["splits", "recovery"], "why": "Loosens the hips through full range before loading" },
+        { "name": "Hip circles", "dose": { "sets": 1, "amount": 5, "unit": "reps/side" }, "goals": ["recovery"], "why": "Opens the hips with slow controlled circles" }
+      ] },
+      { "id": "ankles", "name": "Ankles & feet", "role": "mobilize", "pick": 2, "moves": [
+        { "name": "Shin raises (back against wall)", "dose": { "sets": 1, "amount": 15, "unit": "reps" }, "goals": ["shins", "plantar", "recovery"], "why": "Wakes tibialis for landings and shin health" },
+        { "name": "Ankle circles", "dose": { "sets": 1, "amount": 10, "unit": "reps/side" }, "goals": ["plantar", "recovery"], "why": "Mobilises the ankles before impact" },
+        { "name": "Knee-to-wall rocks", "dose": { "sets": 1, "amount": 8, "unit": "reps/side" }, "goals": ["plantar", "recovery"], "why": "Restores ankle dorsiflexion for squats and landings" }
+      ] },
+      { "id": "thoracic", "name": "Thoracic", "role": "mobilize", "pick": 1, "moves": [
+        { "name": "Cat-cow", "dose": { "sets": 1, "amount": 8, "unit": "reps" }, "goals": ["posture", "recovery"], "why": "Segments the spine to wake the mid-back" },
+        { "name": "Thread the needle", "dose": { "sets": 1, "amount": 6, "unit": "reps/side" }, "goals": ["posture"], "why": "Opens the thoracic spine for overhead and rotation" }
+      ] },
+      { "id": "core-activate", "name": "Core activation", "role": "activate", "pinnedIn": ["gym-impact", "gym-lift", "daily"], "pick": 2, "moves": [
+        { "name": "Curl-ups", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Switches on the deep core before hollow work" },
+        { "name": "Leg lifts", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Lower-ab activation before the main core block" },
+        { "name": "Curl + leg lift combo", "dose": { "sets": 1, "amount": 10, "unit": "reps" }, "goals": ["core"], "why": "Ties upper and lower core together before hollow work" },
+        { "name": "Bird dog", "dose": { "sets": 1, "amount": 8, "unit": "reps/side" }, "goals": ["core", "recovery"], "why": "Anti-extension control to protect the lower back before bridges and BHS" }
+      ] },
+      { "id": "glutes", "name": "Glute activation", "role": "activate", "contexts": ["gym-impact"], "moves": [
+        { "name": "Glute bridge", "dose": { "sets": 1, "amount": 12, "unit": "reps" }, "goals": ["core", "recovery"], "why": "Fires the glutes so the lower back doesn't take the load" }
+      ] },
+      { "id": "potentiate", "name": "Potentiation", "role": "potentiate", "contexts": ["gym-impact"], "moves": [
+        { "name": "Ankle pogos", "dose": { "sets": 2, "amount": 15, "unit": "reps" }, "loads": { "impact": 1, "shin": 1, "foot": 1 }, "goals": ["shins", "flip"], "why": "Builds shin tolerance for roundoffs, one stiff bounce at a time", "progression": { "step": 5, "max": 30, "maxSets": 2 } },
+        { "name": "Tuck jumps (crisp)", "dose": { "sets": 1, "amount": 3, "unit": "reps" }, "loads": { "impact": 1, "shin": 1, "knee": 1, "foot": 1 }, "goals": ["flip"], "why": "A few crisp jumps — stop while they're still snappy" },
+        { "name": "Handstand hold", "dose": { "sets": 1, "amount": 20, "unit": "sec" }, "loads": { "wrist": 1 }, "goals": ["gym"], "why": "Time on the hands to prime the shoulders and wrists" }
+      ] }
     ],
     "moves": [
       { "name": "Handstand wall hold", "section": "floor", "family": "handstand-support", "loads": { "wrist": 2, "elbow": 1 }, "fatigue": 3, "qualitySensitive": true, "tags": ["joint-stress-arms", "day-a"], "dose": { "sets": 3, "amount": 30, "unit": "sec" }, "goalScores": { "gym": 10, "core": 5 }, "muscle": "shoulders", "why": "Shoulder stack and balance (soft elbows, no hard lockout)", "progression": { "step": 5, "max": 60, "maxSets": 3 } },
@@ -100,19 +139,44 @@
       { "name": "Leg extension", "section": "machines", "family": "squat-knee", "loads": { "knee": 2 }, "fatigue": 2, "tags": ["day-a", "gym-only"], "dose": { "sets": 3, "amount": 10, "unit": "reps", "weight": 85 }, "goalScores": { "flip": 4, "gym": 2 }, "why": "Quad and knee-tendon capacity for jumping", "progression": { "step": 1, "max": 15, "weightStep": 10 } },
       { "name": "Tibialis raises", "section": "machines", "family": "shin-dorsiflexion", "loads": { "shin": 1 }, "fatigue": 1, "tags": ["gym-only"], "dose": { "sets": 3, "amount": 15, "unit": "reps" }, "goalScores": { "shins": 8, "flip": 2 }, "care": ["plantar", "recovery"], "why": "Balances all that calf and jump work — shin and foot health", "progression": { "step": 1, "max": 20, "maxSets": 3 } }
     ],
-    "cooldown": [
-      { "name": "Splits routine (incl. sciatic floss)", "dose": { "sets": 1, "amount": 5, "unit": "min" }, "goals": ["splits", "sciatic", "recovery", "aerial"], "why": "Your routine — hip range plus the nerve work you already do", "alwaysInShort": true, "progression": { "step": 1, "max": 8, "maxSets": 1 } },
-      { "name": "Doorway pec stretch + thoracic extension", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["posture"], "why": "Posture — opens what tumbling rounds", "alwaysInShort": true },
-      { "name": "Calf + plantar fascia stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["plantar"], "why": "Gentle end-of-session foot care" }
+    "cooldownModules": [
+      { "id": "splits", "name": "Splits routine", "role": "flex", "pinnedIn": ["gym-impact", "gym-lift", "daily"], "moves": [
+        { "name": "Splits routine (incl. sciatic floss)", "dose": { "sets": 1, "amount": 5, "unit": "min" }, "goals": ["splits", "sciatic", "recovery", "aerial"], "why": "Your routine — hip range plus the nerve work you already do", "progression": { "step": 1, "max": 8, "maxSets": 1 } }
+      ] },
+      { "id": "hips-extra", "name": "Straddle & hips", "role": "flex", "contexts": ["gym-impact", "daily"], "pick": 1, "moves": [
+        { "name": "Seated straddle / pancake reach", "dose": { "sets": 1, "amount": 60, "unit": "sec" }, "goals": ["splits", "aerial"], "why": "The angle the splits routine misses — the aerial takes off through an open straddle, and it's warm tissue now, so the range sticks" },
+        { "name": "Figure-4 glute stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["recovery"], "why": "Knee-friendly hip and glute care after impact — no deep pigeon on the wonky right knee" }
+      ] },
+      { "id": "calves-feet", "name": "Calves & feet", "role": "care", "contexts": ["gym-impact", "daily"], "pinnedIn": ["gym-impact", "daily"], "moves": [
+        { "name": "Calf + plantar fascia stretch", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["plantar"], "why": "Gentle end-of-session foot care" }
+      ] },
+      { "id": "posture", "name": "Posture", "role": "care", "contexts": ["gym-lift", "daily"], "pinnedIn": ["gym-lift", "daily"], "moves": [
+        { "name": "Doorway pec stretch + thoracic extension", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "goals": ["posture"], "why": "Posture — opens what tumbling rounds" }
+      ] },
+      { "id": "downshift", "name": "Down-regulate", "role": "downshift", "contexts": ["gym-impact", "gym-lift"], "pick": 1, "moves": [
+        { "name": "Legs up the wall + slow breathing", "dose": { "sets": 1, "amount": 2, "unit": "min" }, "goals": ["recovery"], "why": "Lumbar decompression and a parasympathetic downshift for an athlete who stims by jumping and has a leg-nerve history" },
+        { "name": "Child's pose breathing", "dose": { "sets": 1, "amount": 90, "unit": "sec" }, "loads": { "knee": 1 }, "goals": ["recovery"], "why": "Slow breathing over a gentle spinal flexion to close the session down" }
+      ] }
+    ],
+    "dailyModules": [
+      { "id": "jumps", "name": "Jumps", "role": "stim", "contexts": ["daily"], "pinnedIn": ["daily"], "moves": [
+        { "name": "Tuck jumps", "dose": { "sets": 3, "amount": 10, "unit": "reps" }, "loads": { "impact": 1, "shin": 1 }, "goals": ["flip", "recovery"], "why": "Daily plyometric stim — light, springy jumps through the feet" }
+      ] },
+      { "id": "handstand", "name": "Handstand touch", "role": "skill", "contexts": ["daily"], "moves": [
+        { "name": "Wall handstand hold", "dose": { "sets": 2, "amount": 30, "unit": "sec" }, "loads": { "wrist": 1 }, "goals": ["aerial"], "why": "Daily line + wrist tolerance — keeps upside-down proprioception ticking between gym days; feeds the aerial", "progression": { "step": 5, "max": 60, "maxSets": 2 } }
+      ] },
+      { "id": "shin-armor", "name": "Shin armor", "role": "armor", "contexts": ["daily"], "pinnedIn": ["daily"], "moves": [
+        { "name": "Wall tibialis raises", "dose": { "sets": 2, "amount": 15, "unit": "reps" }, "goals": ["shins"], "why": "Armors the front of the shin — direct medicine for the roundoff/front-flip volume limiter", "progression": { "step": 5, "max": 25, "maxSets": 3 } }
+      ] }
     ]
   },
   "structure": {
     "frequencyPerWeek": "2-3",
     "dayAlternation": "A on odd sessions, B on even",
-    "sliders": { "moves": [3, 15], "cool": [1, 2] },
+    "sliders": { "moves": [3, 15] },
     "selection": "Each move carries goalScores (trainingGoalId -> 0..10). A move's base score = Σ over training goals of goal.weight × goalScore; moves scoring 0 are excluded. A recency boost favours moves not done recently. A move may carry a `tags` array of ids from the top-level `tags` list; each tag resolves to a 1–5 priority. Auto day tags (day-a, day-b) are a SOFT preference derived from the session's A/B day — today's day scores 4 (×1.5) and the other day 2 (×0.6), so a B-tagged move can still surface on an A day if it scores high enough (no hard lock). Every other tag reads settings.tagPriority (default 3). Priority 1 removes the move from the pool entirely; otherwise the base score is multiplied per tag: 2 → ×0.6, 3 → ×1, 4 → ×1.5, 5 → ×2.5. Moves are then picked greedily up to `moves`, with per-section diminishing returns (each already-picked move discounts its section) so Floor never crowds out Weights / Machines; the picks are grouped by section into Floor / Weights / Machines. A move flagged disabled is never picked. Superset bias (settings.supersetBias, 0–30) further nudges Floor moves that pair into supersets while Auto superset is on.",
     "notes": [
-      "Warm-up and cool-down are static and always cover the care goals (splits, plantar, cubital, posture, sciatic, recovery); only change them when the user explicitly asks",
+      "Warm-up is assembled by buildWarmup from blocks.warmupModules, the Daily-tab practice block by buildDaily from blocks.dailyModules, and cool-down by buildCooldown from blocks.cooldownModules — each module has a role (warm-up: care/raise/mobilize/activate/potentiate; daily: stim/skill/armor; cool-down: flex/care/downshift). All three are chosen by context (gym-impact / gym-lift / daily), mode (short/standard/long), a deterministic session rotation, and readiness gating. Warm-up pins care (plantar, nerves) in every context. The daily practice block pins the tuck-jump stim and the shin-armor tibialis work every day and adds a handstand touch in standard/long. Cool-down pins the splits routine in every context (front-split goal, driven by frequency of exposure), the calf/plantar stretch after impact, the pec/thoracic stretch after lifting, and adds a down-regulation move on gym days. The pinned modules and the splits routine change only when the user explicitly asks.",
       "Training goals (flip, aerial, core, gym, shins) have 0–10 weight sliders in Settings and in the Gym tab's Adjust-session panel; weight 0 turns a goal off. Care goals are always on and have no sliders. The shins goal (tibialis + soleus durability) is served by heel/toe walks and bent-knee calf raises at home plus tibialis raises in the gym.",
       "A move may carry a `tags` array of ids drawn from the top-level `tags` list. Each non-auto tag has a 1–5 priority slider in Settings (settings.tagPriority, default 3): 1 hard-avoids the move (drops it from the pool), 2 lowers its priority (×0.6), 3 is neutral, 4/5 raise it (×1.5 / ×2.5). The joint-stress-legs (knees/ankles) and joint-stress-arms (shoulders/elbows/wrists) tags let a recovering athlete spare a region. The gym-only tag marks every weights/machines move (equipment the user has only at the gym); set its priority to 1 to hard-exclude them for an at-home, bodyweight-on-a-mat session. Day A/B are auto tags (auto:\"day\"): they express a soft same-day preference (today's day ×1.5, the other ×0.6) rather than a hard lock, and never appear as sliders. Moves may also be individually disabled in the Moves tab (disabled:true).",
       "Health constraints: cubital tunnel (no hard elbow lockout pressing), plantar fasciitis (keep slow calf loading, conservative impact), sciatic nerve (gentle flossing lives in user's splits routine), posture (never drop the pulling work), user stims by jumping (extra daily impact through feet)"
