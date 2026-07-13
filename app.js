@@ -92,9 +92,6 @@ const ui = {
   finishing: false,
   adjustOpen: false,              // v3.4: Gym-tab "Adjust session" panel open/collapsed (transient)
   readinessOpen: false,           // v4.1: Gym-tab "Readiness check-in" panel open/collapsed (transient)
-  feedbackPick: null,             // v4.2: transient 'yellow'|'red' — the 24h prompt's region step
-  feedbackFor: null,              // v4.2: session number the pick was made for — a pick never
-                                  // carries over to a different entry's prompt (stale-pick guard)
   // v3.9 Coach: ALL transient / in-memory. messages = [{ role:'user'|'assistant', text }]
   // (ephemeral chat — never persisted, resets on reload). pending = a staged changeset
   // awaiting the user's Apply/Discard. busy = a request is in flight. error = last error.
@@ -112,26 +109,36 @@ function defaultTagPriority(routine) {
 // v4.1 (Phase 3): per-session readiness check-in. NOT part of settings or the routine
 // (no schema bump) — a transient body-state the generator reads as *state* (deterministic,
 // no RNG/Date). Allowed values per region; unknown → the region's default. Pure.
+// v4.6: every body region is a 3-level session DIAL — good / light / skip ("go normal",
+// "go light on this region today", "skip loading this region today"). These are today's
+// dials, NOT injuries or chronic conditions.
 const READINESS_LEVELS = {
-  shins: ['good', 'caution', 'stop'],
-  knee: ['good', 'caution', 'stop'],
-  foot: ['good', 'caution', 'stop'],
-  back: ['good', 'sensitive'],
-  arms: ['good', 'caution'],
+  shins: ['good', 'light', 'skip'],
+  knee: ['good', 'light', 'skip'],
+  foot: ['good', 'light', 'skip'],
+  back: ['good', 'light', 'skip'],
+  wrist: ['good', 'light', 'skip'],
   energy: ['low', 'normal', 'high']
 };
 // The all-good default readiness object. Used by freshState, normalizeState, the
 // clear-on-finish reset, the Reset button, and future-preview neutralization. Pure.
 function defaultReadiness() {
-  return { shins: 'good', knee: 'good', foot: 'good', back: 'good', arms: 'good', energy: 'normal', classSoon: false };
+  return { shins: 'good', knee: 'good', foot: 'good', back: 'good', wrist: 'good', energy: 'normal', classSoon: false };
 }
 // Repair a stored/loaded readiness object: each region snaps to a known value (else its
 // default), classSoon coerces to a strict boolean. Pure — returns a fresh object.
+// v4.6: migrate legacy shapes first — the old `arms` key maps to `wrist`, and the old
+// values caution→light, stop→skip, sensitive→light snap into the unified 3-level scale.
 function normalizeReadiness(r) {
   const out = defaultReadiness();
   if (!r || typeof r !== 'object') return out;
+  const LEGACY_VAL = { caution: 'light', stop: 'skip', sensitive: 'light' };
+  const src = Object.assign({}, r);
+  if (src.wrist == null && src.arms != null) src.wrist = src.arms;   // arms → wrist
   Object.keys(READINESS_LEVELS).forEach((k) => {
-    if (READINESS_LEVELS[k].indexOf(r[k]) >= 0) out[k] = r[k];
+    let v = src[k];
+    if (k !== 'energy' && LEGACY_VAL[v]) v = LEGACY_VAL[v];
+    if (READINESS_LEVELS[k].indexOf(v) >= 0) out[k] = v;
   });
   out.classSoon = r.classSoon === true;
   return out;
@@ -141,35 +148,6 @@ function readinessIsDefault(r) {
   const d = defaultReadiness();
   const n = normalizeReadiness(r);
   return Object.keys(d).every((k) => n[k] === d[k]);
-}
-
-// v4.2 (Phase 4): the 24-hour green/yellow/red feedback loop. After a session settles the
-// athlete answers "how did that settle?"; a yellow/red answer parks a body region in
-// `state.regionStatus`, a PERSISTENT map that the deterministic generator reads as *state*
-// (never RNG/Date). Green = the absence of an entry. Each region maps to the load keys a
-// move can carry; a yellow region eases its work for a couple of sessions, a red region is
-// paused until cleared in Settings. See readinessCaps / sessionBudgets / moveImplicated.
-const REGION_KEYS = { shins: ['shin'], knee: ['knee'], foot: ['foot'], back: ['lumbar'], arms: ['wrist', 'elbow'] };
-const FEEDBACK_DELAY_MS = 12 * 3600 * 1000;   // wait ≥12 h after finish before prompting (UI gate only)
-const YELLOW_SESSIONS = 2;                     // sessions a yellow region stays parked (decayed in finishSession)
-const DOSE_CUT = 0.8;                          // ~20% dose cut for implicated moves (snapped to a real ladder step)
-// Repair a stored/loaded regionStatus map: drop unknown regions and unknown lights; a red
-// entry is bare {light:'red'}; a yellow entry carries an integer sessionsLeft clamped 1..2
-// (default 2). Non-object → {}. Pure — returns a fresh object.
-function normalizeRegionStatus(rs) {
-  const out = {};
-  if (!rs || typeof rs !== 'object') return out;
-  Object.keys(rs).forEach((region) => {
-    if (!REGION_KEYS[region]) return;                 // unknown region → drop
-    const s = rs[region];
-    if (!s || typeof s !== 'object') return;
-    if (s.light === 'red') { out[region] = { light: 'red' }; return; }   // red carries no sessionsLeft
-    if (s.light !== 'yellow') return;                 // unknown light → drop
-    const raw = s.sessionsLeft;
-    const n = (typeof raw === 'number' && isFinite(raw)) ? Math.round(raw) : YELLOW_SESSIONS;
-    out[region] = { light: 'yellow', sessionsLeft: clamp(n, 1, 2) };
-  });
-  return out;
 }
 
 function freshState(routine) {
@@ -187,7 +165,10 @@ function freshState(routine) {
     // v4.3: warmupMode (short|standard|long, default standard) drives buildWarmup's length. Toggled on the warm-up block header.
     // v4.4: cooldownMode (short|standard|long, default standard; reuses WARMUP_MODES) drives buildCooldown's length; the old `cool` slider retired.
     // v4.5: dailyMode (short|standard|long, default standard; reuses WARMUP_MODES) drives buildDaily's length. Toggled on the Daily-tab practice block header.
-    settings: { moves: 10, cooldownMode: 'standard', dailyMode: 'standard', supersetBias: 5, weeklyClasses: 1, warmupMode: 'standard', tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
+    // v4.7: atGym (default true) is the "At gym / At home" location toggle. true = gym-only
+    // (equipment) moves stay in the pool; false = they are hard-excluded. Replaces the gym-only
+    // priority slider — see tagEffectivePriority.
+    settings: { moves: 10, cooldownMode: 'standard', dailyMode: 'standard', supersetBias: 5, weeklyClasses: 1, warmupMode: 'standard', atGym: true, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
@@ -204,9 +185,6 @@ function freshState(routine) {
     // routine — a transient body-state the generator filters/budgets against. See selectMoves.
     sessionIntent: 'default',     // 'default'|'gym-prep'|'recovery'|'low-impact'|'short'|'upper'
     readiness: defaultReadiness(),
-    // v4.2 (Phase 4): persistent region status from the 24h feedback loop. Keys from
-    // shins|knee|foot|back|arms → {light:'yellow', sessionsLeft} or {light:'red'}; absence = green.
-    regionStatus: {},
     deletedMoves: []              // Move viewer tombstones — deleted moves never return via a seed migration
   };
 }
@@ -1123,6 +1101,121 @@ function migrateRoutineV18(routine, seed) {
 }
 
 /*
+ * v4.5 -> v4.6 migration (readiness overhaul). Gated (version < 19), idempotent. Data-only
+ * cleanups matching the v19 seed for existing installs (found by id/name, V13-style):
+ *  - remove the retired joint-stress-legs / joint-stress-arms tag defs from routine.tags and
+ *    strip those ids from every move's tags (empty tags arrays dropped). settings.tagPriority
+ *    is pruned separately by normalizeState's orphan sweep (those ids are no longer valid tags).
+ *  - daily "Tuck jumps" gains full leg loads {impact,shin,knee,foot:2} so any leg region at
+ *    light/skip drops the stim (the old {impact:1,shin:1} survived shins/knee gating — the bug).
+ *  - warm-up: drop "Standing calf stretch" (plantar; duplicated cool-down calf work) and
+ *    "Tiger claws" (wrists; that's the user's braces, not an exercise).
+ *  - cool-down: rename "Figure-4 glute stretch" → "Pigeon stretch" (unit sec/side, knee:1 load
+ *    so a knee skip drops it, reworded why). Doesn't use the seed but is gated on it like the rest.
+ */
+function migrateRoutineV19(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 19) return routine;
+  const r = deepClone(routine);
+  const b = r.blocks || (r.blocks = {});
+  const DEAD_TAGS = ['joint-stress-legs', 'joint-stress-arms'];
+  // Remove the tag defs from the routine catalog.
+  if (Array.isArray(r.tags)) r.tags = r.tags.filter((t) => !(t && DEAD_TAGS.indexOf(t.id) >= 0));
+  // Strip the ids off every move that carries them (pool + any tagged module moves); drop a tags
+  // array emptied by the strip.
+  const stripTags = (ex) => {
+    if (!ex || !Array.isArray(ex.tags)) return;
+    ex.tags = ex.tags.filter((t) => DEAD_TAGS.indexOf(t) === -1);
+    if (!ex.tags.length) delete ex.tags;
+  };
+  (b.moves || []).forEach(stripTags);
+  ['warmupModules', 'cooldownModules', 'dailyModules'].forEach((mk) => {
+    (b[mk] || []).forEach((m) => ((m && m.moves) || []).forEach(stripTags));
+  });
+  // Find a same-name move inside a module by module id (or null).
+  const moduleMove = (mk, moduleId, name) => {
+    const mod = (b[mk] || []).find((m) => m && m.id === moduleId);
+    return (mod && Array.isArray(mod.moves)) ? (mod.moves.find((mv) => mv && mv.name === name) || null) : null;
+  };
+  // Drop a same-name move out of a module.
+  const dropMove = (mk, moduleId, name) => {
+    const mod = (b[mk] || []).find((m) => m && m.id === moduleId);
+    if (mod && Array.isArray(mod.moves)) mod.moves = mod.moves.filter((mv) => !(mv && mv.name === name));
+  };
+  // D: daily Tuck jumps — full leg loads so any leg region at light/skip drops the stim.
+  const tj = moduleMove('dailyModules', 'jumps', 'Tuck jumps');
+  if (tj) tj.loads = { impact: 2, shin: 2, knee: 2, foot: 2 };
+  // E1/E2: retire duplicated / non-exercise warm-up moves.
+  dropMove('warmupModules', 'plantar', 'Standing calf stretch');
+  dropMove('warmupModules', 'wrists', 'Tiger claws');
+  // E3: cool-down Figure-4 → Pigeon stretch (per-side, front-knee load, reworded).
+  const fig = moduleMove('cooldownModules', 'hips-extra', 'Figure-4 glute stretch');
+  if (fig) {
+    fig.name = 'Pigeon stretch';
+    if (fig.dose && typeof fig.dose === 'object') fig.dose.unit = 'sec/side';
+    fig.loads = { knee: 1 };
+    fig.why = 'Deep hip and glute opener after impact — ease the front knee in, back off if it complains';
+  }
+  r.version = 19;
+  return r;
+}
+
+/*
+ * v4.6 -> v4.7 migration. Gated (version < 20), idempotent. Prose-only: re-stamp routine.structure
+ * (the generator DOCUMENTATION — frequency/selection/notes) from the seed so existing installs pick
+ * up the v20 wording describing the At gym / At home location toggle (the gym-only tag is no longer a
+ * priority slider). structure is docs, never user-edited, so copying it wholesale from the seed is
+ * safe. No move/tag/goal data changes — the gym-only tag stays; it's just driven by settings.atGym
+ * now, and settings (incl. atGym) are repaired separately in normalizeState, not by this migration.
+ */
+function migrateRoutineV20(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 20) return routine;
+  const r = deepClone(routine);
+  if (seed && seed.structure) r.structure = deepClone(seed.structure);
+  r.version = 20;
+  return r;
+}
+
+/*
+ * v4.7 -> v4.8 migration (readiness care promotion). Gated (version < 21), idempotent.
+ * Stamps `helps` (the LOAD_KEY regions a move rebuilds at low load) onto the pool moves
+ * by name, adds the wrist-forearm accessory family, inserts the two new wrist capacity
+ * moves from the seed (insertSeedMove no-ops if present; deleted-move tombstones are
+ * filtered after all migrations in normalizeState), and re-stamps structure prose.
+ */
+function migrateRoutineV21(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 21) return routine;
+  const r = deepClone(routine);
+  if (!Array.isArray(r.families)) r.families = [];
+  if (!r.families.some((f) => f && f.id === 'wrist-forearm')) {
+    r.families.push({ id: 'wrist-forearm', name: 'Wrist / forearm', phase: 'accessory' });
+  }
+  const HELPS = {
+    'Heel walks': ['shin'],
+    'Toe walks': ['shin', 'foot'],
+    'Bent-knee (soleus) calf raises': ['shin', 'foot'],
+    'Tibialis raises': ['shin', 'foot'],
+    'Nordic hamstring curl': ['knee'],
+    'Leg curl': ['knee'],
+    'Hip abduction (band walks or side-lying)': ['knee'],
+    'Dead bug': ['lumbar'],
+    'Side plank hip dips': ['lumbar'],
+    'Pallof press': ['lumbar'],
+    'Single-leg glute bridge': ['lumbar']
+  };
+  ((r.blocks && r.blocks.moves) || []).forEach((ex) => {
+    if (ex && HELPS[ex.name]) ex.helps = HELPS[ex.name].slice();
+  });
+  insertSeedMove(r, seed, 'Kneeling wrist rocks (loaded)', ['moves']);   // seed copies carry helps
+  insertSeedMove(r, seed, 'Wrist curls + reverse curls', ['moves']);
+  if (seed && seed.structure) r.structure = deepClone(seed.structure);
+  r.version = 21;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -1224,6 +1317,15 @@ function normalizeState(obj) {
   // v4.4 -> v4.5: Phase 7 daily practice engine — install blocks.dailyModules (no legacy block to
   // carry; the old daily stim was a hardcoded constant). Runs for any version < 18. See migrateRoutineV18.
   if (seed) routine = migrateRoutineV18(routine, seed);
+  // v4.5 -> v4.6: readiness overhaul data fixes — drop the retired joint-stress tags, give daily
+  // Tuck jumps full leg loads, retire two warm-up moves, rename Figure-4 → Pigeon. Version < 19.
+  if (seed) routine = migrateRoutineV19(routine, seed);
+  // v4.6 -> v4.7: re-stamp structure prose (At gym / At home location toggle replaces the gym-only
+  // slider). Prose-only, version < 20. See migrateRoutineV20.
+  if (seed) routine = migrateRoutineV20(routine, seed);
+  // v4.7 -> v4.8: readiness care promotion data — helps metadata on the pool, wrist-forearm
+  // family + two wrist capacity moves, structure prose. Version < 21. See migrateRoutineV21.
+  if (seed) routine = migrateRoutineV21(routine, seed);
   // Move-viewer tombstones: a move the user deleted must never be resurrected by a
   // migration or a re-inserted seed move — filter deleted names after all migrations.
   const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
@@ -1299,6 +1401,15 @@ function normalizeState(obj) {
   });
   Object.keys(tp).forEach((id) => { if (!validTag[id]) delete tp[id]; });
   merged.settings.tagPriority = tp;
+  // v4.7: at-gym / at-home is now a boolean toggle (settings.atGym), no longer the gym-only
+  // priority slider. If the STORED settings lack a boolean atGym, derive it ONE time from the
+  // stored gym-only priority: 1 → at home (false); anything else / missing → at gym (true). Read
+  // the STORED obj.settings (not merged — merged already carries freshState's default true, which
+  // would pre-empt the derivation) and storedTP (not the repaired tp, which carries the default-3
+  // fill). The stored gym-only entry is left in tagPriority (now ignored) — atGym owns it now.
+  if (typeof (obj.settings && obj.settings.atGym) !== 'boolean') {
+    merged.settings.atGym = !(storedTP['gym-only'] === 1);
+  }
   // v3.5/v3.7: superset bias — integer 0–30 (default 5). Missing / non-number → 5; clamp + int.
   merged.settings.supersetBias = typeof merged.settings.supersetBias === 'number'
     ? clamp(merged.settings.supersetBias | 0, 0, 30) : 5;
@@ -1328,9 +1439,8 @@ function normalizeState(obj) {
   // finish). Any unknown/garbage value snaps back to its default. Not in settings/routine.
   merged.sessionIntent = sessionIntent(merged);   // reads merged.sessionIntent; unknown → 'default'
   merged.readiness = normalizeReadiness(merged.readiness);
-  // v4.2 (Phase 4): persistent regionStatus survives reloads; repair any garbage (unknown
-  // region/light dropped, yellow sessionsLeft clamped 1..2, red stripped of sessionsLeft).
-  merged.regionStatus = normalizeRegionStatus(merged.regionStatus);
+  // v4.6: the v4.2 24h-feedback region-status map is retired — drop any stale persisted copy.
+  delete merged.regionStatus;
 
   if (legacy) {
     merged.intensity = migrateIntensity(obj.intensity || {}, routine);
@@ -1905,29 +2015,25 @@ function sessionIntent(st) {
 }
 // Per-load-key caps this session, from readiness regions + intent. Only capped keys are
 // present; value = the max allowed load for that key (a move with load > cap is out).
-//   region caution → 1 · region stop → 0 · back sensitive → lumbar 1 · arms caution →
-//   wrist & elbow 1 · intent 'upper' → impact/shin/knee/foot all 0 (a legs-off day).
+//   region light → 1 · region skip → 0 · back maps to lumbar · wrist light → wrist & elbow 1,
+//   wrist skip → wrist 0 but elbow stays 1 (most elbow load rides on hand support, don't zero
+//   it) · intent 'upper' → impact/shin/knee/foot all 0 (a legs-off day).
 // When two sources cap the same key, the more restrictive (min) wins. Pure given state.
 function readinessCaps(st) {
   const r = (st && st.readiness && typeof st.readiness === 'object') ? st.readiness : {};
   const caps = {};
   const cap = (key, v) => { caps[key] = (key in caps) ? Math.min(caps[key], v) : v; };
   const region = (val, key) => {
-    if (val === 'caution') cap(key, 1);
-    else if (val === 'stop') cap(key, 0);
+    if (val === 'light') cap(key, 1);
+    else if (val === 'skip') cap(key, 0);
   };
   region(r.shins, 'shin');
   region(r.knee, 'knee');
   region(r.foot, 'foot');
-  if (r.back === 'sensitive') cap('lumbar', 1);
-  if (r.arms === 'caution') { cap('wrist', 1); cap('elbow', 1); }
+  region(r.back, 'lumbar');
+  if (r.wrist === 'light') { cap('wrist', 1); cap('elbow', 1); }
+  else if (r.wrist === 'skip') { cap('wrist', 0); cap('elbow', 1); }
   if (sessionIntent(st) === 'upper') { cap('impact', 0); cap('shin', 0); cap('knee', 0); cap('foot', 0); }
-  // v4.2: a RED region (persistent 24h-feedback status) pauses all its load keys — cap each
-  // at 0. Composes with readiness caution/stop via the same min() helper. Yellow adds NO cap.
-  const rs = (st && st.regionStatus && typeof st.regionStatus === 'object') ? st.regionStatus : {};
-  Object.keys(rs).forEach((region) => {
-    if (rs[region] && rs[region].light === 'red') (REGION_KEYS[region] || []).forEach((k) => cap(k, 0));
-  });
   return caps;
 }
 // Does `move` respect every readiness cap (its load on each capped key ≤ the cap)? Pure.
@@ -1938,35 +2044,32 @@ function passesReadiness(move, caps) {
   }
   return true;
 }
-// v4.2: is `move` implicated by the current region status? True iff some yellow OR red region
-// carries a load ≥ 1 on any of its keys. (Red-implicated moves are already filtered out of
-// generation, but a red move can still be on screen mid-session, so dose-cut + pip suppression
-// treat yellow and red uniformly here.) Pure given (move, regionStatus).
-function moveImplicated(move, regionStatus) {
-  const rs = (regionStatus && typeof regionStatus === 'object') ? regionStatus : {};
-  const regions = Object.keys(rs);
-  for (let i = 0; i < regions.length; i++) {
-    const s = rs[regions[i]];
-    if (!s || (s.light !== 'yellow' && s.light !== 'red')) continue;
-    const keys = REGION_KEYS[regions[i]] || [];
-    for (let j = 0; j < keys.length; j++) {
-      if (moveLoad(move, keys[j]) >= 1) return true;
-    }
-  }
-  return false;
+/* --- v4.8: readiness care promotion --------------------------------------- *
+ * A region dialed to 'light' doesn't just shrink the session — it promotes the
+ * low-load moves that rebuild that region (a move's `helps` array, keyed by LOAD_KEY).
+ * Light only: at 'skip' the cap-0 filter already drops the helpers (they all carry
+ * load 1 on their own region), and skip means rest it. Soft ×boost in selectMoves,
+ * capped per region so a light day never turns into a rehab session; buildWarmup
+ * additionally pins the region's prep module.
+ */
+const READINESS_CARE_BOOST = 2;      // score multiplier for a promotable helper
+const READINESS_CARE_MAX = 2;        // max boosted picks per light region
+// readiness dial name -> the LOAD_KEY its helpers are tagged with
+const READINESS_REGION_LOADKEY = { shins: 'shin', knee: 'knee', foot: 'foot', back: 'lumbar', wrist: 'wrist' };
+// warm-up module id -> the light regions that pin it
+const READINESS_CARE_MODULES = { wrists: ['wrist'], ankles: ['shin', 'foot'] };
+// The LOAD_KEYs whose readiness dial is exactly 'light' today. Pure.
+function readinessLightKeys(st) {
+  const r = (st && st.readiness && typeof st.readiness === 'object') ? st.readiness : {};
+  const out = [];
+  Object.keys(READINESS_REGION_LOADKEY).forEach((dial) => {
+    if (r[dial] === 'light') out.push(READINESS_REGION_LOADKEY[dial]);
+  });
+  return out;
 }
-// v4.2: pick the ladder level to display for an implicated move — a ~20% volume cut snapped
-// DOWN to a real ladder step. Level 0 (base) is the floor. Otherwise target volume =
-// DOSE_CUT × (sets × amount) at `level`; walk down from level-1 and return the first (highest)
-// step at or under it; if none qualifies, step down one anyway (always ≥1 step). Ignores weight.
-function doseCutLevel(ladder, level) {
-  if (level === 0) return 0;
-  const vol = (e) => e.sets * e.amount;
-  const target = DOSE_CUT * vol(ladder[level]);
-  for (let l = level - 1; l >= 0; l--) {
-    if (vol(ladder[l]) <= target) return l;
-  }
-  return level - 1;
+// Does `move` declare it helps (rebuilds) the region behind LOAD_KEY `key`? Pure.
+function moveHelps(move, key) {
+  return !!(move && Array.isArray(move.helps) && move.helps.indexOf(key) >= 0);
 }
 // Effective move-count budget for the session: intent 'short' trims two moves (floor 3);
 // every other intent leaves settings.moves untouched. Pure given state.
@@ -1988,19 +2091,9 @@ function sessionBudgets(stateOrSettings) {
   let highFatigue = GENERATOR_BUDGETS.highFatigue;
   if (intent === 'recovery' || r.energy === 'low') highFatigue = Math.min(highFatigue, 1);
   let armSupport = GENERATOR_BUDGETS.armSupport;
-  if (r.arms === 'caution') armSupport = Math.min(armSupport, 1);
+  if (r.wrist !== undefined && r.wrist !== 'good') armSupport = Math.min(armSupport, 1);
   let lumbar = GENERATOR_BUDGETS.lumbar;
-  if (r.back === 'sensitive') lumbar = Math.min(lumbar, 1);
-  // v4.2: a YELLOW region eases its budget by one step (cumulative per region; floored at 0).
-  // shins/knee/foot → impact (a leg region loses a landing), back → lumbar, arms → armSupport.
-  // Budgets only ever tighten; a bare settings object (no regionStatus) is left unchanged.
-  const rs = (st.regionStatus && typeof st.regionStatus === 'object') ? st.regionStatus : {};
-  Object.keys(rs).forEach((region) => {
-    if (!rs[region] || rs[region].light !== 'yellow') return;
-    if (region === 'shins' || region === 'knee' || region === 'foot') impact = Math.max(0, impact - 1);
-    else if (region === 'back') lumbar = Math.max(0, lumbar - 1);
-    else if (region === 'arms') armSupport = Math.max(0, armSupport - 1);
-  });
+  if (r.back !== undefined && r.back !== 'good') lumbar = Math.min(lumbar, 1);
   return { impact: impact, highFatigue: highFatigue, armSupport: armSupport, lumbar: lumbar };
 }
 // Would adding `move` to a session whose running `totals` are as given bust any
@@ -2076,6 +2169,10 @@ const TAG_LEVEL_LABEL = { 1: 'Hard avoid', 2: 'Lower priority', 3: 'No effect', 
 // lock. Every other tag reads settings.tagPriority (default 3). Pure.
 function tagEffectivePriority(tag, settings, day) {
   if (!tag) return 3;
+  // v4.7: gym-only is no longer a slider — it's driven by the At gym / At home location toggle
+  // (settings.atGym). At gym → neutral (3, moves stay in the pool); At home → hard-exclude (1).
+  // settings.tagPriority['gym-only'] is ignored (kept but dead). Missing/true settings default to gym.
+  if (tag.id === 'gym-only') return (settings && settings.atGym === false) ? 1 : 3;
   if (tag.auto === 'day') {
     const isToday = (day === 'A' && tag.id === 'day-a') || (day === 'B' && tag.id === 'day-b');
     return isToday ? 4 : 2;
@@ -2216,7 +2313,7 @@ function selectMoves(st) {
   const day = currentDay(st.session);
   const settings = st.settings || {};
   // v4.1 (Phase 3): readiness/intent hard-filter caps — a move exceeding a capped load
-  // key (shins/knee/foot caution|stop, back sensitive, arms caution, intent 'upper') is
+  // key (shins/knee/foot/back/wrist light|skip, intent 'upper') is
   // out of today's pool, right alongside the disabled / tag-priority-1 exclusions.
   const caps = readinessCaps(st);
   const pool = [];
@@ -2235,12 +2332,16 @@ function selectMoves(st) {
   const count = effectiveMoveBudget(st);
 
   const scored = [];
+  // v4.8: readiness care promotion — regions at 'light' promote their low-load helpers.
+  const lightKeys = readinessLightKeys(st);
   pool.forEach((move, i) => {
     const base = scoreMove(move, goals);
     if (base <= 0) return;
     const last = lastCompletedIndex(move.name, log);
     const sessionsSince = last < 0 ? 6 : Math.min(log.length - last, 6);
-    scored.push({ move, i, section: move.section || 'floor', effective: base * (1 + 0.1 * sessionsSince) * tagMults[i] });
+    scored.push({ move, i, section: move.section || 'floor',
+      helpKeys: lightKeys.filter((k) => moveHelps(move, k)),
+      effective: base * (1 + 0.1 * sessionsSince) * tagMults[i] });
   });
 
   const remaining = scored.slice();
@@ -2254,6 +2355,7 @@ function selectMoves(st) {
   const budgets = sessionBudgets(st);   // v4.1: readiness/intent modifiers compose over the base
   const budgetTotals = { impact: 0, highFatigue: 0, armSupport: 0, lumbar: 0 };
   const famCount = {};
+  const careCount = {};                 // v4.8: promoted care picks so far, per light LOAD_KEY
   const activeSlots = activeSlotCount(count);
   // v3.2: superset members each cost half a move toward the budget (see sessionMoveCost),
   // so a supersetting session pulls in more actual moves. Cost is measured over the chosen
@@ -2270,6 +2372,35 @@ function selectMoves(st) {
   const biasOn = autoSuperset && bias > 0;
   const underBudget = () =>
     sessionMoveCost(chosen.slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset, st.routine) < count;
+  // Move a candidate (by `remaining` index) into `chosen`, updating every running total.
+  const take = (idx) => {
+    const pick = remaining.splice(idx, 1)[0];
+    sectionCount[pick.section] = (sectionCount[pick.section] || 0) + 1;
+    const pfam = moveFamilyId(pick.move);
+    if (pfam) famCount[pfam] = (famCount[pfam] || 0) + 1;
+    pick.helpKeys.forEach((hk) => { careCount[hk] = (careCount[hk] || 0) + 1; });
+    addToBudgetTotals(budgetTotals, pick.move);
+    chosen.push(pick);
+  };
+  // v4.8: guarantee ONE care pick per light region up front — the swap that makes a light
+  // day purposeful. A soft boost alone can't do this: honest low-score accessories (the
+  // wrist moves) never outbid the staples. Best helper by effective score; the same hard
+  // gates as the main loop (family caps, load budgets — readiness caps already filtered
+  // the pool) still apply, and chosen is re-sorted to pool order at the end so pre-picking
+  // never reorders the rendered session.
+  lightKeys.forEach((k) => {
+    if ((careCount[k] || 0) >= 1 || !underBudget()) return;
+    let best = -1, bestVal = -Infinity;
+    for (let j = 0; j < remaining.length; j++) {
+      const c = remaining[j];
+      if (c.helpKeys.indexOf(k) === -1) continue;
+      const fam = moveFamilyId(c.move);
+      if (fam && (famCount[fam] || 0) >= moveMaxPerFamily(st.routine, c.move)) continue;
+      if (bustsBudget(c.move, budgetTotals, budgets)) continue;
+      if (best === -1 || c.effective > bestVal || (c.effective === bestVal && c.i < remaining[best].i)) { bestVal = c.effective; best = j; }
+    }
+    if (best >= 0) take(best);
+  });
   while (underBudget() && remaining.length) {
     let best = -1, bestVal = -Infinity;
     for (let k = 0; k < remaining.length; k++) {
@@ -2281,16 +2412,14 @@ function selectMoves(st) {
       let val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
       if (biasOn && wouldSuperset(chosen, c, st.routine)) val *= (1 + 0.1 * bias);
       val *= coverageBoost(c.move, famCount, activeSlots);   // soft coverage nudge
+      // v4.8: a helper for a light region gets a soft boost until that region has
+      // READINESS_CARE_MAX promoted picks — swap in care, don't fill the session with it.
+      if (c.helpKeys.some((hk) => (careCount[hk] || 0) < READINESS_CARE_MAX)) val *= READINESS_CARE_BOOST;
       // Strictly-greater wins; exact ties fall to the earlier pool index (stable).
       if (best === -1 || val > bestVal || (val === bestVal && c.i < remaining[best].i)) { bestVal = val; best = k; }
     }
     if (best === -1) break;   // no eligible candidate remains (family caps/budgets) — terminate cleanly
-    const pick = remaining.splice(best, 1)[0];
-    sectionCount[pick.section] = (sectionCount[pick.section] || 0) + 1;
-    const pfam = moveFamilyId(pick.move);
-    if (pfam) famCount[pfam] = (famCount[pfam] || 0) + 1;
-    addToBudgetTotals(budgetTotals, pick.move);
-    chosen.push(pick);
+    take(best);
   }
 
   chosen.sort((a, b2) => a.i - b2.i);           // back to pool order for stable render
@@ -2340,7 +2469,7 @@ function warmupRotatePick(pool, R, n) {
  * Assemble the warm-up for `context` ('gym-impact'|'gym-lift'|'daily'). Pure given `st`.
  * Steps: choose which eligible modules are IN (by mode + pinned + rotation), pick which moves
  * each `pick: n` module shows (same rotation), drop moves whose loads exceed today's readiness
- * caps (potentiate dropped whole when back is 'sensitive'), drop any module emptied by gating.
+ * caps (potentiate dropped whole when back is light/skip), drop any module emptied by gating.
  * Output is a flat exercise list, each entry stamped `group` = module name and ordered
  * raise → care → mobilize → activate → potentiate (seed order within a role), so warmupGroups /
  * renderWarmupGroupCard, 'warmup:'+group checks, and per-group logging keep working unchanged.
@@ -2352,7 +2481,7 @@ function buildWarmup(st, context) {
   const caps = readinessCaps(st);
   const R = warmupRotationIndex(st);
   const isGym = context === 'gym-impact' || context === 'gym-lift';
-  const backSensitive = !!(st.readiness && st.readiness.back === 'sensitive');
+  const backEasy = !!(st.readiness && st.readiness.back && st.readiness.back !== 'good');
   const moduleIndex = {};
   all.forEach((m, i) => { if (m && m.id) moduleIndex[m.id] = i; });
   const eligible = all.filter((m) => m && warmupModuleEligible(m, context));
@@ -2363,6 +2492,16 @@ function buildWarmup(st, context) {
 
   // Pinned modules are always in (in every mode).
   eligible.forEach((m) => { if (warmupModulePinned(m, context)) add(m); });
+
+  // v4.8: a region at 'light' pins its prep module (wrists / ankles & feet) — a light
+  // day preps the tender region, not just avoids it. ('skip' does NOT pin: rest means rest.)
+  const lightKeys = readinessLightKeys(st);
+  if (lightKeys.length) {
+    eligible.forEach((m) => {
+      const regions = m && m.id && READINESS_CARE_MODULES[m.id];
+      if (regions && regions.some((k) => lightKeys.indexOf(k) >= 0)) add(m);
+    });
+  }
 
   if (mode === 'long') {
     eligible.forEach(add);                                   // every eligible module (potentiate still gated below)
@@ -2388,7 +2527,7 @@ function buildWarmup(st, context) {
   // then emit flat, ordered by role then module seed order, moves in module order.
   const prepared = [];
   chosen.forEach((m) => {
-    if (m.role === 'potentiate' && backSensitive) return;   // back sensitive drops potentiate entirely
+    if (m.role === 'potentiate' && backEasy) return;   // back light/skip drops potentiate entirely
     let moves = (m.moves || []).slice();
     if (typeof m.pick === 'number' && m.pick > 0 && m.pick < moves.length) {
       moves = warmupRotatePick(moves, R, m.pick);
@@ -2433,7 +2572,7 @@ function cooldownModules(routine) {
  * Modes: short = pinned only; standard = pinned + ONE rotating non-pinned flex/care module + all
  * eligible downshift modules; long = every eligible module. Per chosen module: apply pick-n
  * rotation, then drop moves whose loads exceed readiness caps (module emptied by gating falls
- * out). No back-sensitive special case (unlike the warm-up's potentiate). Output is a flat list
+ * out). No back-easy special case (unlike the warm-up's potentiate). Output is a flat list
  * ordered flex → care → downshift (seed order within a role), each move stamped `group` = module
  * name so rendering stays per-move cards keyed by move name.
  */
@@ -2505,13 +2644,44 @@ function dailyModules(routine) {
     ? routine.blocks.dailyModules : [];
 }
 /*
+ * v4.7: the ONE goal-weight rule the Daily tab honours (buildDaily's only tie to goal weights —
+ * moves-count, supersets, tag priorities, families, budgets etc. do NOT apply to the daily block).
+ * A daily move is dropped ONLY when the athlete has switched off every training goal it serves:
+ * it names ≥1 TRAINING goal, ALL of those training goals are at weight 0, and it carries NO care
+ * goal. A care goal always keeps a move in (care work is never turned off); a move with no training
+ * goals at all is also kept. Goal kind/weight come from routine.goals. Pure given (move, routine).
+ * With the current seed: aerial=0 drops the handstand touch, shins=0 drops the tibialis raises, and
+ * Tuck jumps always stay (they carry the care goal "recovery"), even at flip=0.
+ */
+function dailyMovePassesGoals(move, routine) {
+  const ids = (move && Array.isArray(move.goals)) ? move.goals : [];
+  if (!ids.length) return true;
+  const byId = {};
+  ((routine && routine.goals) || []).forEach((g) => { if (g && g.id) byId[g.id] = g; });
+  let hasTraining = false, anyTrainingActive = false;
+  for (let i = 0; i < ids.length; i++) {
+    const g = byId[ids[i]];
+    if (!g) continue;
+    if (g.kind === 'care') return true;                       // a care goal always keeps a move in
+    if (g.kind === 'training') {
+      hasTraining = true;
+      if ((typeof g.weight === 'number' ? g.weight : 0) > 0) anyTrainingActive = true;
+    }
+  }
+  if (!hasTraining) return true;                              // no training goals to switch off
+  return anyTrainingActive;                                   // keep only while some training goal is on
+}
+/*
  * Assemble the Daily-tab practice block (always context 'daily'). Pure given `st`.
  * Modes: short = pinned only (the jump stim + shin armor); standard AND long = all eligible
  * modules (they are identical for the daily block — only 3 modules, no rotating slot — but both
  * modes are kept so the shared header toggle cycles uniformly with the warm-up / cool-down). Each
  * chosen module: pick-n rotation (for generality; the seed has no picks), then readiness gating,
- * dropping any module emptied by gating. Output is flat, ordered stim → skill → armor (seed order
- * within a role), each move stamped `group` = module name.
+ * then the v4.7 goal-weight filter (dailyMovePassesGoals — drop a move only when every training
+ * goal it serves is switched off, care goals always keep it), dropping any module emptied by either.
+ * Output is flat, ordered stim → skill → armor (seed order within a role), each move stamped
+ * `group` = module name. This goal filter is the ONLY goal-weight input to the daily block: the
+ * moves-count, superset, weekly-classes, family/budget, and tag-priority machinery do NOT apply here.
  */
 function buildDaily(st) {
   const context = 'daily';
@@ -2538,7 +2708,8 @@ function buildDaily(st) {
       moves = warmupRotatePick(moves, R, m.pick);
     }
     moves = moves.filter((mv) => passesReadiness(mv, caps));      // drop moves whose loads exceed caps
-    if (!moves.length) return;                                    // module emptied by gating falls out
+    moves = moves.filter((mv) => dailyMovePassesGoals(mv, st.routine)); // v4.7: drop moves whose only training goals are all weight 0 (see dailyMovePassesGoals)
+    if (!moves.length) return;                                    // module emptied by gating (or the goal filter) falls out
     prepared.push({ role: m.role, name: m.name, mi: (m.id in moduleIndex) ? moduleIndex[m.id] : 999, moves });
   });
 
@@ -2790,17 +2961,12 @@ function currentLevel(ex) {
 function effectiveDose(ex) {
   const d = ex.dose;
   const level = currentLevel(ex);
-  // v4.2: when a yellow/red region implicates this move, ease the dose ~20% down the ladder.
-  // Reduced doses log automatically (finishSession logs effectiveDose). Base is always the floor.
-  const reduced = moveImplicated(ex, (state && state.regionStatus) || {});
-  if (!level && !reduced) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
+  if (!level) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
   const ladder = progressionLadder(ex);
-  const clamped = clamp(level, 0, ladder.length - 1);
-  const useLevel = reduced ? doseCutLevel(ladder, clamped) : clamped;
+  const useLevel = clamp(level, 0, ladder.length - 1);
   const entry = ladder[useLevel];
   const out = { sets: entry.sets, amount: entry.amount, unit: d.unit, weight: entry.weight };
   if (useLevel > 0) out.overridden = true;
-  if (reduced) out.reduced = true;
   return out;
 }
 
@@ -2808,10 +2974,6 @@ function effectiveDose(ex) {
 function formatDose(eff) {
   return eff.sets + ' × ' + eff.amount + ' ' + eff.unit +
     (eff.weight != null ? ' @ ' + eff.weight + ' lb' : '');
-}
-// v4.2: subtle "· eased" tag appended after a reduced (region-implicated) dose line.
-function easedTag(eff) {
-  return (eff && eff.reduced) ? ' <span class="dose-eased">· eased</span>' : '';
 }
 
 // Move up (dir +1 = harder) or down the ladder; level 0 clears the override.
@@ -2979,6 +3141,7 @@ function renderAdjustPanel() {
       renderSettingSlider('moves', 'Number of moves') +
       renderWeeklyClassesField() +
       renderTagPriorityFields() +
+      renderAtGymField() +
       renderSupersetBiasField() +
       '<div class="adjust-goals-head">Goal weights</div>' +
       renderGoalWeightSliders() +
@@ -3004,74 +3167,10 @@ function readinessSummary() {
   if (r.knee !== 'good') out.push('knee ' + r.knee);
   if (r.foot !== 'good') out.push('foot ' + r.foot);
   if (r.back !== 'good') out.push('back ' + r.back);
-  if (r.arms !== 'good') out.push('arms ' + r.arms);
+  if (r.wrist !== 'good') out.push('wrist ' + r.wrist);
   if (r.energy !== 'normal') out.push(r.energy + ' energy');
   if (r.classSoon) out.push('class < 24h');
   return out;
-}
-/* --- v4.2 (Phase 4): 24-hour green/yellow/red feedback loop ---------------- */
-// The log entry the "how did that settle?" prompt should ask about, or null. Only ever the
-// LAST entry, and only when it is un-answered (no feedback / feedbackSkipped) and ≥12 h old.
-// Date.now() here is a UI gate, not the generator — deterministic selection never reads it.
-function feedbackPromptEntry() {
-  const log = (state && state.log) || [];
-  if (!log.length) return null;
-  const e = log[log.length - 1];
-  if (!e || e.feedback || e.feedbackSkipped || !e.date) return null;
-  if (Date.now() - Date.parse(e.date) < FEEDBACK_DELAY_MS) return null;
-  return e;
-}
-// The 24h prompt card. Step 1 = three lights; tapping Yellow/Red opens step 2 = a region row.
-function renderFeedbackCard(entry) {
-  // A pick only opens the region step for the entry it was made on. If the athlete left the
-  // step open, finished ANOTHER session, and this prompt is for the newer entry, the stale
-  // pick must not skip its light choice (or it would stamp a judgment they never made).
-  const pick = (ui.feedbackFor === entry.session) ? ui.feedbackPick : null;
-  const when = 'Day ' + escapeHtml(entry.day || '?') + ' · ' + escapeHtml(new Date(entry.date).toLocaleDateString());
-  let h = '<div class="feedback-card">' +
-    '<div class="feedback-head">' +
-      '<span class="feedback-title">How did that session settle?</span>' +
-      '<button class="feedback-x" data-action="feedback-skip" aria-label="Dismiss">✕</button>' +
-    '</div>' +
-    '<div class="feedback-when">' + when + '</div>';
-  if (!pick) {
-    h += '<div class="feedback-btns">' +
-      '<button class="feedback-btn fb-green" data-action="feedback-light" data-light="green">Felt fine</button>' +
-      '<button class="feedback-btn fb-yellow" data-action="feedback-light" data-light="yellow">A bit stirred up</button>' +
-      '<button class="feedback-btn fb-red" data-action="feedback-light" data-light="red">Something’s wrong</button>' +
-      '</div>';
-  } else {
-    const regions = [['shins', 'Shins'], ['knee', 'Knee'], ['foot', 'Foot'], ['back', 'Back'], ['arms', 'Arms']];
-    h += '<div class="feedback-region-label">Which region?</div>' +
-      '<div class="feedback-btns feedback-regions">' + regions.map((rr) =>
-        '<button class="feedback-btn fb-' + pick + '" data-action="feedback-region" data-region="' + rr[0] + '">' +
-        escapeHtml(rr[1]) + '</button>').join('') + '</div>';
-    if (pick === 'red') {
-      h += '<p class="muted feedback-note">Red pauses that region’s work until you clear it in Settings. ' +
-        'Persistent, worsening, or neurological symptoms → clinician.</p>';
-    }
-    h += '<div class="row"><button class="btn small ghost" data-action="feedback-cancel">Cancel</button></div>';
-  }
-  return h + '</div>';
-}
-// Compact "Settling: …" strip + (when any region red) a clinician notice. Gym tab, live only.
-function renderRegionStatusStrip() {
-  const rs = state.regionStatus || {};
-  const regions = Object.keys(rs);
-  if (!regions.length) return '';
-  const items = regions.map((r) => {
-    const s = rs[r];
-    if (s.light === 'red') return '<span class="region-chip region-chip-red">' + escapeHtml(r + ' red — cleared in Settings') + '</span>';
-    const n = s.sessionsLeft;
-    return '<span class="region-chip region-chip-yellow">' +
-      escapeHtml(r + ' yellow · ' + n + ' session' + (n === 1 ? '' : 's') + ' left') + '</span>';
-  });
-  let h = '<div class="region-strip"><span class="region-strip-label">Settling:</span> ' + items.join(' ') + '</div>';
-  if (regions.some((r) => rs[r].light === 'red')) {
-    h += '<div class="notice region-notice">Red pauses that region’s work until you clear it in Settings. ' +
-      'Persistent, worsening, or neurological symptoms → clinician.</div>';
-  }
-  return h;
 }
 
 // One segmented row: a label + a group of one-tap buttons that set `region` to a level.
@@ -3095,12 +3194,12 @@ function renderReadinessPanel() {
     '</span><span class="adjust-caret">' + (open ? '▾' : '▸') + '</span></button>';
   if (open) {
     h += '<div class="adjust-body">';
-    const tri = [{ v: 'good', label: 'Good' }, { v: 'caution', label: 'Caution' }, { v: 'stop', label: 'Stop' }];
+    const tri = [{ v: 'good', label: 'Good' }, { v: 'light', label: 'Light' }, { v: 'skip', label: 'Skip' }];
     h += renderSegRow('Shins', 'shins', r.shins, tri);
     h += renderSegRow('Knee', 'knee', r.knee, tri);
     h += renderSegRow('Foot', 'foot', r.foot, tri);
-    h += renderSegRow('Back', 'back', r.back, [{ v: 'good', label: 'Good' }, { v: 'sensitive', label: 'Sensitive' }]);
-    h += renderSegRow('Arms', 'arms', r.arms, [{ v: 'good', label: 'Good' }, { v: 'caution', label: 'Caution' }]);
+    h += renderSegRow('Back', 'back', r.back, tri);
+    h += renderSegRow('Wrist', 'wrist', r.wrist, tri);
     h += renderSegRow('Energy', 'energy', r.energy, [{ v: 'low', label: 'Low' }, { v: 'normal', label: 'Normal' }, { v: 'high', label: 'High' }]);
     // classSoon: a two-segment No/Yes toggle (data-val 0/1), styled like the rows above.
     h += '<div class="seg-row"><span class="seg-label">Class within 24 h</span><span class="seg-btns">' +
@@ -3178,21 +3277,12 @@ function renderToday(build) {
   renderedExercises = [];
   const preview = inPreview();
   let html = renderPreviewBar(build);
-  // v4.2: the 24h "how did that settle?" prompt sits above everything else — live only, and
-  // not while the finish sheet is up. feedbackPromptEntry gates on the ≥12 h delay.
-  if (!preview && !ui.finishing) {
-    const fbEntry = feedbackPromptEntry();
-    if (fbEntry) html += renderFeedbackCard(fbEntry);
-  }
   // Suggestions (incl. swap chips) are interactive — hide them while previewing.
   if (!preview) html += renderSuggestions(build);
   // v3.4: collapsible "Adjust session" — the same sliders/toggles as Settings, live in
   // the Gym tab so tuning immediately re-generates the session below. Hidden in preview.
   if (!preview) html += renderAdjustPanel();
-  // v4.2: compact region-status strip (+ clinician notice when any region is red), above the
-  // readiness panel. Hidden in preview (persistent status still applies to preview generation).
-  if (!preview) html += renderRegionStatusStrip();
-  // v4.1: collapsible "Readiness check-in" — per-region caution/stop + session intent that
+  // v4.1: collapsible "Readiness check-in" — per-region good/light/skip + session intent that
   // hard-filter/tighten today's session. Hidden in preview (previews are neutral by design).
   if (!preview) html += renderReadinessPanel();
 
@@ -3310,7 +3400,7 @@ function renderWarmupGroupCard(card, idx) {
     const meff = effectiveDose(m);
     const over = !preview && currentLevel(m) > 0;
     return '<li class="wu-move">' + escapeHtml(m.name) + ' — ' +
-      escapeHtml(formatDose(meff)) + tempo + easedTag(meff) +
+      escapeHtml(formatDose(meff)) + tempo +
       (over ? ' <span class="mod">modified</span>' : '') + '</li>';
   }).join('');
   // Moves with a real ladder (more than the base step) get progression controls behind expand.
@@ -3500,7 +3590,7 @@ function renderSupersetCard(card, idx) {
     return '<li class="ss-move">' +
       '<span class="ss-move-name">' + escapeHtml(ex.name) +
         (over ? ' <span class="mod">modified</span>' : '') + '</span>' +
-      '<span class="ss-move-dose">' + escapeHtml(formatDose(meff)) + easedTag(meff) + '</span>' +
+      '<span class="ss-move-dose">' + escapeHtml(formatDose(meff)) + '</span>' +
       '</li>';
   }).join('');
   const mainAttrs = preview ? '' : ' data-action="expand" data-idx="' + idx + '"';
@@ -3581,7 +3671,7 @@ function renderCard(ex, idx, blockKey) {
           '<div class="chips">' + chips + '</div>' +
           '<div class="card-name">' + escapeHtml(ex.name) +
             (overridden ? ' <span class="mod">modified</span>' : '') + '</div>' +
-          '<div class="dose">' + escapeHtml(formatDose(eff)) + easedTag(eff) + '</div>' +
+          '<div class="dose">' + escapeHtml(formatDose(eff)) + '</div>' +
           renderSetCircles(ex, idx, blockKey, eff) +
           renderRestClock(ex, blockKey, eff) +
         '</div>' +
@@ -3630,8 +3720,7 @@ function renderProgression(ex, idx, memberIdx) {
   const level = clamp(currentLevel(ex), 0, ladder.length - 1);
   const atTop = level >= ladder.length - 1;
   const atBottom = level <= 0;
-  // v4.2: suppress the ready-pip (not the manual ▲ button) while a yellow/red region eases this move.
-  const ready = !moveImplicated(ex, state.regionStatus || {}) && progressionReady(ex.name, effectiveDose(ex), state.log || []);
+  const ready = progressionReady(ex.name, effectiveDose(ex), state.log || []);
   const upReady = ready && !atTop;
   // On a superset card the buttons carry the member index so the shared prog/reset
   // handlers resolve the member off the card (members aren't in renderedExercises).
@@ -3694,6 +3783,13 @@ function renderFinish() {
 function renderDaily() {
   renderedExercises = [];
   let html = '';
+
+  // v4.7: the same shared Readiness check-in + Adjust-session panels the Gym tab shows. Readiness
+  // gates buildWarmup/buildDaily/buildCooldown (readinessCaps), and Adjust's goal-weight sliders now
+  // feed buildDaily's goal filter (dailyMovePassesGoals); their handlers call render(), which re-runs
+  // this daily builder live. Panels are collapsed by default (bodies only render when expanded).
+  html += renderReadinessPanel();
+  html += renderAdjustPanel();
 
   // Warm-up — same grouped-card rendering / check-off as the Gym view. v4.3: the Daily tab uses
   // the 'daily' context (pinned care + posture + core; standard/long add a rotating slot). v4.5:
@@ -4020,7 +4116,8 @@ function renderGoalWeightSliders() {
 // 1 hard-avoids the move, 3 is neutral, 5 boosts it — the label shows the current
 // level's meaning. data-tag carries the tag id to the shared onChange handler.
 function renderTagPriorityFields() {
-  const tags = ((state.routine && state.routine.tags) || []).filter((t) => t && t.id && !t.auto);
+  // v4.7: gym-only is excluded — it's the At gym / At home toggle (renderAtGymField), not a slider.
+  const tags = ((state.routine && state.routine.tags) || []).filter((t) => t && t.id && !t.auto && t.id !== 'gym-only');
   if (!tags.length) return '';
   return tags.map((t) => {
     const raw = state.settings.tagPriority && state.settings.tagPriority[t.id];
@@ -4032,6 +4129,20 @@ function renderTagPriorityFields() {
         'min="1" max="5" step="1" value="' + val + '">' +
     '</div>';
   }).join('');
+}
+
+// v4.7: the "At gym / At home" location toggle. Replaces the retired gym-only priority slider.
+// "At gym" (default) leaves equipment (gym-only) moves in the pool; "At home" hard-excludes them.
+// A single button cycles the two states (data-action="toggle-at-gym"), matching the .wu-mode
+// length cyclers; it reads/writes state.settings.atGym and re-renders (see the click dispatcher).
+function renderAtGymField() {
+  const atGym = state.settings.atGym !== false;
+  const label = atGym ? 'At gym' : 'At home';
+  return '<div class="field toggle">' +
+    '<label>Training location</label>' +
+    '<button class="btn small ghost wu-mode" data-action="toggle-at-gym" ' +
+      'aria-label="Training location: ' + label + ' (tap to change)">' + escapeHtml(label) + '</button>' +
+    '</div>';
 }
 
 // Auto-superset toggle.
@@ -4068,31 +4179,6 @@ function renderWeeklyClassesField() {
 
 /* --- Settings view -------------------------------------------------------- */
 
-// v4.2: Settings "Region status" block — one row per active region with a per-row Clear
-// (the only way to clear a red region). Rendered only when at least one region is active.
-function renderRegionStatusSettings() {
-  const rs = state.regionStatus || {};
-  const regions = Object.keys(rs);
-  if (!regions.length) return '';
-  const label = { shins: 'Shins', knee: 'Knee', foot: 'Foot', back: 'Back', arms: 'Arms' };
-  let h = '<section class="panel"><h3>Region status</h3>';
-  regions.forEach((r) => {
-    const s = rs[r];
-    const desc = s.light === 'red' ? 'red' :
-      'yellow · ' + s.sessionsLeft + ' session' + (s.sessionsLeft === 1 ? '' : 's') + ' left';
-    h += '<div class="region-row">' +
-      '<span class="region-row-label">' + escapeHtml(label[r] || r) + '</span>' +
-      '<span class="region-row-light region-light-' + escapeHtml(s.light) + '">' + escapeHtml(desc) + '</span>' +
-      '<button class="btn small ghost" data-action="region-clear" data-region="' + escapeHtml(r) + '">Clear</button>' +
-      '</div>';
-  });
-  h += '<p class="muted">Set by the 24-hour "how did that settle?" check-in. Yellow eases the ' +
-    'region and clears itself over a couple of sessions (or with a green check-in); red pauses it ' +
-    'until cleared here. This tracks how a session settled — it doesn’t assess injuries; ' +
-    'persistent, worsening, or neurological symptoms → clinician.</p>';
-  return h + '</section>';
-}
-
 function renderSettings() {
   let html = '<div class="settings">';
 
@@ -4102,18 +4188,17 @@ function renderSettings() {
     renderSettingSlider('moves', 'Number of moves') +
     renderWeeklyClassesField() +
     renderTagPriorityFields() +
+    renderAtGymField() +
     renderAutoSupersetField() +
     renderSupersetBiasField() +
     '<p class="muted">Each tag slider tunes how its moves are picked: 1 hard-avoids them, ' +
-      '3 is neutral, 5 favours them (e.g. drop joint-stress: legs to 1 to spare recovering ' +
-      'knees/ankles). Day A/B are automatic — the current day is softly preferred, not locked. ' +
+      '3 is neutral, 5 favours them. Training location toggles between At gym and At home — At home ' +
+      'hard-excludes the gym-only (equipment) moves for a bodyweight-on-a-mat session. ' +
+      'Day A/B are automatic — the current day is softly preferred, not locked. ' +
       'Auto superset groups same-muscle-free Floor moves into supersets — one card, alternate ' +
       'the moves, rest after each round. Higher superset bias makes the generator prefer moves ' +
       'that pair into supersets; it only applies while Auto superset is on.</p>' +
     '</section>';
-
-  // v4.2: region status from the 24h feedback loop (only when any region is active).
-  html += renderRegionStatusSettings();
 
   // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
   // are always on (they live in the static warm-up / cool-down) and get no slider.
@@ -4423,6 +4508,9 @@ function applyCoachTool(name, args, trial) {
     }
     case 'set_tag_priority': {
       if (!args.tagId) return err('set_tag_priority: "tagId" is required');
+      // v4.7: gym-only is no longer a priority — it's the At gym / At home location toggle, which
+      // only the athlete controls. Reject rather than silently mapping it.
+      if (args.tagId === 'gym-only') return err('set_tag_priority: "gym-only" is controlled by the At gym / At home location toggle in Settings (athlete-set) — you cannot change it.');
       const tag = (trial.routine.tags || []).find((t) => t && t.id === args.tagId && !t.auto);
       if (!tag) return err('set_tag_priority: no editable tag "' + args.tagId + '"');
       if (typeof args.priority !== 'number' || !isFinite(args.priority)) return err('set_tag_priority: "priority" must be a number 1-5');
@@ -4471,27 +4559,22 @@ function coachSettingsContext() {
   const training = (state.routine.goals || []).filter((g) => g && g.kind === 'training')
     .map((g) => g.id + '=' + (typeof g.weight === 'number' ? g.weight : 0));
   const tp = state.settings.tagPriority || {};
-  const tags = ((state.routine.tags || []).filter((t) => t && t.id && !t.auto))
+  // v4.7: gym-only is excluded from the priority list — it's the At gym / At home location toggle.
+  const tags = ((state.routine.tags || []).filter((t) => t && t.id && !t.auto && t.id !== 'gym-only'))
     .map((t) => t.id + '=' + (typeof tp[t.id] === 'number' ? tp[t.id] : 3));
   // v4.1: readiness + intent are per-session, athlete-only inputs — surface the current
   // (non-default) values compactly so the Coach knows what filtered today's session.
   const rParts = readinessSummary();
   const intent = sessionIntent(state);
-  // v4.2: persistent region status from the 24h feedback loop (athlete-only; non-empty only).
-  const rs = state.regionStatus || {};
-  const rsKeys = Object.keys(rs);
-  const rsLine = rsKeys.length ? '\nRegion status (24h feedback): ' + rsKeys.map((r) => {
-    const s = rs[r];
-    return r + ' ' + s.light + (s.light === 'yellow'
-      ? ' (' + s.sessionsLeft + ' session' + (s.sessionsLeft === 1 ? '' : 's') + ' left)' : '');
-  }).join(', ') : '';
   return 'Training goal weights (0-10): ' + (training.join(', ') || '(none)') + '\n' +
     'Tag priorities (1 avoid … 3 neutral … 5 favour): ' + (tags.join(', ') || '(none)') + '\n' +
+    'Training location: ' + (state.settings.atGym === false
+      ? 'at home (gym-only / equipment moves excluded)' : 'at gym (all moves available)') + '\n' +
     'Superset bias: ' + (state.settings.supersetBias != null ? state.settings.supersetBias : 5) +
     ' · moves/session: ' + state.settings.moves +
     ' · gymnastics classes this week: ' + weeklyClasses(state.settings) + '\n' +
     'Readiness (today, athlete-set): ' + (rParts.length ? rParts.join(', ') : 'all good') + '\n' +
-    'Session intent: ' + (intent === 'default' ? 'default' : INTENT_LABELS[intent]) + rsLine;
+    'Session intent: ' + (intent === 'default' ? 'default' : INTENT_LABELS[intent]);
 }
 
 function coachSystemPrompt() {
@@ -4531,12 +4614,14 @@ function coachSystemPrompt() {
     '- The session planner now enforces family caps (≤1 move per family), load budgets (Σ impact scaled by',
     '  weekly gymnastics classes, plus caps on fatigue≥4 / arm-support / lumbar≥2 moves) and coverage slots.',
     '  So structure/diversity is handled by the generator — do not try to fix it purely by nudging scores.',
-    '- A pre-session readiness check-in (per-region good/caution/stop, back sensitive, arms caution, energy,',
-    '  class-soon) and a session intent (gym prep, recovery, low-impact, short, upper) further filter and',
-    '  budget today\'s session — the athlete sets these on the Gym tab; you cannot and must not set them.',
-    '- A 24-hour traffic-light feedback loop (green/yellow/red per region) parks a persistent region status',
-    '  that eases (yellow) or pauses (red) that region\'s work. Like readiness, this is an athlete-only input',
-    '  you can SEE (below) but never set or clear — advise, do not attempt to change it via tools.',
+    '- A pre-session readiness check-in sets a per-region session DIAL — shins/knee/foot/back/wrist each at',
+    '  good / light / skip ("go normal" / "go light on this region today" / "skip loading this region today") —',
+    '  plus energy and class-soon, and a session intent (gym prep, recovery, low-impact, short, upper). These',
+    '  filter and budget TODAY\'s session only; the athlete sets them on the Gym tab and you cannot set them.',
+    '  These are today\'s dials, NOT injuries or chronic conditions — do not treat a light/skip region as a',
+    '  medical flag, do not be alarmed by it, and do not over-restrict future planning because of it.',
+    '- The athlete also picks a training LOCATION (At gym / At home) that includes or excludes the',
+    '  gym-only (equipment) moves. That toggle is theirs alone — you cannot set gym-only\'s priority.',
     '',
     'CURRENT GENERATION SETTINGS:',
     coachSettingsContext(),
@@ -4820,17 +4905,12 @@ function onClick(e) {
     case 'cooldown-mode': cycleCooldownMode(); break;   // v4.4 cool-down length toggle
     case 'daily-mode': cycleDailyMode(); break;   // v4.5 daily-practice length toggle
     case 'toggle-adjust': ui.adjustOpen = !ui.adjustOpen; render(); break;   // v3.4 Gym panel
+    case 'toggle-at-gym': state.settings.atGym = !(state.settings.atGym !== false); saveState(); render(); break;   // v4.7 At gym / At home
     case 'toggle-readiness': ui.readinessOpen = !ui.readinessOpen; render(); break;   // v4.1 check-in panel
     case 'readiness-set': setReadiness(el.dataset.region, el.dataset.level); break;    // v4.1 one region
     case 'readiness-classsoon': setClassSoon(el.dataset.val === '1'); break;
     case 'readiness-intent': setSessionIntent(el.dataset.intent); break;
     case 'readiness-reset': resetReadiness(); break;
-    // v4.2: 24h feedback loop. Green applies immediately; yellow/red open the region step.
-    case 'feedback-light': feedbackLight(el.dataset.light); break;
-    case 'feedback-region': applyFeedback(ui.feedbackPick, el.dataset.region); break;
-    case 'feedback-cancel': ui.feedbackPick = null; ui.feedbackFor = null; render(); break;
-    case 'feedback-skip': feedbackSkip(); break;
-    case 'region-clear': clearRegionStatus(el.dataset.region); break;   // v4.2 Settings row
     case 'toggle-block': toggleBlock(el.dataset.block); break;               // v3.6 collapse a session block
     case 'export': exportState(); break;
     case 'clear': clearData(); break;
@@ -5107,59 +5187,6 @@ function cycleDailyMode() {
   render();
 }
 
-/* --- v4.2 (Phase 4): 24-hour feedback loop mutations ----------------------- */
-// Green answers immediately; yellow/red open a transient region step (re-renders the card).
-function feedbackLight(light) {
-  if (light === 'green') { applyFeedback('green', null); return; }
-  if (light === 'yellow' || light === 'red') {
-    const entry = feedbackPromptEntry();
-    if (!entry) return;
-    ui.feedbackPick = light;
-    ui.feedbackFor = entry.session;   // pin the pick to this entry (see renderFeedbackCard)
-    render();
-  }
-}
-// Stamp the light (and region) on the prompted log entry, then update persistent regionStatus:
-//   green → clear every yellow region (red persists; only Settings clears red);
-//   yellow(region) → park it yellow for YELLOW_SESSIONS unless it is already red (keep red);
-//   red(region) → pause it (light 'red', no sessionsLeft).
-function applyFeedback(light, region) {
-  const entry = feedbackPromptEntry();
-  if (!entry) { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
-  if (light !== 'green' && !REGION_KEYS[region]) { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
-  if (!state.regionStatus || typeof state.regionStatus !== 'object') state.regionStatus = {};
-  const rs = state.regionStatus;
-  if (light === 'green') {
-    entry.feedback = { light: 'green' };
-    Object.keys(rs).forEach((r) => { if (rs[r] && rs[r].light === 'yellow') delete rs[r]; });
-  } else if (light === 'yellow') {
-    entry.feedback = { light: 'yellow', region: region };
-    if (!(rs[region] && rs[region].light === 'red')) rs[region] = { light: 'yellow', sessionsLeft: YELLOW_SESSIONS };
-  } else if (light === 'red') {
-    entry.feedback = { light: 'red', region: region };
-    rs[region] = { light: 'red' };
-  } else { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
-  ui.feedbackPick = null;
-  ui.feedbackFor = null;
-  saveState();
-  render();
-}
-// Dismiss (✕): mark the entry answered-but-skipped so it never re-prompts (counts as benign).
-function feedbackSkip() {
-  const entry = feedbackPromptEntry();
-  if (entry) entry.feedbackSkipped = true;
-  ui.feedbackPick = null;
-  ui.feedbackFor = null;
-  saveState();
-  render();
-}
-// Settings "Clear" — remove a region entry (the only way to clear a red region).
-function clearRegionStatus(region) {
-  if (state.regionStatus && state.regionStatus[region]) delete state.regionStatus[region];
-  saveState();
-  render();
-}
-
 // Finish: log the session (Phase 2), advance index, clear checks.
 function finishSession(note) {
   const built = buildSession(state);
@@ -5204,52 +5231,10 @@ function finishSession(note) {
     });
   });
   if (note) entry.note = note;
-  // v4.1: stamp non-default readiness/intent so the volume nudge (and the Phase 4
-  // feedback loop) can tell a deliberately modified session from a normal one.
+  // v4.1: stamp non-default readiness/intent so the volume nudge can tell a deliberately
+  // modified (lighter/filtered) session from a normal one.
   if (state.sessionIntent && state.sessionIntent !== 'default') entry.intent = state.sessionIntent;
   if (!readinessIsDefault(state.readiness)) entry.readiness = normalizeReadiness(state.readiness);
-
-  // v4.2: snapshot the active region status onto the entry (region → light), then decay yellow
-  // regions the finished session ACTUALLY loaded — a done, non-warmup move carrying that region's
-  // key ≥ 1. (A shins-yellow 'upper' day that never touched shins must not burn a session.)
-  // regionStatus is persistent, so it is NOT reset with the per-session state below.
-  const rs = (state.regionStatus && typeof state.regionStatus === 'object') ? state.regionStatus : {};
-  const activeRegions = Object.keys(rs);
-  if (activeRegions.length) {
-    const snap = {};
-    activeRegions.forEach((region) => { snap[region] = rs[region].light; });
-    entry.regionStatus = snap;
-    const loaded = {};   // region → did some done move load it this session?
-    const markLoaded = (ex) => activeRegions.forEach((region) => {
-      if ((REGION_KEYS[region] || []).some((k) => moveLoad(ex, k) >= 1)) loaded[region] = true;
-    });
-    built.blocks.forEach((bl) => {
-      // v4.4: cool-down loads exist ONLY for readiness gating (Child's pose knee:1) — they must
-      // not count toward region-status decay or recency. Skip the whole cool-down block.
-      if (bl.key === 'cooldown') return;
-      if (bl.key === 'warmup') {
-        // v4.3: warm-up moves that carry `loads` count toward region status — a session with
-        // done pogos loaded the shins. A warm-up move is "done" when its group card is checked;
-        // loadless prep contributes nothing regardless (no load keys to match).
-        warmupGroups(bl.exercises).forEach((item) => {
-          const checkName = item.kind === 'group' ? item.card.name : item.ex.name;
-          if (!state.checks[checkName]) return;
-          (item.kind === 'group' ? item.moves : [item.ex]).forEach(markLoaded);
-        });
-        return;
-      }
-      bl.exercises.forEach((ex) => {
-        if (!state.checks[ex.name]) return;
-        markLoaded(ex);
-      });
-    });
-    activeRegions.forEach((region) => {
-      const s = rs[region];
-      if (s.light !== 'yellow' || !loaded[region]) return;   // red never decays; unloaded regions untouched
-      s.sessionsLeft = (typeof s.sessionsLeft === 'number' ? s.sessionsLeft : YELLOW_SESSIONS) - 1;
-      if (s.sessionsLeft <= 0) delete rs[region];
-    });
-  }
 
   state.log.push(entry);
   state.session += 1;
@@ -5409,11 +5394,11 @@ function sameKnobs(a, b, keys) {
   return !!a && !!b && keys.every((k) => a[k] === b[k]);
 }
 
-// v4.1/v4.2: a session finished under a non-default intent, readiness, OR an active region
-// status (all stamped on the entry by finishSession) was deliberately lighter/filtered — it
-// says nothing about whether the base sliders fit, so the volume nudge skips it both ways.
+// v4.1: a session finished under a non-default intent or readiness (stamped on the entry by
+// finishSession) was deliberately lighter/filtered — it says nothing about whether the base
+// sliders fit, so the volume nudge skips it both ways.
 function unmodifiedEntry(e) {
-  return !!e && !e.intent && !e.readiness && !e.regionStatus;
+  return !!e && !e.intent && !e.readiness;
 }
 
 // Lowest-value raisable knob (most room to grow); tie-break by RAISE_KNOBS order.
@@ -5577,16 +5562,6 @@ function skipSuggestions(st, build) {
  */
 function progressionReady(name, cur, log) {
   const entries = log || [];
-  // v4.2: the most recent session that actually completed this move gates progression — if
-  // the athlete flagged that session yellow/red (24h feedback), hold the pip. Green, a
-  // dismissed prompt, or an unanswered session leaves progression unaffected.
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if ((entries[i].exercises || []).some((e) => e.name === name && e.done)) {
-      const fb = entries[i].feedback;
-      if (fb && (fb.light === 'yellow' || fb.light === 'red')) return false;
-      break;   // only the most-recent completing session counts
-    }
-  }
   let n = 0;
   entries.forEach((entry) => (entry.exercises || []).forEach((e) => {
     if (e.name === name && e.done && e.dose &&
@@ -5725,8 +5700,8 @@ if (typeof module !== 'undefined' && module.exports) {
     // v4.1 (Phase 3) — readiness check-in + session intents (pure)
     defaultReadiness, normalizeReadiness, readinessIsDefault, unmodifiedEntry,
     sessionIntent, readinessCaps, passesReadiness, effectiveMoveBudget,
-    // v4.2 (Phase 4) — 24h feedback loop (pure)
-    normalizeRegionStatus, moveImplicated, doseCutLevel, feedbackPromptEntry, REGION_KEYS,
+    // v4.8 — readiness care promotion (pure)
+    readinessLightKeys, moveHelps,
     // v3.7 — generic tag system (pure)
     tagIndex, tagMultiplier, tagEffectivePriority, tagScoreFactor, defaultTagPriority,
     slugify, uniqueTagId,
@@ -5736,9 +5711,9 @@ if (typeof module !== 'undefined' && module.exports) {
     // v4.4 (Phase 6) — cool-down engine (pure)
     buildCooldown, cooldownMode, cooldownModules,
     // v4.5 (Phase 7) — daily practice engine (pure)
-    buildDaily, dailyMode, dailyModules, DAILY_ROLES,
+    buildDaily, dailyMode, dailyModules, dailyMovePassesGoals, DAILY_ROLES,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, migrateRoutineV16, migrateRoutineV17, migrateRoutineV18, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, migrateRoutineV16, migrateRoutineV17, migrateRoutineV18, migrateRoutineV19, migrateRoutineV20, migrateRoutineV21, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
     // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate; v4.0 shares supersetPairOk (above)
     groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
     // Phase 4 heuristics (pure — take log/state as args)

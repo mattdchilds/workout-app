@@ -1314,6 +1314,92 @@ the briefed `loads.armSupport: 1` — `armSupport` is a derived *budget* concept
 is required for shins `stop`/red to gate the stim (matching the Ankle-pogos precedent). The
 handstand goal is `aerial` (no `handstand` goal exists in the seed).
 
+## v4.6 — Readiness overhaul
+
+The per-session readiness check-in is reworked into a single, uniform per-region **session dial**,
+the two joint-stress tags are retired in favour of `loads` + readiness, and the whole v4.2
+24-hour region-status / feedback loop is removed. Routine schema **version 19**; `sw.js` CACHE
+`tumble-trainer-v4.6.0`.
+
+### Readiness levels renamed & unified — good / light / skip
+
+Every body region — **shins, knee, foot, back, wrist** — is now a three-level dial with the same
+values and labels: **`good` / `light` / `skip`** ("go normal" / "go light on this region today" /
+"skip loading this region today"). This replaces the old asymmetric scheme (legs `good/caution/stop`,
+back `good/sensitive`, arms `good/caution`). These are **today's-session dials, NOT injuries or
+chronic conditions** — the framing runs through the UI copy and the Coach prose, and the Coach is
+told explicitly not to treat a `light`/`skip` region as a medical flag or over-restrict future
+planning because of it.
+
+- The readiness key `arms` is **renamed to `wrist`** everywhere (the athlete's actual issue is the
+  wrist). `defaultReadiness()` → `wrist: 'good'`; `READINESS_LEVELS.wrist = ['good','light','skip']`.
+- `normalizeReadiness` migrates legacy persisted state in place: an incoming `arms` maps to `wrist`
+  (when `wrist` is absent), and the legacy values `caution`→`light`, `stop`→`skip`,
+  `sensitive`→`light` snap onto the new scale before the allowed-value check.
+- **`readinessCaps`** — unified region handling: `light` → cap 1, `skip` → cap 0, mapping shins→shin,
+  knee→knee, foot→foot, back→lumbar. Wrist is the one asymmetric case: `light` → wrist 1 **and**
+  elbow 1; `skip` → wrist 0 **and elbow 1** (elbow stays at 1 on a wrist skip — most elbow load rides
+  on hand support, so zeroing it would over-restrict).
+- **`sessionBudgets`** — `r.wrist !== 'good'` tightens the arm-support budget (was `r.arms ==='caution'`);
+  `r.back !== 'good'` tightens lumbar (was `r.back === 'sensitive'`). Both still no-op for a bare
+  settings object (no readiness present). The warm-up's potentiate-drop now triggers on back
+  `light`/`skip` (`backEasy`, was `backSensitive`).
+- UI: `renderReadinessPanel` renders all five body regions with the same Good/Light/Skip row; the
+  Arms row becomes **Wrist**. `readinessSummary()` reports `wrist`.
+
+### Joint-stress tags removed (replaced by loads + readiness)
+
+The `joint-stress-legs` and `joint-stress-arms` tags are deleted from the seed's `tags` catalog and
+from every move that carried them (Handstand wall hold, Jump tucks, Bridge push-ups, Wall handstand
+shoulder taps, Broad jump stick landing, L-sit or tuck sit hold, Straight jump to fast tuck, Lateral
+bound, Overhead press). Per-region sparing is now driven entirely by each move's `loads` plus the
+readiness dial — a strictly better mechanism (graded, per-region, no manual slider). `settings.tagPriority`
+entries for the two ids are dropped by `normalizeState`'s existing orphan sweep. The historical
+V10/V11/V13 migrations (which reference these tags) are left untouched — version-gated history.
+
+### Region-status / 24-hour feedback loop removed (supersedes REDESIGN §4 / Phase 4)
+
+The readiness check-in replaces the v4.2 "how did that settle?" traffic-light feedback loop
+entirely — it **supersedes** the v4.2 section and REDESIGN.md §4 (Phase 4). Removed: `REGION_KEYS`,
+`FEEDBACK_DELAY_MS`, `YELLOW_SESSIONS`, `DOSE_CUT`, `normalizeRegionStatus`, `moveImplicated`,
+`doseCutLevel`, `feedbackPromptEntry`, `renderFeedbackCard`, `renderRegionStatusStrip`,
+`renderRegionStatusSettings`, `feedbackLight`/`applyFeedback`/`feedbackSkip`/`clearRegionStatus`,
+their dispatch cases, the `state.regionStatus` field, the `readinessCaps`/`sessionBudgets` region
+branches, the `effectiveDose` dose-cut (+ `easedTag`/`.dose-eased`) and the `renderProgression`
+pip-suppression, the `finishSession` region-status decay/snapshot, the `progressionReady` feedback
+gate, and the `ui.feedbackPick`/`feedbackFor` flags. `normalizeState` now `delete`s any stale
+persisted `state.regionStatus`. Old log entries keep their `feedback`/`regionStatus` fields (not
+migrated); nothing reads them anymore, and `unmodifiedEntry` no longer checks `regionStatus`. Dead
+feedback/region CSS (and the orphaned `.notice`) removed from `styles.css`.
+
+### Daily Tuck jumps load fix
+
+The daily-practice "Tuck jumps" carried `loads {impact:1, shin:1}`, which meant it survived a
+shins-`caution` + knee-`stop` (now `light`/`skip`) check-in — the stim kept firing on a day the
+athlete had flagged their legs. Its loads are now `{impact:2, shin:2, knee:2, foot:2}` (mirroring the
+pool "Jump tucks"), so any leg region at `light` or `skip` drops the daily jump stim.
+
+### Content fixes
+
+- Warm-up `plantar`: **"Standing calf stretch" deleted** (calf stretching already lives in cool-down
+  as "Calf + plantar fascia stretch" — the athlete was getting both).
+- Warm-up `wrists`: **"Tiger claws" deleted** (it's the athlete's wrist braces, not an exercise; the
+  remaining three moves cover the prep).
+- Cool-down `hips-extra`: **"Figure-4 glute stretch" → "Pigeon stretch"** — unit `sec` → `sec/side`,
+  new `loads {knee:1}` (so a knee `skip` drops it), reworded `why` ("Deep hip and glute opener after
+  impact — ease the front knee in, back off if it complains"). Per the athlete's explicit request
+  (the old copy avoided pigeon for the right knee; loads + readiness now handle that).
+
+### Migration & versioning
+
+`migrateRoutineV19(routine, seed)` — gated (`version < 19`), idempotent, registered in
+`normalizeState` right after V18. Strips the two tag ids from `routine.tags` and every move's tags
+(dropping emptied tags arrays) across `blocks.moves` and the module blocks; stamps the daily Tuck
+jumps loads; drops Standing calf stretch and Tiger claws; renames Figure-4 → Pigeon (unit/loads/why).
+Routine schema **version 19**; `sw.js` CACHE `tumble-trainer-v4.6.0`. New pure export:
+`migrateRoutineV19`. Removed exports: `normalizeRegionStatus`, `moveImplicated`, `doseCutLevel`,
+`feedbackPromptEntry`, `REGION_KEYS`.
+
 ## Non-goals
 - No accounts, no server, no analytics
 - No LLM calls without explicit user action (cost + privacy)
@@ -1325,3 +1411,125 @@ handstand goal is `aerial` (no `handstand` goal exists in the seed).
 - Export → clear data → import restores identical state
 - Routine edit: malformed LLM output changes nothing; rollback restores exactly
 - sw.js CACHE bumped; old cache evicted on activate
+
+## v4.7 — At gym / At home toggle; readiness + adjust on Daily
+
+Two changes: the `gym-only` equipment tag graduates from a generic 1–5 priority slider to a
+dedicated **At gym / At home** boolean, and the Daily tab gains the shared **Readiness check-in**
+and **Adjust session** panels (the latter with a deliberately minor, goal-weight-only effect on the
+daily practice block). Routine schema **version 20**; `sw.js` CACHE `tumble-trainer-v4.7.0`.
+
+### At gym / At home location toggle
+
+`gym-only` was one of the generic per-tag priority sliders (1 hard-excludes the equipment moves … 5
+favours them). It is now a hardcoded boolean, `settings.atGym` (default `true`):
+
+- **`tagEffectivePriority`** special-cases `tag.id === 'gym-only'`: **At gym** (`atGym !== false`) →
+  effective priority **3** (neutral, equipment moves stay in the pool); **At home** (`atGym === false`)
+  → effective priority **1** (hard-exclude), ignoring `settings.tagPriority['gym-only']` entirely. The
+  stored `tagPriority` entry is left in place (dead) — `atGym` is the source of truth.
+- **`renderTagPriorityFields`** now skips `gym-only` (no slider). A new shared control
+  **`renderAtGymField`** renders a "Training location" row with a single button that cycles At gym ↔
+  At home (`data-action="toggle-at-gym"`, matching the `.wu-mode` length cyclers). It is rendered in
+  BOTH the Settings "Session" panel and the Gym/Daily "Adjust session" panel, beside the tag sliders.
+- **`normalizeState` settings repair** (settings are repaired every load, not schema-versioned):
+  if `settings.atGym` isn't a boolean, it's derived one-time from the stored gym-only priority —
+  `tagPriority['gym-only'] === 1` → `false` (at home), anything else / missing → `true` (at gym).
+  `freshState` seeds `atGym: true`.
+- **Coach**: the settings context now reports a "Training location: at gym / at home" line instead of
+  a gym-only priority; the `set_tag_priority` tool **rejects** `gym-only` with a message pointing at
+  the location toggle (chosen over silently mapping it — less code, and the trial's settings slice
+  only carries `tagPriority`); the system prompt notes the location toggle is athlete-set. The
+  Settings help prose describes the toggle instead of "drop gym-only to 1".
+
+### Readiness + Adjust panels on the Daily tab
+
+`renderDaily` now prepends `renderReadinessPanel()` and `renderAdjustPanel()` — the same collapsible
+panels the Gym tab shows (no gym-view-only coupling; their handlers already call `render()`, which
+re-runs the daily builders live). Readiness already fully gated `buildWarmup`/`buildDaily`/
+`buildCooldown` via `readinessCaps` — no engine change there.
+
+The Adjust panel's effect on the daily practice block is deliberately **minor**: only the goal-weight
+sliders reach it, through a single new rule in `buildDaily`. After readiness gating, a new pure helper
+**`dailyMovePassesGoals(move, routine)`** drops a daily move only when the athlete has switched off
+**every training goal it serves** — the move names ≥1 training goal, ALL of those training goals are
+at weight 0, and it carries no care goal (a care goal always keeps a move in; a move with no training
+goals is kept). With the current seed: `aerial = 0` drops the handstand touch (Wall handstand hold),
+`shins = 0` drops the tibialis raises (Wall tibialis raises), and the Tuck jumps stim always stays
+(it carries the care goal `recovery`), even at `flip = 0`. No moves-count, superset, weekly-classes,
+family/budget, or tag-priority machinery is applied to the daily / warm-up / cool-down builders.
+
+### Migration & versioning
+
+`migrateRoutineV20(routine, seed)` — gated (`version < 20`), idempotent, registered in
+`normalizeState` right after V19. Prose-only: re-stamps `routine.structure` (generator documentation,
+never user-edited) from the seed so existing installs pick up the v20 note wording describing the
+location toggle. No move/tag/goal data changes. Routine schema **version 20**; `sw.js` CACHE
+`tumble-trainer-v4.7.0`. New pure exports: `migrateRoutineV20`, `dailyMovePassesGoals`.
+
+## v4.8 — Readiness care promotion
+
+Readiness stops being purely subtractive. A region dialed to **light** in the pre-session check-in
+now *promotes* the low-load moves that rebuild that region — a light-shins day trades jump volume
+for shin-capacity work instead of just shrinking. **Skip is unchanged**: skip means rest it, and the
+cap-0 filter already drops the helpers (they all carry load 1 on their own region). Routine schema
+**version 21**; `sw.js` CACHE `tumble-trainer-v4.8.0`.
+
+### `helps` move metadata
+
+Moves may carry a `helps` array of LOAD_KEYs (`shin`/`knee`/`foot`/`lumbar`/`wrist`) — the regions
+the move rebuilds at low load. Only moves that pass the light cap (load ≤ 1 on their own region)
+are tagged; Reverse Nordic curl and Leg extension stay untagged (knee load 2 — gone at knee-light
+anyway). The mapping:
+
+- **shin**: Heel walks, Toe walks, Bent-knee (soleus) calf raises, Tibialis raises
+- **foot**: Toe walks, Bent-knee (soleus) calf raises, Tibialis raises
+- **knee**: Nordic hamstring curl, Leg curl, Hip abduction (band walks or side-lying)
+- **lumbar**: Dead bug, Side plank hip dips, Pallof press, Single-leg glute bridge
+- **wrist**: the two NEW moves below
+
+### New wrist capacity moves + family
+
+Wrist was the one region with no low-load builder in the main pool. New accessory family
+**`wrist-forearm`** ("Wrist / forearm") and two new moves, both `wrist: 1`, fatigue 1:
+
+- **Kneeling wrist rocks (loaded)** — floor, 2×10 reps, `gym: 4`, progression to 3×15. Graded
+  weight-bearing over the hands; the capacity handstands demand.
+- **Wrist curls + reverse curls** — weights (`gym-only`), 2×15 @ 10 lb, `gym: 3`, progression to
+  20 reps / +5 lb. Forearm flexors and extensors.
+
+### Engine: promotion in `selectMoves`
+
+New pure helpers **`readinessLightKeys(st)`** (the LOAD_KEYs whose dial is exactly `'light'`,
+via `READINESS_REGION_LOADKEY`: shins→shin, back→lumbar, …) and **`moveHelps(move, key)`**.
+In `selectMoves`, each scored candidate precomputes `helpKeys` (light regions it helps). Promotion
+is a **guarantee plus a soft boost**:
+
+1. **Guarantee** — before the greedy loop, each light region pre-picks its best-scoring eligible
+   helper (same hard gates as the loop: family caps, load budgets, move-count budget; readiness
+   caps already filtered the pool). A boost alone can't do this — honest low-score accessories
+   (the wrist moves, base ≈ 32) never outbid 200-point staples at any sane multiplier. `chosen`
+   is re-sorted to pool order at the end, so pre-picking never reorders the rendered session.
+2. **Boost** — a candidate helping a region with fewer than **`READINESS_CARE_MAX` (2)** promoted
+   picks gets **×`READINESS_CARE_BOOST` (2)**, composing with the existing tag / recency /
+   section-decay / coverage / superset multipliers, so a strong second helper can still earn a slot.
+
+Per-region `careCount` (incremented by every chosen helper, shared by both steps) enforces the cap:
+one guaranteed care move, at most two — a light day swaps in care work without becoming a rehab
+session. The pick bookkeeping is factored into a local `take(idx)` used by both paths.
+
+### Warm-up: light pins the region's prep module
+
+`buildWarmup` pins a module when a region it preps is light (`READINESS_CARE_MODULES`:
+`wrists` module ← wrist light; `ankles` ← shin or foot light), in every mode/context where the
+module is eligible — a light day preps the tender region, not just avoids it. Dedup with the
+rotation slots is free (`add` is id-deduped); skip pins nothing.
+
+### Migration & versioning
+
+`migrateRoutineV21(routine, seed)` — gated (`version < 21`), idempotent, registered after V20.
+Adds the `wrist-forearm` family if absent, stamps `helps` onto the eleven pool moves by name,
+inserts the two wrist moves via `insertSeedMove` (no-op if present; deleted-move tombstones still
+filter after migrations), re-stamps `structure` prose (selection + module notes now describe the
+promotion). Routine schema **version 21**; `sw.js` CACHE `tumble-trainer-v4.8.0`. New pure exports:
+`readinessLightKeys`, `moveHelps`, `migrateRoutineV21`.
