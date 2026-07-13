@@ -101,6 +101,10 @@ const ui = {
   expanded: new Set(),
   finishing: false,
   adjustOpen: false,              // v3.4: Gym-tab "Adjust session" panel open/collapsed (transient)
+  readinessOpen: false,           // v4.1: Gym-tab "Readiness check-in" panel open/collapsed (transient)
+  feedbackPick: null,             // v4.2: transient 'yellow'|'red' — the 24h prompt's region step
+  feedbackFor: null,              // v4.2: session number the pick was made for — a pick never
+                                  // carries over to a different entry's prompt (stale-pick guard)
   // v3.9 Coach: ALL transient / in-memory. messages = [{ role:'user'|'assistant', text }]
   // (ephemeral chat — never persisted, resets on reload). pending = a staged changeset
   // awaiting the user's Apply/Discard. busy = a request is in flight. error = last error.
@@ -115,6 +119,69 @@ function defaultTagPriority(routine) {
   return tp;
 }
 
+// v4.1 (Phase 3): per-session readiness check-in. NOT part of settings or the routine
+// (no schema bump) — a transient body-state the generator reads as *state* (deterministic,
+// no RNG/Date). Allowed values per region; unknown → the region's default. Pure.
+const READINESS_LEVELS = {
+  shins: ['good', 'caution', 'stop'],
+  knee: ['good', 'caution', 'stop'],
+  foot: ['good', 'caution', 'stop'],
+  back: ['good', 'sensitive'],
+  arms: ['good', 'caution'],
+  energy: ['low', 'normal', 'high']
+};
+// The all-good default readiness object. Used by freshState, normalizeState, the
+// clear-on-finish reset, the Reset button, and future-preview neutralization. Pure.
+function defaultReadiness() {
+  return { shins: 'good', knee: 'good', foot: 'good', back: 'good', arms: 'good', energy: 'normal', classSoon: false };
+}
+// Repair a stored/loaded readiness object: each region snaps to a known value (else its
+// default), classSoon coerces to a strict boolean. Pure — returns a fresh object.
+function normalizeReadiness(r) {
+  const out = defaultReadiness();
+  if (!r || typeof r !== 'object') return out;
+  Object.keys(READINESS_LEVELS).forEach((k) => {
+    if (READINESS_LEVELS[k].indexOf(r[k]) >= 0) out[k] = r[k];
+  });
+  out.classSoon = r.classSoon === true;
+  return out;
+}
+// True when a readiness object is indistinguishable from the all-good default. Pure.
+function readinessIsDefault(r) {
+  const d = defaultReadiness();
+  const n = normalizeReadiness(r);
+  return Object.keys(d).every((k) => n[k] === d[k]);
+}
+
+// v4.2 (Phase 4): the 24-hour green/yellow/red feedback loop. After a session settles the
+// athlete answers "how did that settle?"; a yellow/red answer parks a body region in
+// `state.regionStatus`, a PERSISTENT map that the deterministic generator reads as *state*
+// (never RNG/Date). Green = the absence of an entry. Each region maps to the load keys a
+// move can carry; a yellow region eases its work for a couple of sessions, a red region is
+// paused until cleared in Settings. See readinessCaps / sessionBudgets / moveImplicated.
+const REGION_KEYS = { shins: ['shin'], knee: ['knee'], foot: ['foot'], back: ['lumbar'], arms: ['wrist', 'elbow'] };
+const FEEDBACK_DELAY_MS = 12 * 3600 * 1000;   // wait ≥12 h after finish before prompting (UI gate only)
+const YELLOW_SESSIONS = 2;                     // sessions a yellow region stays parked (decayed in finishSession)
+const DOSE_CUT = 0.8;                          // ~20% dose cut for implicated moves (snapped to a real ladder step)
+// Repair a stored/loaded regionStatus map: drop unknown regions and unknown lights; a red
+// entry is bare {light:'red'}; a yellow entry carries an integer sessionsLeft clamped 1..2
+// (default 2). Non-object → {}. Pure — returns a fresh object.
+function normalizeRegionStatus(rs) {
+  const out = {};
+  if (!rs || typeof rs !== 'object') return out;
+  Object.keys(rs).forEach((region) => {
+    if (!REGION_KEYS[region]) return;                 // unknown region → drop
+    const s = rs[region];
+    if (!s || typeof s !== 'object') return;
+    if (s.light === 'red') { out[region] = { light: 'red' }; return; }   // red carries no sessionsLeft
+    if (s.light !== 'yellow') return;                 // unknown light → drop
+    const raw = s.sessionsLeft;
+    const n = (typeof raw === 'number' && isFinite(raw)) ? Math.round(raw) : YELLOW_SESSIONS;
+    out[region] = { light: 'yellow', sessionsLeft: clamp(n, 1, 2) };
+  });
+  return out;
+}
+
 function freshState(routine) {
   return {
     version: 2,
@@ -126,7 +193,8 @@ function freshState(routine) {
     // 1 hard-avoids, 3 is neutral. Auto (day) tags never appear here. See selectMoves.
     // v3.5/v3.7: supersetBias 0–30 nudges the generator toward moves that pair into
     // supersets (default 5; 0 = old behavior). See selectMoves.
-    settings: { moves: 10, cool: 2, supersetBias: 5, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
+    // v4.0: weeklyClasses (0|1|2, default 1) = gymnastics classes expected this week; scales the impact budget.
+    settings: { moves: 10, cool: 2, supersetBias: 5, weeklyClasses: 1, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
@@ -139,6 +207,13 @@ function freshState(routine) {
     dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
     swaps: {},                    // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
     autoSuperset: true,           // v2.5: group same-location skill/core moves into supersets (default ON)
+    // v4.1 (Phase 3): per-session readiness + intent (cleared on finish). Not in settings /
+    // routine — a transient body-state the generator filters/budgets against. See selectMoves.
+    sessionIntent: 'default',     // 'default'|'gym-prep'|'recovery'|'low-impact'|'short'|'upper'
+    readiness: defaultReadiness(),
+    // v4.2 (Phase 4): persistent region status from the 24h feedback loop. Keys from
+    // shins|knee|foot|back|arms → {light:'yellow', sessionsLeft} or {light:'red'}; absence = green.
+    regionStatus: {},
     deletedMoves: []              // Move viewer tombstones — deleted moves never return via a seed migration
   };
 }
@@ -885,6 +960,33 @@ function migrateRoutineV14(routine, seed) {
 }
 
 /*
+ * v3.9.5 -> v4.0 migration (Phase 1 — move metadata foundation). Runs for any stored
+ * routine whose version is < 15. Pure; returns a new routine stamped version 15.
+ * Idempotent. (a) copies the seed's `families` catalog onto the stored routine;
+ * (b) for each stored move whose name matches a seed move, copies the functional
+ * metadata (family/loads/fatigue/qualitySensitive) from the seed — but never
+ * overwrites a field the stored move somehow already carries (a user/coach edit
+ * survives); (c) stamps version 15. No generator behavior change — the fields are
+ * data the Phase 2 pipeline will reason over. Uses the seed the same way V14 does.
+ */
+function migrateRoutineV15(routine, seed) {
+  if (!routine || typeof routine !== 'object') return routine;
+  if (typeof routine.version === 'number' && routine.version >= 15) return routine;
+  const r = deepClone(routine);
+  if (seed && Array.isArray(seed.families)) r.families = deepClone(seed.families);
+  const moves = (r.blocks && r.blocks.moves) || [];
+  moves.forEach((ex) => {
+    const seedEx = ex && ex.name && findExerciseByName(seed, ex.name);
+    if (!seedEx) return;
+    ['family', 'loads', 'fatigue', 'qualitySensitive'].forEach((k) => {
+      if (k in seedEx && !(k in ex)) ex[k] = deepClone(seedEx[k]);
+    });
+  });
+  r.version = 15;
+  return r;
+}
+
+/*
  * v2.4.1 warm-up group rename. Applied UNCONDITIONALLY and idempotently in
  * normalizeState — gated on the group VALUE, not routine.version, because some
  * devices were already stamped version 3 before this rename existed. Mutates the
@@ -971,6 +1073,10 @@ function normalizeState(obj) {
   // pull, anti-rotation, adductor, hamstring/quad eccentrics, lateral plyo,
   // one-leg hinge). Runs for any version < 14. See migrateRoutineV14.
   if (seed) routine = migrateRoutineV14(routine, seed);
+  // v3.9.5 -> v4.0: Phase 1 metadata foundation — copy the families catalog and stamp
+  // family/loads/fatigue/qualitySensitive onto seed-known moves by name (no overwrite of
+  // existing fields). Runs for any version < 15. See migrateRoutineV15.
+  if (seed) routine = migrateRoutineV15(routine, seed);
   // Move-viewer tombstones: a move the user deleted must never be resurrected by a
   // migration or a re-inserted seed move — filter deleted names after all migrations.
   const tombstones = Array.isArray(obj.deletedMoves) ? obj.deletedMoves.slice() : [];
@@ -1049,6 +1155,16 @@ function normalizeState(obj) {
   // v3.5/v3.7: superset bias — integer 0–30 (default 5). Missing / non-number → 5; clamp + int.
   merged.settings.supersetBias = typeof merged.settings.supersetBias === 'number'
     ? clamp(merged.settings.supersetBias | 0, 0, 30) : 5;
+  // v4.0: weeklyClasses — integer 0–2 (default 1). Missing / non-number → 1; clamp + int.
+  merged.settings.weeklyClasses = typeof merged.settings.weeklyClasses === 'number'
+    ? clamp(merged.settings.weeklyClasses | 0, 0, 2) : 1;
+  // v4.1 (Phase 3): per-session readiness + intent (survive a mid-session reload; cleared on
+  // finish). Any unknown/garbage value snaps back to its default. Not in settings/routine.
+  merged.sessionIntent = sessionIntent(merged);   // reads merged.sessionIntent; unknown → 'default'
+  merged.readiness = normalizeReadiness(merged.readiness);
+  // v4.2 (Phase 4): persistent regionStatus survives reloads; repair any garbage (unknown
+  // region/light dropped, yellow sessionsLeft clamped 1..2, red stripped of sessionsLeft).
+  merged.regionStatus = normalizeRegionStatus(merged.regionStatus);
 
   if (legacy) {
     merged.intensity = migrateIntensity(obj.intensity || {}, routine);
@@ -1093,6 +1209,10 @@ async function loadSeed() {
  * rest, progression, tempoNote, alwaysInShort, muscle) are allowed.
  */
 const SECTIONS = ['floor', 'weights', 'machines'];
+// v4.0 (Phase 1): family `phase` ordering ranks and the load-region keys a move's
+// `loads` object may carry. Both are data facts the Phase 2 generator reasons over.
+const FAMILY_PHASES = ['power', 'strength', 'skill-strength', 'trunk', 'accessory'];
+const LOAD_KEYS = ['impact', 'shin', 'knee', 'foot', 'wrist', 'elbow', 'lumbar'];
 
 function validateRoutine(routine) {
   const errors = [];
@@ -1153,6 +1273,35 @@ function validateRoutine(routine) {
         if (typeof t.id === 'string' && t.id) {
           if (seenTag.has(t.id)) errors.push('tags: duplicate tag id "' + t.id + '"');
           seenTag.add(t.id); tagIds.push(t.id);
+        }
+      });
+    }
+  }
+
+  // v4.0 (Phase 1): optional top-level `families` catalog — [{ id, name, phase, maxPerSession? }].
+  // ids unique; `phase` one of the five ordering ranks; `maxPerSession` a positive integer when
+  // present (defaults to 1). Move `family` is validated against these ids. Mirrors `tags` above.
+  const familyIds = [];
+  if ('families' in routine) {
+    if (!Array.isArray(routine.families)) {
+      errors.push('families must be an array of { id, name, phase, maxPerSession? }');
+    } else {
+      const seenFam = new Set();
+      routine.families.forEach((f, i) => {
+        if (!f || typeof f !== 'object' || Array.isArray(f)) {
+          errors.push('families[' + i + '] must be an object'); return;
+        }
+        if (typeof f.id !== 'string' || !f.id) errors.push('families[' + i + '] missing string "id"');
+        if (typeof f.name !== 'string' || !f.name) errors.push('families[' + i + '] missing string "name"');
+        if (FAMILY_PHASES.indexOf(f.phase) === -1) {
+          errors.push('families[' + i + '] (' + (f.id || i) + ') "phase" must be one of ' + FAMILY_PHASES.join(', '));
+        }
+        if ('maxPerSession' in f && !(Number.isInteger(f.maxPerSession) && f.maxPerSession > 0)) {
+          errors.push('families[' + i + '] (' + (f.id || i) + ') "maxPerSession" must be a positive integer');
+        }
+        if (typeof f.id === 'string' && f.id) {
+          if (seenFam.has(f.id)) errors.push('families: duplicate family id "' + f.id + '"');
+          seenFam.add(f.id); familyIds.push(f.id);
         }
       });
     }
@@ -1259,6 +1408,39 @@ function validateRoutine(routine) {
         });
       }
     }
+    // v4.0 (Phase 1): optional functional metadata. All OPTIONAL so user-/coach-added moves
+    // without them stay valid. `family` — a string id resolving into routine.families (when a
+    // families catalog exists). `loads` — an object of load-region -> integer 0..3 (keys ⊆
+    // LOAD_KEYS). `fatigue` — integer 1..5. `qualitySensitive` — boolean.
+    if ('family' in ex) {
+      if (typeof ex.family !== 'string' || !ex.family) {
+        errors.push(path + ' (' + label + '): family must be a non-empty string');
+      } else if (familyIds.indexOf(ex.family) === -1) {
+        errors.push(path + ' (' + label + '): family references unknown family id "' + ex.family + '"');
+      }
+    }
+    if ('loads' in ex) {
+      const ld = ex.loads;
+      if (!ld || typeof ld !== 'object' || Array.isArray(ld)) {
+        errors.push(path + ' (' + label + '): loads must be an object of load-region -> 0..3');
+      } else {
+        Object.keys(ld).forEach((k) => {
+          if (LOAD_KEYS.indexOf(k) === -1) {
+            errors.push(path + ' (' + label + '): loads has unknown region "' + k + '" (allowed: ' + LOAD_KEYS.join(', ') + ')');
+          }
+          const v = ld[k];
+          if (!Number.isInteger(v) || v < 0 || v > 3) {
+            errors.push(path + ' (' + label + '): loads.' + k + ' must be an integer 0–3 (got ' + JSON.stringify(v) + ')');
+          }
+        });
+      }
+    }
+    if ('fatigue' in ex && !(Number.isInteger(ex.fatigue) && ex.fatigue >= 1 && ex.fatigue <= 5)) {
+      errors.push(path + ' (' + label + '): fatigue must be an integer 1–5 (got ' + JSON.stringify(ex.fatigue) + ')');
+    }
+    if ('qualitySensitive' in ex && typeof ex.qualitySensitive !== 'boolean') {
+      errors.push(path + ' (' + label + '): qualitySensitive must be a boolean');
+    }
     if ('dose' in ex) validateDose(ex, path, label);
     validateCommon(ex, path, label);
   }
@@ -1359,6 +1541,256 @@ function tagIndex(routine) {
 
 function tagById(id) {
   return ((state && state.routine && state.routine.tags) || []).find((t) => t && t.id === id) || null;
+}
+
+// v4.0 (Phase 1): resolve a move's family id to its catalog entry (for the Moves-tab chip).
+// Delegates to the pure moveFamilyEntry so the catalog lookup lives in one place.
+function familyById(id) {
+  return moveFamilyEntry(state && state.routine, { family: id });
+}
+
+/* --- v4.0 (Phase 2): move-metadata accessors with defaults ----------------- *
+ * User/coach-added moves may lack the Phase-1 metadata. These centralise the
+ * defaults (loads 0 per key; fatigue 3; missing/unknown family → no cap, no
+ * coverage match, ordering rank "strength"). All pure. */
+function moveLoad(move, key) {
+  const v = move && move.loads && move.loads[key];
+  return (typeof v === 'number' && v > 0) ? v : 0;
+}
+function moveFatigue(move) {
+  const f = move && move.fatigue;
+  return (typeof f === 'number' && f >= 1) ? f : 3;
+}
+// A move's family id, or null if missing (used for caps/coverage/ordering).
+function moveFamilyId(move) {
+  return (move && typeof move.family === 'string' && move.family) ? move.family : null;
+}
+// A move's family catalog entry against a routine (pure — no global state). null if unknown.
+function moveFamilyEntry(routine, move) {
+  const id = moveFamilyId(move);
+  if (!id) return null;
+  return ((routine && routine.families) || []).find((f) => f && f.id === id) || null;
+}
+// Ordering rank of a move's family phase (power 0 … accessory 4; unknown/missing → strength 1).
+function moveFamilyRank(routine, move) {
+  const fam = moveFamilyEntry(routine, move);
+  const idx = fam ? FAMILY_PHASES.indexOf(fam.phase) : -1;
+  return idx === -1 ? 1 : idx;
+}
+// Per-session cap for a move's family (default 1). Missing/unknown family → no cap (Infinity).
+function moveMaxPerFamily(routine, move) {
+  const fam = moveFamilyEntry(routine, move);
+  if (!fam) return Infinity;
+  return (typeof fam.maxPerSession === 'number' && fam.maxPerSession >= 1) ? fam.maxPerSession : 1;
+}
+// "Arm-support" load: wrist OR elbow ≥ 2 (a budget category and a superset incompatibility).
+function isArmSupport(move) {
+  return moveLoad(move, 'wrist') >= 2 || moveLoad(move, 'elbow') >= 2;
+}
+
+/* --- v4.0 (Phase 2): generator budgets & coverage template ----------------- *
+ * Data facts kept as code constants (no schema change this phase). Note: a move
+ * whose single-key load already exceeds a session budget can never be selected
+ * with that budget — e.g. an impact-3 move is excluded outright at weeklyClasses 2
+ * (impact budget 2). That is intended: the classes supply that week's impact. */
+const HIGH_FATIGUE = 4;                       // "high-fatigue" threshold (fatigue ≥ 4)
+const GENERATOR_BUDGETS = {
+  impactByClasses: { 0: 4, 1: 3, 2: 2 },      // Σ moveLoad(impact) over the session, by weeklyClasses
+  highFatigue: 2,                             // max moves with fatigue ≥ 4
+  armSupport: 2,                              // max arm-support moves (wrist∨elbow ≥ 2)
+  lumbar: 2                                    // max moves with lumbar ≥ 2
+};
+// Ordered coverage slots (soft). Each lists the families that satisfy it; while an
+// active slot is unfilled, candidates in its families get a ×COVERAGE_BOOST nudge.
+const COVERAGE_SLOTS = [
+  ['trunk-anti-extension', 'gymnastics-shape'],               // 1 trunk control
+  ['trunk-anti-rotation'],                                    // 2 anti-rotation
+  ['shin-dorsiflexion', 'calf-soleus'],                       // 3 shin/ankle
+  ['squat-knee', 'single-leg'],                               // 4 squat/single-leg
+  ['hinge-hamstring'],                                        // 5 hinge
+  ['horizontal-pull', 'posture-accessory'],                   // 6 pull
+  ['gymnastics-shape', 'handstand-support']                   // 7 gymnastics-specific
+];
+const COVERAGE_BOOST = 1.5;
+
+// weeklyClasses is 0|1|2 (default 1). Pure reader with the default baked in.
+function weeklyClasses(settings) {
+  const v = settings && settings.weeklyClasses;
+  return (v === 0 || v === 1 || v === 2) ? v : 1;
+}
+
+/* --- v4.1 (Phase 3): readiness caps + session intents ---------------------- *
+ * Per-session body-state (state.readiness) and one intent (state.sessionIntent)
+ * enter the generator as extra HARD FILTERS and BUDGET MODIFIERS. Deterministic:
+ * they are read from state, never RNG/Date. Budgets only tighten (compose over the
+ * weeklyClasses base via Math.min); readiness/intent caps only remove candidates. */
+const SESSION_INTENTS = ['default', 'gym-prep', 'recovery', 'low-impact', 'short', 'upper'];
+const INTENT_LABELS = {
+  'default': 'Default', 'gym-prep': 'Gym prep', 'recovery': 'Recovery',
+  'low-impact': 'Low impact', 'short': 'Short', 'upper': 'Upper'
+};
+// Normalized session intent for a state (unknown/missing → 'default'). Pure — also
+// tolerates being handed a bare settings object (has no sessionIntent → 'default').
+function sessionIntent(st) {
+  const v = st && st.sessionIntent;
+  return SESSION_INTENTS.indexOf(v) >= 0 ? v : 'default';
+}
+// Per-load-key caps this session, from readiness regions + intent. Only capped keys are
+// present; value = the max allowed load for that key (a move with load > cap is out).
+//   region caution → 1 · region stop → 0 · back sensitive → lumbar 1 · arms caution →
+//   wrist & elbow 1 · intent 'upper' → impact/shin/knee/foot all 0 (a legs-off day).
+// When two sources cap the same key, the more restrictive (min) wins. Pure given state.
+function readinessCaps(st) {
+  const r = (st && st.readiness && typeof st.readiness === 'object') ? st.readiness : {};
+  const caps = {};
+  const cap = (key, v) => { caps[key] = (key in caps) ? Math.min(caps[key], v) : v; };
+  const region = (val, key) => {
+    if (val === 'caution') cap(key, 1);
+    else if (val === 'stop') cap(key, 0);
+  };
+  region(r.shins, 'shin');
+  region(r.knee, 'knee');
+  region(r.foot, 'foot');
+  if (r.back === 'sensitive') cap('lumbar', 1);
+  if (r.arms === 'caution') { cap('wrist', 1); cap('elbow', 1); }
+  if (sessionIntent(st) === 'upper') { cap('impact', 0); cap('shin', 0); cap('knee', 0); cap('foot', 0); }
+  // v4.2: a RED region (persistent 24h-feedback status) pauses all its load keys — cap each
+  // at 0. Composes with readiness caution/stop via the same min() helper. Yellow adds NO cap.
+  const rs = (st && st.regionStatus && typeof st.regionStatus === 'object') ? st.regionStatus : {};
+  Object.keys(rs).forEach((region) => {
+    if (rs[region] && rs[region].light === 'red') (REGION_KEYS[region] || []).forEach((k) => cap(k, 0));
+  });
+  return caps;
+}
+// Does `move` respect every readiness cap (its load on each capped key ≤ the cap)? Pure.
+function passesReadiness(move, caps) {
+  const keys = Object.keys(caps || {});
+  for (let i = 0; i < keys.length; i++) {
+    if (moveLoad(move, keys[i]) > caps[keys[i]]) return false;
+  }
+  return true;
+}
+// v4.2: is `move` implicated by the current region status? True iff some yellow OR red region
+// carries a load ≥ 1 on any of its keys. (Red-implicated moves are already filtered out of
+// generation, but a red move can still be on screen mid-session, so dose-cut + pip suppression
+// treat yellow and red uniformly here.) Pure given (move, regionStatus).
+function moveImplicated(move, regionStatus) {
+  const rs = (regionStatus && typeof regionStatus === 'object') ? regionStatus : {};
+  const regions = Object.keys(rs);
+  for (let i = 0; i < regions.length; i++) {
+    const s = rs[regions[i]];
+    if (!s || (s.light !== 'yellow' && s.light !== 'red')) continue;
+    const keys = REGION_KEYS[regions[i]] || [];
+    for (let j = 0; j < keys.length; j++) {
+      if (moveLoad(move, keys[j]) >= 1) return true;
+    }
+  }
+  return false;
+}
+// v4.2: pick the ladder level to display for an implicated move — a ~20% volume cut snapped
+// DOWN to a real ladder step. Level 0 (base) is the floor. Otherwise target volume =
+// DOSE_CUT × (sets × amount) at `level`; walk down from level-1 and return the first (highest)
+// step at or under it; if none qualifies, step down one anyway (always ≥1 step). Ignores weight.
+function doseCutLevel(ladder, level) {
+  if (level === 0) return 0;
+  const vol = (e) => e.sets * e.amount;
+  const target = DOSE_CUT * vol(ladder[level]);
+  for (let l = level - 1; l >= 0; l--) {
+    if (vol(ladder[l]) <= target) return l;
+  }
+  return level - 1;
+}
+// Effective move-count budget for the session: intent 'short' trims two moves (floor 3);
+// every other intent leaves settings.moves untouched. Pure given state.
+function effectiveMoveBudget(st) {
+  const moves = Math.max((st && st.settings && st.settings.moves) || 0, 0);
+  return sessionIntent(st) === 'short' ? Math.max(3, moves - 2) : moves;
+}
+// This session's load budgets. Accepts EITHER a full state (applies readiness/intent
+// modifiers) or a bare settings object (Phase-2 callers: base budgets only). Modifiers
+// COMPOSE over the weeklyClasses base by taking the minimum — budgets only tighten. Pure.
+function sessionBudgets(stateOrSettings) {
+  const st = stateOrSettings || {};
+  const settings = st.settings || st;               // full state carries .settings; else it IS settings
+  const r = (st.readiness && typeof st.readiness === 'object') ? st.readiness : {};
+  const intent = sessionIntent(st);
+  let impact = GENERATOR_BUDGETS.impactByClasses[weeklyClasses(settings)];
+  if (r.classSoon || intent === 'gym-prep') impact = Math.min(impact, 1);
+  if (intent === 'low-impact' || intent === 'upper') impact = Math.min(impact, 0);
+  let highFatigue = GENERATOR_BUDGETS.highFatigue;
+  if (intent === 'recovery' || r.energy === 'low') highFatigue = Math.min(highFatigue, 1);
+  let armSupport = GENERATOR_BUDGETS.armSupport;
+  if (r.arms === 'caution') armSupport = Math.min(armSupport, 1);
+  let lumbar = GENERATOR_BUDGETS.lumbar;
+  if (r.back === 'sensitive') lumbar = Math.min(lumbar, 1);
+  // v4.2: a YELLOW region eases its budget by one step (cumulative per region; floored at 0).
+  // shins/knee/foot → impact (a leg region loses a landing), back → lumbar, arms → armSupport.
+  // Budgets only ever tighten; a bare settings object (no regionStatus) is left unchanged.
+  const rs = (st.regionStatus && typeof st.regionStatus === 'object') ? st.regionStatus : {};
+  Object.keys(rs).forEach((region) => {
+    if (!rs[region] || rs[region].light !== 'yellow') return;
+    if (region === 'shins' || region === 'knee' || region === 'foot') impact = Math.max(0, impact - 1);
+    else if (region === 'back') lumbar = Math.max(0, lumbar - 1);
+    else if (region === 'arms') armSupport = Math.max(0, armSupport - 1);
+  });
+  return { impact: impact, highFatigue: highFatigue, armSupport: armSupport, lumbar: lumbar };
+}
+// Would adding `move` to a session whose running `totals` are as given bust any
+// `budgets`? Pure. totals = { impact, highFatigue, armSupport, lumbar }.
+function bustsBudget(move, totals, budgets) {
+  if (totals.impact + moveLoad(move, 'impact') > budgets.impact) return true;
+  if (moveFatigue(move) >= HIGH_FATIGUE && totals.highFatigue + 1 > budgets.highFatigue) return true;
+  if (isArmSupport(move) && totals.armSupport + 1 > budgets.armSupport) return true;
+  if (moveLoad(move, 'lumbar') >= 2 && totals.lumbar + 1 > budgets.lumbar) return true;
+  return false;
+}
+// Fold `move` into the running `totals` (mutates). Pure otherwise.
+function addToBudgetTotals(totals, move) {
+  totals.impact += moveLoad(move, 'impact');
+  if (moveFatigue(move) >= HIGH_FATIGUE) totals.highFatigue += 1;
+  if (isArmSupport(move)) totals.armSupport += 1;
+  if (moveLoad(move, 'lumbar') >= 2) totals.lumbar += 1;
+}
+// Soft coverage multiplier for `move` given the per-family pick counts so far and how
+// many leading slots are active: ×COVERAGE_BOOST if the move's family belongs to an
+// active slot that has no chosen family yet, else ×1. Applied once. Pure.
+function coverageBoost(move, famCount, activeSlots) {
+  const fam = moveFamilyId(move);
+  if (!fam) return 1;
+  for (let s = 0; s < activeSlots && s < COVERAGE_SLOTS.length; s++) {
+    const slot = COVERAGE_SLOTS[s];
+    if (slot.indexOf(fam) === -1) continue;
+    if (!slot.some((f) => (famCount[f] || 0) > 0)) return COVERAGE_BOOST;   // slot unfilled → boost
+  }
+  return 1;
+}
+// Number of leading coverage slots that apply for a given move count. Pure.
+function activeSlotCount(moveCount) {
+  return Math.min(COVERAGE_SLOTS.length, Math.max(3, (moveCount | 0) - 2));
+}
+// Stable-sort moves by family phase rank (power → strength → skill-strength → trunk →
+// accessory; unknown → strength). Preserves prior order within a rank. Pure.
+function orderByPhase(routine, moves) {
+  return (moves || [])
+    .map((m, i) => ({ m: m, i: i, rank: moveFamilyRank(routine, m) }))   // rank once per move
+    .sort((a, b) => (a.rank - b.rank) || (a.i - b.i))
+    .map((o) => o.m);
+}
+// Shared superset pairing predicate (v4.0) — the SINGLE rule used directly by render
+// grouping (groupSupersets) and transitively by the bias scorer (wouldSuperset, which
+// delegates to groupSupersets) so the two cannot drift. True iff moves `a` and `b` may
+// share a superset group. Pure.
+function supersetPairOk(a, b) {
+  if (!a || !b) return false;
+  if ((a.location || 'floor') !== (b.location || 'floor')) return false;   // existing: same location
+  if (a.muscle && b.muscle && a.muscle === b.muscle) return false;         // existing: no shared muscle
+  const fa = moveFamilyId(a), fb = moveFamilyId(b);
+  if (fa && fb && fa === fb) return false;                                 // different family (missing = compatible)
+  if (moveFatigue(a) + moveFatigue(b) > 6) return false;                   // fatigue sum ≤ 6
+  if (a.qualitySensitive && b.qualitySensitive) return false;             // not both quality-sensitive
+  if (isArmSupport(a) && isArmSupport(b)) return false;                    // not both arm-support
+  if (moveLoad(a, 'impact') >= 1 && moveLoad(b, 'impact') >= 1) return false; // not both impact ≥ 1
+  return true;
 }
 
 // Tag priority (1–5) → score multiplier. ONE tunable table. Priority 1 is handled
@@ -1478,16 +1910,16 @@ const SECTION_DECAY = 0.85;
  * v3.2 "number of moves" budget cost of a chosen set of moves. With Auto Superset
  * on, Floor moves that group into a superset (a group of >= 2) each count as HALF a
  * move — so a superset pair costs one whole move toward the slider — while every
- * other move costs one. Grouping mirrors supersetPlan (groupSupersets over the Floor
- * moves that carry a `muscle`, in pool order), so selection and rendering agree. Pure.
+ * other move costs one. v4.0: grouping mirrors supersetPlan exactly by phase-ordering
+ * the Floor moves (orderByPhase, the render order) before groupSupersets, so the
+ * selection budget and the rendered cards agree. Pure given (moves, routine).
  */
-function sessionMoveCost(moves, autoSuperset) {
+function sessionMoveCost(moves, autoSuperset, routine) {
   if (!autoSuperset) return (moves || []).length;
-  const floorMembers = (moves || [])
-    .filter((ex) => ex && (ex.section || 'floor') === 'floor' && ex.muscle)
-    .map((ex) => ({ ex: ex, block: 'floor' }));
+  const floorMoves = orderByPhase(routine, (moves || [])
+    .filter((ex) => ex && (ex.section || 'floor') === 'floor' && ex.muscle));
   const grouped = new Set();
-  groupSupersets(floorMembers).forEach((g) => {
+  groupSupersets(floorMoves.map((ex) => ({ ex: ex, block: 'floor' }))).forEach((g) => {
     if (g.members.length >= 2) g.members.forEach((m) => grouped.add(m.ex));
   });
   let cost = 0;
@@ -1515,10 +1947,15 @@ function selectMoves(st) {
   // same-day preference (no hard lock), so a B-tagged move can appear on an A day.
   const day = currentDay(st.session);
   const settings = st.settings || {};
+  // v4.1 (Phase 3): readiness/intent hard-filter caps — a move exceeding a capped load
+  // key (shins/knee/foot caution|stop, back sensitive, arms caution, intent 'upper') is
+  // out of today's pool, right alongside the disabled / tag-priority-1 exclusions.
+  const caps = readinessCaps(st);
   const pool = [];
   const tagMults = [];
   (b.moves || []).forEach((ex) => {
     if (!ex || ex.disabled) return;
+    if (!passesReadiness(ex, caps)) return;
     const f = tagScoreFactor(ex, st.routine, settings, day);
     if (f.excluded) return;
     pool.push(ex);
@@ -1526,7 +1963,8 @@ function selectMoves(st) {
   });
   const goals = ((st.routine && st.routine.goals) || []).filter((g) => g && g.kind === 'training');
   const log = st.log || [];
-  const count = Math.max(st.settings.moves || 0, 0);
+  // v4.1: intent 'short' trims the move budget by two (floor 3); otherwise settings.moves.
+  const count = effectiveMoveBudget(st);
 
   const scored = [];
   pool.forEach((move, i) => {
@@ -1540,31 +1978,50 @@ function selectMoves(st) {
   const remaining = scored.slice();
   const sectionCount = {};
   const chosen = [];
-  // v3.2: superset members each cost half a move toward the budget (see
-  // sessionMoveCost), so a supersetting session pulls in more actual moves. Cost is
-  // measured over the chosen moves in pool order (matching how they render).
+  // v4.0 (Phase 2): hard family caps + hard load budgets + soft coverage slots.
+  // Family caps: once maxPerSession picks from a family, its candidates are ineligible.
+  // Load budgets (session totals): a candidate whose addition busts a budget is skipped
+  // this pass. Coverage: while a leading slot is unfilled, candidates in its families get
+  // a ×1.5 nudge — a preference, never a quota. All deterministic (no RNG/Date).
+  const budgets = sessionBudgets(st);   // v4.1: readiness/intent modifiers compose over the base
+  const budgetTotals = { impact: 0, highFatigue: 0, armSupport: 0, lumbar: 0 };
+  const famCount = {};
+  const activeSlots = activeSlotCount(count);
+  // v3.2: superset members each cost half a move toward the budget (see sessionMoveCost),
+  // so a supersetting session pulls in more actual moves. Cost is measured over the chosen
+  // moves in pool order, which sessionMoveCost then phase-orders exactly as they render.
   const autoSuperset = st.autoSuperset !== false;
   // v3.5/v3.7: superset bias (settings.supersetBias, 0–30, default 5). While Auto superset
   // is on, a candidate Floor move that would land in a superset group (>= 2) with the
   // already-chosen moves has its score multiplied by (1 + 0.1 * bias) — bias 10 = 2x,
-  // bias 0 = no change (so bias 0 reproduces pre-v3.5 selection byte-for-byte). The
-  // pair test (wouldSuperset) mirrors render-time grouping exactly; O(n^2) over the
-  // small move pool is fine.
+  // bias 0 just disables this multiplier (the family caps / budgets / coverage of Generator
+  // v2 still apply, so bias 0 no longer reproduces pre-v3.5 selection). The pair test
+  // (wouldSuperset) phase-orders the floor moves to mirror render-time grouping exactly;
+  // O(n^2) over the small move pool is fine.
   const bias = (st.settings && typeof st.settings.supersetBias === 'number') ? st.settings.supersetBias : 5;
   const biasOn = autoSuperset && bias > 0;
   const underBudget = () =>
-    sessionMoveCost(chosen.slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset) < count;
+    sessionMoveCost(chosen.slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset, st.routine) < count;
   while (underBudget() && remaining.length) {
     let best = -1, bestVal = -Infinity;
     for (let k = 0; k < remaining.length; k++) {
       const c = remaining[k];
+      const fam = moveFamilyId(c.move);
+      // Hard: family cap reached, or this pick would bust a load budget → ineligible.
+      if (fam && (famCount[fam] || 0) >= moveMaxPerFamily(st.routine, c.move)) continue;
+      if (bustsBudget(c.move, budgetTotals, budgets)) continue;
       let val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
-      if (biasOn && wouldSuperset(chosen, c)) val *= (1 + 0.1 * bias);
+      if (biasOn && wouldSuperset(chosen, c, st.routine)) val *= (1 + 0.1 * bias);
+      val *= coverageBoost(c.move, famCount, activeSlots);   // soft coverage nudge
       // Strictly-greater wins; exact ties fall to the earlier pool index (stable).
-      if (val > bestVal || (val === bestVal && c.i < remaining[best].i)) { bestVal = val; best = k; }
+      if (best === -1 || val > bestVal || (val === bestVal && c.i < remaining[best].i)) { bestVal = val; best = k; }
     }
+    if (best === -1) break;   // no eligible candidate remains (family caps/budgets) — terminate cleanly
     const pick = remaining.splice(best, 1)[0];
     sectionCount[pick.section] = (sectionCount[pick.section] || 0) + 1;
+    const pfam = moveFamilyId(pick.move);
+    if (pfam) famCount[pfam] = (famCount[pfam] || 0) + 1;
+    addToBudgetTotals(budgetTotals, pick.move);
     chosen.push(pick);
   }
 
@@ -1607,7 +2064,9 @@ function buildSession(st) {
 
   const selected = selectMoves(st);
   MOVE_SECTIONS.forEach((sec) => {
-    const exercises = selected.filter((ex) => (ex.section || 'floor') === sec.key);
+    // v4.0 (Phase 2): within each section, stable-sort by family phase rank so power /
+    // quality-sensitive work lands while fresh and low-fatigue accessories close.
+    const exercises = orderByPhase(r, selected.filter((ex) => (ex.section || 'floor') === sec.key));
     if (exercises.length) blocks.push({ key: sec.key, title: sec.title, exercises: exercises });
   });
 
@@ -1642,6 +2101,10 @@ function buildFutureSession(st, offset) {
   if (!offset) return buildSession(st);
   const sim = deepClone(st);
   sim.swaps = {};                       // preview ignores per-session swaps
+  // v4.1 (Phase 3): a future day must NOT inherit today's readiness/intent — those are
+  // a "how do I feel right now" input. Previews generate the neutral, all-good session.
+  sim.readiness = defaultReadiness();
+  sim.sessionIntent = 'default';
   sim.log = sim.log ? sim.log.slice() : [];
   for (let step = 0; step < offset; step++) {
     const build = buildSession(sim);
@@ -1801,16 +2264,28 @@ function currentLevel(ex) {
 function effectiveDose(ex) {
   const d = ex.dose;
   const level = currentLevel(ex);
-  if (!level) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
+  // v4.2: when a yellow/red region implicates this move, ease the dose ~20% down the ladder.
+  // Reduced doses log automatically (finishSession logs effectiveDose). Base is always the floor.
+  const reduced = moveImplicated(ex, (state && state.regionStatus) || {});
+  if (!level && !reduced) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
   const ladder = progressionLadder(ex);
-  const entry = ladder[clamp(level, 0, ladder.length - 1)];
-  return { sets: entry.sets, amount: entry.amount, unit: d.unit, weight: entry.weight, overridden: true };
+  const clamped = clamp(level, 0, ladder.length - 1);
+  const useLevel = reduced ? doseCutLevel(ladder, clamped) : clamped;
+  const entry = ladder[useLevel];
+  const out = { sets: entry.sets, amount: entry.amount, unit: d.unit, weight: entry.weight };
+  if (useLevel > 0) out.overridden = true;
+  if (reduced) out.reduced = true;
+  return out;
 }
 
 // "3 × 30 sec" / "3 × 15 reps/side" / "1 × 20 sec/side" / "3 × 8 reps @ 180 lb".
 function formatDose(eff) {
   return eff.sets + ' × ' + eff.amount + ' ' + eff.unit +
     (eff.weight != null ? ' @ ' + eff.weight + ' lb' : '');
+}
+// v4.2: subtle "· eased" tag appended after a reduced (region-implicated) dose line.
+function easedTag(eff) {
+  return (eff && eff.reduced) ? ' <span class="dose-eased">· eased</span>' : '';
 }
 
 // Move up (dir +1 = harder) or down the ladder; level 0 clears the override.
@@ -1977,11 +2452,146 @@ function renderAdjustPanel() {
     h += '<div class="adjust-body">' +
       renderSettingSlider('moves', 'Number of moves') +
       renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
+      renderWeeklyClassesField() +
       renderTagPriorityFields() +
       renderSupersetBiasField() +
       '<div class="adjust-goals-head">Goal weights</div>' +
       renderGoalWeightSliders() +
       '</div>';
+  }
+  return h + '</section>';
+}
+
+/*
+ * v4.1 (Phase 3): the Gym tab's collapsible "Readiness check-in" panel. Default
+ * collapsed (ui.readinessOpen, transient). One segmented row per region + a session
+ * intent selector; every tap writes state.readiness/state.sessionIntent, saves, and
+ * re-renders — regenerating the visible session live (the same live-regenerate pattern
+ * as the Adjust panel). A summary chip on the collapsed header keeps any active filter
+ * visible. Copy is non-diagnostic: it filters today's session, it does not assess injury.
+ */
+// Human-readable list of the CURRENTLY non-default readiness regions (excludes intent).
+// Drives the collapsed-header chip and the Coach context line. Reads global state.
+function readinessSummary() {
+  const r = state.readiness || defaultReadiness();
+  const out = [];
+  if (r.shins !== 'good') out.push('shins ' + r.shins);
+  if (r.knee !== 'good') out.push('knee ' + r.knee);
+  if (r.foot !== 'good') out.push('foot ' + r.foot);
+  if (r.back !== 'good') out.push('back ' + r.back);
+  if (r.arms !== 'good') out.push('arms ' + r.arms);
+  if (r.energy !== 'normal') out.push(r.energy + ' energy');
+  if (r.classSoon) out.push('class < 24h');
+  return out;
+}
+/* --- v4.2 (Phase 4): 24-hour green/yellow/red feedback loop ---------------- */
+// The log entry the "how did that settle?" prompt should ask about, or null. Only ever the
+// LAST entry, and only when it is un-answered (no feedback / feedbackSkipped) and ≥12 h old.
+// Date.now() here is a UI gate, not the generator — deterministic selection never reads it.
+function feedbackPromptEntry() {
+  const log = (state && state.log) || [];
+  if (!log.length) return null;
+  const e = log[log.length - 1];
+  if (!e || e.feedback || e.feedbackSkipped || !e.date) return null;
+  if (Date.now() - Date.parse(e.date) < FEEDBACK_DELAY_MS) return null;
+  return e;
+}
+// The 24h prompt card. Step 1 = three lights; tapping Yellow/Red opens step 2 = a region row.
+function renderFeedbackCard(entry) {
+  // A pick only opens the region step for the entry it was made on. If the athlete left the
+  // step open, finished ANOTHER session, and this prompt is for the newer entry, the stale
+  // pick must not skip its light choice (or it would stamp a judgment they never made).
+  const pick = (ui.feedbackFor === entry.session) ? ui.feedbackPick : null;
+  const when = 'Day ' + escapeHtml(entry.day || '?') + ' · ' + escapeHtml(new Date(entry.date).toLocaleDateString());
+  let h = '<div class="feedback-card">' +
+    '<div class="feedback-head">' +
+      '<span class="feedback-title">How did that session settle?</span>' +
+      '<button class="feedback-x" data-action="feedback-skip" aria-label="Dismiss">✕</button>' +
+    '</div>' +
+    '<div class="feedback-when">' + when + '</div>';
+  if (!pick) {
+    h += '<div class="feedback-btns">' +
+      '<button class="feedback-btn fb-green" data-action="feedback-light" data-light="green">Felt fine</button>' +
+      '<button class="feedback-btn fb-yellow" data-action="feedback-light" data-light="yellow">A bit stirred up</button>' +
+      '<button class="feedback-btn fb-red" data-action="feedback-light" data-light="red">Something’s wrong</button>' +
+      '</div>';
+  } else {
+    const regions = [['shins', 'Shins'], ['knee', 'Knee'], ['foot', 'Foot'], ['back', 'Back'], ['arms', 'Arms']];
+    h += '<div class="feedback-region-label">Which region?</div>' +
+      '<div class="feedback-btns feedback-regions">' + regions.map((rr) =>
+        '<button class="feedback-btn fb-' + pick + '" data-action="feedback-region" data-region="' + rr[0] + '">' +
+        escapeHtml(rr[1]) + '</button>').join('') + '</div>';
+    if (pick === 'red') {
+      h += '<p class="muted feedback-note">Red pauses that region’s work until you clear it in Settings. ' +
+        'Persistent, worsening, or neurological symptoms → clinician.</p>';
+    }
+    h += '<div class="row"><button class="btn small ghost" data-action="feedback-cancel">Cancel</button></div>';
+  }
+  return h + '</div>';
+}
+// Compact "Settling: …" strip + (when any region red) a clinician notice. Gym tab, live only.
+function renderRegionStatusStrip() {
+  const rs = state.regionStatus || {};
+  const regions = Object.keys(rs);
+  if (!regions.length) return '';
+  const items = regions.map((r) => {
+    const s = rs[r];
+    if (s.light === 'red') return '<span class="region-chip region-chip-red">' + escapeHtml(r + ' red — cleared in Settings') + '</span>';
+    const n = s.sessionsLeft;
+    return '<span class="region-chip region-chip-yellow">' +
+      escapeHtml(r + ' yellow · ' + n + ' session' + (n === 1 ? '' : 's') + ' left') + '</span>';
+  });
+  let h = '<div class="region-strip"><span class="region-strip-label">Settling:</span> ' + items.join(' ') + '</div>';
+  if (regions.some((r) => rs[r].light === 'red')) {
+    h += '<div class="notice region-notice">Red pauses that region’s work until you clear it in Settings. ' +
+      'Persistent, worsening, or neurological symptoms → clinician.</div>';
+  }
+  return h;
+}
+
+// One segmented row: a label + a group of one-tap buttons that set `region` to a level.
+function renderSegRow(label, region, current, opts) {
+  const btns = opts.map((o) =>
+    '<button class="seg-btn' + (current === o.v ? ' is-active' : '') +
+    '" data-action="readiness-set" data-region="' + region + '" data-level="' + o.v + '">' +
+    escapeHtml(o.label) + '</button>').join('');
+  return '<div class="seg-row"><span class="seg-label">' + escapeHtml(label) +
+    '</span><span class="seg-btns">' + btns + '</span></div>';
+}
+function renderReadinessPanel() {
+  const open = ui.readinessOpen;
+  const r = state.readiness || defaultReadiness();
+  const intent = sessionIntent(state);
+  const chips = readinessSummary().concat(intent !== 'default' ? [INTENT_LABELS[intent].toLowerCase()] : []);
+  let h = '<section class="adjust-panel readiness-panel' + (open ? ' is-open' : '') + '">';
+  h += '<button class="adjust-toggle" data-action="toggle-readiness" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+    '<span>Readiness check-in' +
+    (chips.length ? ' <span class="readiness-chip">' + escapeHtml(chips.join(' · ')) + '</span>' : '') +
+    '</span><span class="adjust-caret">' + (open ? '▾' : '▸') + '</span></button>';
+  if (open) {
+    h += '<div class="adjust-body">';
+    const tri = [{ v: 'good', label: 'Good' }, { v: 'caution', label: 'Caution' }, { v: 'stop', label: 'Stop' }];
+    h += renderSegRow('Shins', 'shins', r.shins, tri);
+    h += renderSegRow('Knee', 'knee', r.knee, tri);
+    h += renderSegRow('Foot', 'foot', r.foot, tri);
+    h += renderSegRow('Back', 'back', r.back, [{ v: 'good', label: 'Good' }, { v: 'sensitive', label: 'Sensitive' }]);
+    h += renderSegRow('Arms', 'arms', r.arms, [{ v: 'good', label: 'Good' }, { v: 'caution', label: 'Caution' }]);
+    h += renderSegRow('Energy', 'energy', r.energy, [{ v: 'low', label: 'Low' }, { v: 'normal', label: 'Normal' }, { v: 'high', label: 'High' }]);
+    // classSoon: a two-segment No/Yes toggle (data-val 0/1), styled like the rows above.
+    h += '<div class="seg-row"><span class="seg-label">Class within 24 h</span><span class="seg-btns">' +
+      '<button class="seg-btn' + (!r.classSoon ? ' is-active' : '') + '" data-action="readiness-classsoon" data-val="0">No</button>' +
+      '<button class="seg-btn' + (r.classSoon ? ' is-active' : '') + '" data-action="readiness-classsoon" data-val="1">Yes</button>' +
+      '</span></div>';
+    // Session intent selector (segmented, wraps).
+    const intentBtns = SESSION_INTENTS.map((v) =>
+      '<button class="seg-btn' + (intent === v ? ' is-active' : '') +
+      '" data-action="readiness-intent" data-intent="' + v + '">' + escapeHtml(INTENT_LABELS[v]) + '</button>').join('');
+    h += '<div class="seg-row seg-row-intent"><span class="seg-label">Session intent</span>' +
+      '<span class="seg-btns">' + intentBtns + '</span></div>';
+    h += '<p class="muted readiness-note">Filters today’s session only — it doesn’t assess injuries. ' +
+      'Persistent, worsening, or neurological symptoms → clinician.</p>';
+    h += '<div class="row"><button class="btn small ghost" data-action="readiness-reset">Reset</button></div>';
+    h += '</div>';
   }
   return h + '</section>';
 }
@@ -2013,11 +2623,23 @@ function renderToday(build) {
   renderedExercises = [];
   const preview = inPreview();
   let html = renderPreviewBar(build);
+  // v4.2: the 24h "how did that settle?" prompt sits above everything else — live only, and
+  // not while the finish sheet is up. feedbackPromptEntry gates on the ≥12 h delay.
+  if (!preview && !ui.finishing) {
+    const fbEntry = feedbackPromptEntry();
+    if (fbEntry) html += renderFeedbackCard(fbEntry);
+  }
   // Suggestions (incl. swap chips) are interactive — hide them while previewing.
   if (!preview) html += renderSuggestions(build);
   // v3.4: collapsible "Adjust session" — the same sliders/toggles as Settings, live in
   // the Gym tab so tuning immediately re-generates the session below. Hidden in preview.
   if (!preview) html += renderAdjustPanel();
+  // v4.2: compact region-status strip (+ clinician notice when any region is red), above the
+  // readiness panel. Hidden in preview (persistent status still applies to preview generation).
+  if (!preview) html += renderRegionStatusStrip();
+  // v4.1: collapsible "Readiness check-in" — per-region caution/stop + session intent that
+  // hard-filter/tighten today's session. Hidden in preview (previews are neutral by design).
+  if (!preview) html += renderReadinessPanel();
 
   // v3.0 safety note: warn when goal weights leave no scored moves to select.
   const hasMoves = build.blocks.some((bl) =>
@@ -2168,7 +2790,10 @@ function groupSupersets(members) {
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
       if (g.location !== loc) continue;
-      if (g.members.some((x) => x.ex.muscle === m.ex.muscle)) continue;          // muscle clash
+      // v4.0 (Phase 2): the candidate must be pair-compatible with EVERY existing member
+      // (supersetPairOk folds in the old muscle-clash + location rules plus family / fatigue
+      // / quality-sensitive / arm-support / impact incompatibilities).
+      if (!g.members.every((x) => supersetPairOk(x.ex, m.ex))) continue;
       const large = g.members.filter((x) => x.ex.largeEquipment).length + (m.ex.largeEquipment ? 1 : 0);
       if (large > 1) continue;                                                   // >1 large equipment
       target = g; break;
@@ -2182,18 +2807,20 @@ function groupSupersets(members) {
 /*
  * v3.5 superset-bias predicate (pure; exported for tests). Would adding `cand` (a
  * greedy pick { move, i }) to the already-chosen picks `entries` ({ move, i }) place
- * it in a superset group of >= 2? Mirrors render-time grouping: the chosen floor+muscle
- * moves plus the candidate, ordered by pool index, mapped to { ex, block:'floor' } and
- * run through groupSupersets; true iff the candidate's resulting group has >= 2 members.
- * Non-Floor / muscle-less candidates never pair (return false).
+ * it in a superset group of >= 2? v4.0: mirrors render-time grouping exactly — the chosen
+ * floor+muscle moves plus the candidate are pool-ordered (matching selectMoves' returned
+ * order) and then phase-ordered with orderByPhase (the order the Floor block renders) before
+ * groupSupersets; true iff the candidate's resulting group has >= 2 members. Non-Floor /
+ * muscle-less candidates never pair (return false). Pure given (entries, cand, routine).
  */
-function wouldSuperset(entries, cand) {
+function wouldSuperset(entries, cand, routine) {
   if (!cand || !cand.move || (cand.move.section || 'floor') !== 'floor' || !cand.move.muscle) return false;
-  const floor = (entries || [])
+  const poolOrdered = (entries || [])
     .filter((o) => o && o.move && (o.move.section || 'floor') === 'floor' && o.move.muscle)
     .concat([cand])
     .sort((a, b) => a.i - b.i)
-    .map((o) => ({ ex: o.move, block: 'floor' }));
+    .map((o) => o.move);
+  const floor = orderByPhase(routine, poolOrdered).map((ex) => ({ ex: ex, block: 'floor' }));
   const groups = groupSupersets(floor);
   for (let gi = 0; gi < groups.length; gi++) {
     if (groups[gi].members.some((m) => m.ex === cand.move)) return groups[gi].members.length >= 2;
@@ -2288,10 +2915,11 @@ function renderSupersetCard(card, idx) {
       escapeHtml(goalName(id)) + '</span>').join('');
   const rows = card.moves.map((ex) => {
     const over = currentLevel(ex) > 0;
+    const meff = effectiveDose(ex);
     return '<li class="ss-move">' +
       '<span class="ss-move-name">' + escapeHtml(ex.name) +
         (over ? ' <span class="mod">modified</span>' : '') + '</span>' +
-      '<span class="ss-move-dose">' + escapeHtml(formatDose(effectiveDose(ex))) + '</span>' +
+      '<span class="ss-move-dose">' + escapeHtml(formatDose(meff)) + easedTag(meff) + '</span>' +
       '</li>';
   }).join('');
   const mainAttrs = preview ? '' : ' data-action="expand" data-idx="' + idx + '"';
@@ -2370,7 +2998,7 @@ function renderCard(ex, idx, blockKey) {
           '<div class="chips">' + chips + '</div>' +
           '<div class="card-name">' + escapeHtml(ex.name) +
             (overridden ? ' <span class="mod">modified</span>' : '') + '</div>' +
-          '<div class="dose">' + escapeHtml(formatDose(eff)) + '</div>' +
+          '<div class="dose">' + escapeHtml(formatDose(eff)) + easedTag(eff) + '</div>' +
           renderSetCircles(ex, idx, blockKey, eff) +
           renderRestClock(ex, blockKey, eff) +
         '</div>' +
@@ -2418,7 +3046,8 @@ function renderProgression(ex, idx, memberIdx) {
   const level = clamp(currentLevel(ex), 0, ladder.length - 1);
   const atTop = level >= ladder.length - 1;
   const atBottom = level <= 0;
-  const ready = progressionReady(ex.name, effectiveDose(ex), state.log || []);
+  // v4.2: suppress the ready-pip (not the manual ▲ button) while a yellow/red region eases this move.
+  const ready = !moveImplicated(ex, state.regionStatus || {}) && progressionReady(ex.name, effectiveDose(ex), state.log || []);
   const upReady = ready && !atTop;
   // On a superset card the buttons carry the member index so the shared prog/reset
   // handlers resolve the member off the card (members aren't in renderedExercises).
@@ -2565,6 +3194,11 @@ function renderMoveRow(m, idx, training) {
   const careChips = (m.care || []).map((id) =>
     '<span class="chip c-' + escapeHtml(goalColor(id)) + '">' + escapeHtml(goalName(id)) + '</span>').join(' ');
   const meta = [escapeHtml(formatDose(m.dose || { sets: 0, amount: 0, unit: '' }))];
+  // v4.0 (Phase 1): show the move's functional family as a subtle muted chip.
+  if (m.family) {
+    const fam = familyById(m.family);
+    meta.push('<span class="mv-family">' + escapeHtml(fam ? fam.name : m.family) + '</span>');
+  }
   if (m.muscle) meta.push('muscle: ' + escapeHtml(m.muscle));
   // v3.7: show the move's tags (auto day tags and priority-1 tags both matter to
   // generation; the tag's own name explains what it is).
@@ -2826,7 +3460,43 @@ function renderSupersetBiasField() {
     '</div>';
 }
 
+// v4.0 (Phase 2): a 3-stop slider (0/1/2) for gymnastics classes expected this week.
+// More classes → a smaller session impact budget (fewer landing/jump moves). Reuses the
+// generic "setting" onChange handler (data-key="weeklyClasses").
+function renderWeeklyClassesField() {
+  const val = weeklyClasses(state.settings);
+  return '<div class="field">' +
+    '<label>Gymnastics classes this week <span class="val">' + val + '</span></label>' +
+    '<input type="range" data-action="setting" data-key="weeklyClasses" min="0" max="2" step="1" value="' + val + '">' +
+    '</div>';
+}
+
 /* --- Settings view -------------------------------------------------------- */
+
+// v4.2: Settings "Region status" block — one row per active region with a per-row Clear
+// (the only way to clear a red region). Rendered only when at least one region is active.
+function renderRegionStatusSettings() {
+  const rs = state.regionStatus || {};
+  const regions = Object.keys(rs);
+  if (!regions.length) return '';
+  const label = { shins: 'Shins', knee: 'Knee', foot: 'Foot', back: 'Back', arms: 'Arms' };
+  let h = '<section class="panel"><h3>Region status</h3>';
+  regions.forEach((r) => {
+    const s = rs[r];
+    const desc = s.light === 'red' ? 'red' :
+      'yellow · ' + s.sessionsLeft + ' session' + (s.sessionsLeft === 1 ? '' : 's') + ' left';
+    h += '<div class="region-row">' +
+      '<span class="region-row-label">' + escapeHtml(label[r] || r) + '</span>' +
+      '<span class="region-row-light region-light-' + escapeHtml(s.light) + '">' + escapeHtml(desc) + '</span>' +
+      '<button class="btn small ghost" data-action="region-clear" data-region="' + escapeHtml(r) + '">Clear</button>' +
+      '</div>';
+  });
+  h += '<p class="muted">Set by the 24-hour "how did that settle?" check-in. Yellow eases the ' +
+    'region and clears itself over a couple of sessions (or with a green check-in); red pauses it ' +
+    'until cleared here. This tracks how a session settled — it doesn’t assess injuries; ' +
+    'persistent, worsening, or neurological symptoms → clinician.</p>';
+  return h + '</section>';
+}
 
 function renderSettings() {
   let html = '<div class="settings">';
@@ -2836,6 +3506,7 @@ function renderSettings() {
   html += '<section class="panel"><h3>Session</h3>' +
     renderSettingSlider('moves', 'Number of moves') +
     renderSettingSlider('cool', 'Cool-down (1 = short, 2 = full)') +
+    renderWeeklyClassesField() +
     renderTagPriorityFields() +
     renderAutoSupersetField() +
     renderSupersetBiasField() +
@@ -2846,6 +3517,9 @@ function renderSettings() {
       'the moves, rest after each round. Higher superset bias makes the generator prefer moves ' +
       'that pair into supersets; it only applies while Auto superset is on.</p>' +
     '</section>';
+
+  // v4.2: region status from the 24h feedback loop (only when any region is active).
+  html += renderRegionStatusSettings();
 
   // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
   // are always on (they live in the static warm-up / cool-down) and get no slider.
@@ -2989,6 +3663,23 @@ const COACH_MOVE_SCHEMA = {
     },
     care: { type: 'array', items: { type: 'string' }, description: 'care-goal ids this move also serves' },
     tags: { type: 'array', items: { type: 'string' }, description: 'tag ids from routine.tags' },
+    family: { type: 'string', description: 'functional family id — must match an existing family id in routine.families (add_family first if a new one is needed). One per move; drives Phase-2 diversity/ordering.' },
+    loads: {
+      type: 'object',
+      description: 'per-region load facts about the move, 0..3 each; omit zero regions',
+      properties: {
+        impact: { type: 'integer', minimum: 0, maximum: 3 },
+        shin: { type: 'integer', minimum: 0, maximum: 3 },
+        knee: { type: 'integer', minimum: 0, maximum: 3 },
+        foot: { type: 'integer', minimum: 0, maximum: 3 },
+        wrist: { type: 'integer', minimum: 0, maximum: 3 },
+        elbow: { type: 'integer', minimum: 0, maximum: 3 },
+        lumbar: { type: 'integer', minimum: 0, maximum: 3 }
+      },
+      additionalProperties: false
+    },
+    fatigue: { type: 'integer', minimum: 1, maximum: 5, description: 'session-fatigue cost 1 (trivial) .. 5 (very taxing)' },
+    qualitySensitive: { type: 'boolean', description: 'true when the move degrades badly under fatigue (skill/power holds)' },
     muscle: { type: 'string' },
     rest: { type: 'integer', description: 'rest seconds (> 0)' },
     progression: { type: 'object' },
@@ -3007,7 +3698,7 @@ const COACH_TOOLS = [
   },
   { type: 'function',
     name: 'update_move',
-    description: 'Shallow-merge a patch onto the move matched by exact name. dose, goalScores, progression, tags and care are replaced wholesale when present in the patch.',
+    description: 'Shallow-merge a patch onto the move matched by exact name. dose, goalScores, progression, tags, care and loads are replaced wholesale when present in the patch.',
     parameters: { type: 'object', properties: {
       name: { type: 'string' },
       patch: { type: 'object', description: 'partial move fields to overwrite' }
@@ -3029,6 +3720,15 @@ const COACH_TOOLS = [
     name: 'add_tag',
     description: 'Create a routine tag ("bool") and seed its priority slider to 3 (neutral).',
     parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  { type: 'function',
+    name: 'add_family',
+    description: 'Create a functional move family (id slugified from name) so moves can reference it via move.family.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' },
+      phase: { type: 'string', enum: FAMILY_PHASES, description: 'ordering rank: power → strength → skill-strength → trunk → accessory' },
+      maxPerSession: { type: 'integer', minimum: 1, description: 'optional; how many of this family one session may pick (default 1)' }
+    }, required: ['name', 'phase'] }
   },
   { type: 'function',
     name: 'set_tag_priority',
@@ -3089,7 +3789,7 @@ function applyCoachTool(name, args, trial) {
       if (!args.patch || typeof args.patch !== 'object') return err('update_move: "patch" object is required');
       const mv = findMove(args.name);
       if (!mv) return err('update_move: no move named "' + args.name + '"');
-      Object.assign(mv, deepClone(args.patch));   // dose/goalScores/progression/tags/care replace wholesale
+      Object.assign(mv, deepClone(args.patch));   // dose/goalScores/progression/tags/care/loads replace wholesale
       return ok('Update move: ' + args.name + ' (' + Object.keys(args.patch).join(', ') + ')');
     }
     case 'delete_move': {
@@ -3115,6 +3815,17 @@ function applyCoachTool(name, args, trial) {
       trial.routine.tags.push({ id: id, name: args.name });
       trial.settings.tagPriority[id] = 3;
       return ok('Add tag: ' + args.name + ' (id ' + id + ', priority 3)');
+    }
+    case 'add_family': {
+      if (!args.name) return err('add_family: "name" is required');
+      if (FAMILY_PHASES.indexOf(args.phase) === -1) return err('add_family: "phase" must be one of ' + FAMILY_PHASES.join(', '));
+      trial.routine.families = trial.routine.families || [];
+      const id = uniqueTagId(slugify(args.name), trial.routine.families);
+      const fam = { id: id, name: args.name, phase: args.phase };
+      if (Number.isInteger(args.maxPerSession) && args.maxPerSession > 0) fam.maxPerSession = args.maxPerSession;
+      trial.routine.families.push(fam);
+      return ok('Add family: ' + args.name + ' (id ' + id + ', phase ' + args.phase +
+        (fam.maxPerSession ? ', max ' + fam.maxPerSession + '/session' : '') + ')');
     }
     case 'set_tag_priority': {
       if (!args.tagId) return err('set_tag_priority: "tagId" is required');
@@ -3168,10 +3879,25 @@ function coachSettingsContext() {
   const tp = state.settings.tagPriority || {};
   const tags = ((state.routine.tags || []).filter((t) => t && t.id && !t.auto))
     .map((t) => t.id + '=' + (typeof tp[t.id] === 'number' ? tp[t.id] : 3));
+  // v4.1: readiness + intent are per-session, athlete-only inputs — surface the current
+  // (non-default) values compactly so the Coach knows what filtered today's session.
+  const rParts = readinessSummary();
+  const intent = sessionIntent(state);
+  // v4.2: persistent region status from the 24h feedback loop (athlete-only; non-empty only).
+  const rs = state.regionStatus || {};
+  const rsKeys = Object.keys(rs);
+  const rsLine = rsKeys.length ? '\nRegion status (24h feedback): ' + rsKeys.map((r) => {
+    const s = rs[r];
+    return r + ' ' + s.light + (s.light === 'yellow'
+      ? ' (' + s.sessionsLeft + ' session' + (s.sessionsLeft === 1 ? '' : 's') + ' left)' : '');
+  }).join(', ') : '';
   return 'Training goal weights (0-10): ' + (training.join(', ') || '(none)') + '\n' +
     'Tag priorities (1 avoid … 3 neutral … 5 favour): ' + (tags.join(', ') || '(none)') + '\n' +
     'Superset bias: ' + (state.settings.supersetBias != null ? state.settings.supersetBias : 5) +
-    ' · moves/session: ' + state.settings.moves;
+    ' · moves/session: ' + state.settings.moves +
+    ' · gymnastics classes this week: ' + weeklyClasses(state.settings) + '\n' +
+    'Readiness (today, athlete-set): ' + (rParts.length ? rParts.join(', ') : 'all good') + '\n' +
+    'Session intent: ' + (intent === 'default' ? 'default' : INTENT_LABELS[intent]) + rsLine;
 }
 
 function coachSystemPrompt() {
@@ -3193,9 +3919,12 @@ function coachSystemPrompt() {
     '- A valid move needs: name, section (one of ' + SECTIONS.join(', ') + '), why, dose',
     '  { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ' }, and goalScores',
     '  (map of training-goal id -> integer 0-10; omit goals scoring 0). Optional: care[] (care-goal ids),',
-    '  tags[] (ids from routine.tags), muscle, rest (seconds), progression, dose.weight (lb), disabled.',
+    '  tags[] (ids from routine.tags), muscle, rest (seconds), progression, dose.weight (lb), disabled, and',
+    '  the functional metadata family (a routine.families id), loads (per-region 0-3, omit zeros),',
+    '  fatigue (1-5), qualitySensitive (bool) — data the session planner reasons over.',
     '- goalScores keys must be existing TRAINING goal ids; care[] must be existing CARE goal ids; tags[]',
-    '  must be existing tag ids. Create a goal or tag first (add_goal / add_tag) if you need a new one.',
+    '  must be existing tag ids; family must be an existing family id. Create a goal, tag or family first',
+    '  (add_goal / add_tag / add_family) if you need a new one.',
     '- Move names are unique. update_move/delete_move/set_move_disabled match by EXACT name.',
     '',
     'GUARDRAILS:',
@@ -3203,6 +3932,15 @@ function coachSystemPrompt() {
     '  tunnel, posture, sciatic, joint recovery, splits). Do not remove care-serving work casually, and',
     '  for symptom/pain topics advise seeing a professional rather than prescribing rehab.',
     '- Prefer small, targeted edits over sweeping rewrites. Keep names unique. Explain reasoning briefly.',
+    '- The session planner now enforces family caps (≤1 move per family), load budgets (Σ impact scaled by',
+    '  weekly gymnastics classes, plus caps on fatigue≥4 / arm-support / lumbar≥2 moves) and coverage slots.',
+    '  So structure/diversity is handled by the generator — do not try to fix it purely by nudging scores.',
+    '- A pre-session readiness check-in (per-region good/caution/stop, back sensitive, arms caution, energy,',
+    '  class-soon) and a session intent (gym prep, recovery, low-impact, short, upper) further filter and',
+    '  budget today\'s session — the athlete sets these on the Gym tab; you cannot and must not set them.',
+    '- A 24-hour traffic-light feedback loop (green/yellow/red per region) parks a persistent region status',
+    '  that eases (yellow) or pauses (red) that region\'s work. Like readiness, this is an athlete-only input',
+    '  you can SEE (below) but never set or clear — advise, do not attempt to change it via tools.',
     '',
     'CURRENT GENERATION SETTINGS:',
     coachSettingsContext(),
@@ -3479,6 +4217,17 @@ function onClick(e) {
     case 'next-day': setPreviewOffset(previewOffset + 1); break;
     case 'back-to-today': setPreviewOffset(0); break;
     case 'toggle-adjust': ui.adjustOpen = !ui.adjustOpen; render(); break;   // v3.4 Gym panel
+    case 'toggle-readiness': ui.readinessOpen = !ui.readinessOpen; render(); break;   // v4.1 check-in panel
+    case 'readiness-set': setReadiness(el.dataset.region, el.dataset.level); break;    // v4.1 one region
+    case 'readiness-classsoon': setClassSoon(el.dataset.val === '1'); break;
+    case 'readiness-intent': setSessionIntent(el.dataset.intent); break;
+    case 'readiness-reset': resetReadiness(); break;
+    // v4.2: 24h feedback loop. Green applies immediately; yellow/red open the region step.
+    case 'feedback-light': feedbackLight(el.dataset.light); break;
+    case 'feedback-region': applyFeedback(ui.feedbackPick, el.dataset.region); break;
+    case 'feedback-cancel': ui.feedbackPick = null; ui.feedbackFor = null; render(); break;
+    case 'feedback-skip': feedbackSkip(); break;
+    case 'region-clear': clearRegionStatus(el.dataset.region); break;   // v4.2 Settings row
     case 'toggle-block': toggleBlock(el.dataset.block); break;               // v3.6 collapse a session block
     case 'export': exportState(); break;
     case 'clear': clearData(); break;
@@ -3704,6 +4453,89 @@ function toggleBlock(key) {
   render();
 }
 
+/* --- v4.1 (Phase 3): readiness check-in mutations. Each writes state, saves, and
+ * re-renders — regenerating the visible session live (like the Adjust panel). ------- */
+function ensureReadiness() {
+  if (!state.readiness || typeof state.readiness !== 'object') state.readiness = defaultReadiness();
+  return state.readiness;
+}
+function setReadiness(region, level) {
+  if (!region || !READINESS_LEVELS[region] || READINESS_LEVELS[region].indexOf(level) === -1) return;
+  ensureReadiness()[region] = level;
+  saveState();
+  render();
+}
+function setClassSoon(on) {
+  ensureReadiness().classSoon = !!on;
+  saveState();
+  render();
+}
+function setSessionIntent(intent) {
+  if (SESSION_INTENTS.indexOf(intent) === -1) return;
+  state.sessionIntent = intent;
+  saveState();
+  render();
+}
+function resetReadiness() {
+  state.readiness = defaultReadiness();
+  state.sessionIntent = 'default';
+  saveState();
+  render();
+}
+
+/* --- v4.2 (Phase 4): 24-hour feedback loop mutations ----------------------- */
+// Green answers immediately; yellow/red open a transient region step (re-renders the card).
+function feedbackLight(light) {
+  if (light === 'green') { applyFeedback('green', null); return; }
+  if (light === 'yellow' || light === 'red') {
+    const entry = feedbackPromptEntry();
+    if (!entry) return;
+    ui.feedbackPick = light;
+    ui.feedbackFor = entry.session;   // pin the pick to this entry (see renderFeedbackCard)
+    render();
+  }
+}
+// Stamp the light (and region) on the prompted log entry, then update persistent regionStatus:
+//   green → clear every yellow region (red persists; only Settings clears red);
+//   yellow(region) → park it yellow for YELLOW_SESSIONS unless it is already red (keep red);
+//   red(region) → pause it (light 'red', no sessionsLeft).
+function applyFeedback(light, region) {
+  const entry = feedbackPromptEntry();
+  if (!entry) { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
+  if (light !== 'green' && !REGION_KEYS[region]) { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
+  if (!state.regionStatus || typeof state.regionStatus !== 'object') state.regionStatus = {};
+  const rs = state.regionStatus;
+  if (light === 'green') {
+    entry.feedback = { light: 'green' };
+    Object.keys(rs).forEach((r) => { if (rs[r] && rs[r].light === 'yellow') delete rs[r]; });
+  } else if (light === 'yellow') {
+    entry.feedback = { light: 'yellow', region: region };
+    if (!(rs[region] && rs[region].light === 'red')) rs[region] = { light: 'yellow', sessionsLeft: YELLOW_SESSIONS };
+  } else if (light === 'red') {
+    entry.feedback = { light: 'red', region: region };
+    rs[region] = { light: 'red' };
+  } else { ui.feedbackPick = null; ui.feedbackFor = null; render(); return; }
+  ui.feedbackPick = null;
+  ui.feedbackFor = null;
+  saveState();
+  render();
+}
+// Dismiss (✕): mark the entry answered-but-skipped so it never re-prompts (counts as benign).
+function feedbackSkip() {
+  const entry = feedbackPromptEntry();
+  if (entry) entry.feedbackSkipped = true;
+  ui.feedbackPick = null;
+  ui.feedbackFor = null;
+  saveState();
+  render();
+}
+// Settings "Clear" — remove a region entry (the only way to clear a red region).
+function clearRegionStatus(region) {
+  if (state.regionStatus && state.regionStatus[region]) delete state.regionStatus[region];
+  saveState();
+  render();
+}
+
 // Finish: log the session (Phase 2), advance index, clear checks.
 function finishSession(note) {
   const built = buildSession(state);
@@ -3731,15 +4563,55 @@ function finishSession(note) {
       const eff = effectiveDose(ex);
       const dose = { sets: eff.sets, amount: eff.amount, unit: eff.unit };  // EFFECTIVE dose
       if (eff.weight != null) dose.weight = eff.weight;                     // carry physical load
-      entry.exercises.push({
+      const logged = {
         name: ex.name,
         goals: (ex.goals || []).slice(),
         dose: dose,
         done: !!state.checks[ex.name]
-      });
+      };
+      // v4.2: log contacts for impact families so weekly impact can be tallied against classes.
+      // sets × reps ('reps'); doubled for 'reps/side'. Only when done and rep-based.
+      const fam = moveFamilyId(ex);
+      if (logged.done && (fam === 'landing-impact' || fam === 'jump-power') &&
+          (eff.unit === 'reps' || eff.unit === 'reps/side')) {
+        logged.contacts = eff.sets * eff.amount * (eff.unit === 'reps/side' ? 2 : 1);
+      }
+      entry.exercises.push(logged);
     });
   });
   if (note) entry.note = note;
+  // v4.1: stamp non-default readiness/intent so the volume nudge (and the Phase 4
+  // feedback loop) can tell a deliberately modified session from a normal one.
+  if (state.sessionIntent && state.sessionIntent !== 'default') entry.intent = state.sessionIntent;
+  if (!readinessIsDefault(state.readiness)) entry.readiness = normalizeReadiness(state.readiness);
+
+  // v4.2: snapshot the active region status onto the entry (region → light), then decay yellow
+  // regions the finished session ACTUALLY loaded — a done, non-warmup move carrying that region's
+  // key ≥ 1. (A shins-yellow 'upper' day that never touched shins must not burn a session.)
+  // regionStatus is persistent, so it is NOT reset with the per-session state below.
+  const rs = (state.regionStatus && typeof state.regionStatus === 'object') ? state.regionStatus : {};
+  const activeRegions = Object.keys(rs);
+  if (activeRegions.length) {
+    const snap = {};
+    activeRegions.forEach((region) => { snap[region] = rs[region].light; });
+    entry.regionStatus = snap;
+    const loaded = {};   // region → did some done, non-warmup move load it this session?
+    built.blocks.forEach((bl) => {
+      if (bl.key === 'warmup') return;
+      bl.exercises.forEach((ex) => {
+        if (!state.checks[ex.name]) return;
+        activeRegions.forEach((region) => {
+          if ((REGION_KEYS[region] || []).some((k) => moveLoad(ex, k) >= 1)) loaded[region] = true;
+        });
+      });
+    });
+    activeRegions.forEach((region) => {
+      const s = rs[region];
+      if (s.light !== 'yellow' || !loaded[region]) return;   // red never decays; unloaded regions untouched
+      s.sessionsLeft = (typeof s.sessionsLeft === 'number' ? s.sessionsLeft : YELLOW_SESSIONS) - 1;
+      if (s.sessionsLeft <= 0) delete rs[region];
+    });
+  }
 
   state.log.push(entry);
   state.session += 1;
@@ -3748,6 +4620,8 @@ function finishSession(note) {
   state.swaps = {};              // Phase 4: swaps are per-session trials — clear on finish
   state.setsDone = {};           // Feature E: per-session, cleared on finish
   state.rest = { name: null, startedAt: null };
+  state.sessionIntent = 'default';        // v4.1: readiness/intent are a per-session input — reset
+  state.readiness = defaultReadiness();
   state.lastFinished = entry.date;
   previewOffset = 0;             // v3.1: finishing returns the Today view to today
   saveState();
@@ -3897,6 +4771,13 @@ function sameKnobs(a, b, keys) {
   return !!a && !!b && keys.every((k) => a[k] === b[k]);
 }
 
+// v4.1/v4.2: a session finished under a non-default intent, readiness, OR an active region
+// status (all stamped on the entry by finishSession) was deliberately lighter/filtered — it
+// says nothing about whether the base sliders fit, so the volume nudge skips it both ways.
+function unmodifiedEntry(e) {
+  return !!e && !e.intent && !e.readiness && !e.regionStatus;
+}
+
 // Lowest-value raisable knob (most room to grow); tie-break by RAISE_KNOBS order.
 function pickRaiseKnob(settings, ranges) {
   const cands = RAISE_KNOBS.filter((k) => settings[k] < (ranges[k] || DEFAULT_RANGES[k])[1]);
@@ -3930,6 +4811,8 @@ function pickLowerKnob(entries, routine, settings, ranges) {
  *          values (so the streak really reflects today's load) -> raise a knob.
  *   LOWER: last 2 logged sessions both < 60% complete -> lower the least-
  *          completed block's knob.
+ *   Sessions stamped with a non-default intent/readiness are excluded from both
+ *   (a cleared "short" session is not a mandate to raise the base slider).
  */
 function volumeNudge(st) {
   const log = st.log || [];
@@ -3939,7 +4822,7 @@ function volumeNudge(st) {
   if (log.length >= 3) {
     const last3 = log.slice(-3);
     const all100 = last3.every((e) => sessionCompletion(e) >= 1);
-    const sameLoad = last3.every((e) => sameKnobs(e.settings, s, ALL_KNOBS));
+    const sameLoad = last3.every((e) => sameKnobs(e.settings, s, ALL_KNOBS) && unmodifiedEntry(e));
     if (all100 && sameLoad) {
       const knob = pickRaiseKnob(s, ranges);
       if (knob) {
@@ -3956,7 +4839,7 @@ function volumeNudge(st) {
 
   if (log.length >= 2) {
     const last2 = log.slice(-2);
-    if (last2.every((e) => sessionCompletion(e) < 0.6)) {
+    if (last2.every((e) => unmodifiedEntry(e) && sessionCompletion(e) < 0.6)) {
       const knob = pickLowerKnob(last2, st.routine, s, ranges);
       if (knob) {
         const target = s[knob] - 1;
@@ -4055,8 +4938,19 @@ function skipSuggestions(st, build) {
  * the count naturally resets at the new level.
  */
 function progressionReady(name, cur, log) {
+  const entries = log || [];
+  // v4.2: the most recent session that actually completed this move gates progression — if
+  // the athlete flagged that session yellow/red (24h feedback), hold the pip. Green, a
+  // dismissed prompt, or an unanswered session leaves progression unaffected.
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if ((entries[i].exercises || []).some((e) => e.name === name && e.done)) {
+      const fb = entries[i].feedback;
+      if (fb && (fb.light === 'yellow' || fb.light === 'red')) return false;
+      break;   // only the most-recent completing session counts
+    }
+  }
   let n = 0;
-  (log || []).forEach((entry) => (entry.exercises || []).forEach((e) => {
+  entries.forEach((entry) => (entry.exercises || []).forEach((e) => {
     if (e.name === name && e.done && e.dose &&
         e.dose.sets === cur.sets && e.dose.amount === cur.amount && e.dose.unit === cur.unit &&
         (e.dose.weight || null) === (cur.weight || null)) {
@@ -4187,13 +5081,21 @@ if (typeof module !== 'undefined' && module.exports) {
     migrateFromV1, freshState, currentDay,
     // v3.0 — goal-weighted generator (pure)
     goalActive, trainingGoals, scoreMove, selectMoves, topGoalId,
+    // v4.0 (Phase 2) — generator v2 pure helpers (metadata accessors, budgets, coverage, ordering, pairing)
+    moveLoad, moveFatigue, moveFamilyId, moveFamilyEntry, moveFamilyRank, moveMaxPerFamily, isArmSupport,
+    weeklyClasses, sessionBudgets, bustsBudget, coverageBoost, activeSlotCount, orderByPhase, supersetPairOk,
+    // v4.1 (Phase 3) — readiness check-in + session intents (pure)
+    defaultReadiness, normalizeReadiness, readinessIsDefault, unmodifiedEntry,
+    sessionIntent, readinessCaps, passesReadiness, effectiveMoveBudget,
+    // v4.2 (Phase 4) — 24h feedback loop (pure)
+    normalizeRegionStatus, moveImplicated, doseCutLevel, feedbackPromptEntry, REGION_KEYS,
     // v3.7 — generic tag system (pure)
     tagIndex, tagMultiplier, tagEffectivePriority, tagScoreFactor, defaultTagPriority,
     slugify, uniqueTagId,
     cardGoalIds, moveChipIds, moveGoalIds, buildCooldown,
     progressionParams, progressionLadder, currentLevel, restTarget,
-    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
-    // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate
+    migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
+    // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate; v4.0 shares supersetPairOk (above)
     groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
     // Phase 4 heuristics (pure — take log/state as args)
     leastRecentlyCompleted, lastCompletedIndex, sessionCompletion, buildKnobMap,

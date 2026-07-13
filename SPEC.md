@@ -570,6 +570,13 @@ upgrades stored routines in place.
   likely to evict the localStorage progression data (esp. on Android). No UI; no-op where
   unsupported.
 
+> **Editor's note (superseded).** The per-move `jointStress` array described in this
+> section was retired by the **v3.7 generic tag system** (see below): it migrated into the
+> `joint-stress-legs` / `joint-stress-arms` tags. `jointStress` now survives only inside the
+> `migrateRoutineV10`/`migrateRoutineV11` migration code, not in the live schema. v4.0's
+> per-move `loads` object (Phase 1, see the v4.0 section) is the successor concept for
+> *facts about a move's joint load*; tags remain the user-steerable preference layer.
+
 - **Split joint-friendly (was v3.4's single boolean).** The one `settings.jointFriendly`
   toggle becomes **two independent** ones, `settings.jointFriendlyLegs` and
   `settings.jointFriendlyArms` (each default off), rendered in both the Gym Adjust panel and
@@ -704,6 +711,343 @@ items; `max_output_tokens` replaces `max_completion_tokens`; reasoning effort is
 (`reasoning: {effort}` — top-level `reasoning_effort` is chat-completions-only and 400s
 here). Staging/validation flow unchanged. `sw.js` CACHE bumped to `tumble-trainer-v3.9.2`.
 Note: no org verification needed — it gates only streaming, which the Coach doesn't use.
+
+## v3.9.3 — Coach tab shipped + tag priorities + shins goal + moveset-audit fixes
+The Coach feature (v3.9 / v3.9.1 above) and the surrounding coaching-data updates all
+reached release together in this build (`sw.js` CACHE `tumble-trainer-v3.9.x`). Routine
+schema advanced to **version 13**. What landed:
+- **Coach tab** (OpenAI Responses API, staged tool-call edits) — see the v3.9 / v3.9.1
+  sections for the full design.
+- **Generic 1–5 tag priorities** (v3.7 mechanism) as the steering layer that replaced the
+  old joint-friendly toggles and day-lock; `settings.tagPriority`.
+- **Shins goal + shin moves** and the **gym-only** tag (v3.8 / v12 migration): heel walks,
+  toe walks, bent-knee soleus calf raises, tibialis raises; Arch rocks replaced the retired
+  Wall-sit hollow press; core rescoring.
+- **Moveset-audit fix (`migrateRoutineV13`, routine v13).** Stamped the `joint-stress-arms`
+  tag onto Overhead press and L-sit/tuck-sit hold (seed-known, by name) — arm-loading moves
+  whose bodyweight peers already carried the tag. Idempotent; user-added moves untouched.
+
+## v3.9.4 — Seven audit gap-fill moves
+Routine schema **version 14** (`migrateRoutineV14`). Inserted the seven researched moves that
+fill the moveset audit's coverage gaps — home pulling/posture (Prone Y-T-W raises),
+anti-rotation core (Pallof press), adductor strength (Copenhagen plank), home
+hamstring/quad eccentrics (Nordic hamstring curl, Reverse Nordic curl), lateral-plane plyo
+(Lateral bound), and one-leg hinge (Single-leg RDL). Uses `insertSeedMove` (skips names
+already present; `normalizeState` re-filters tombstones after all migrations, so a deleted
+move never resurrects and duplicates aren't created). `sw.js` CACHE bumped.
+
+## v3.9.5 — Service-worker precache bypasses the HTTP cache
+No schema change. The install handler now fetches each precached asset with
+`new Request(u, { cache: 'reload' })` so a new worker can't precache STALE copies served
+from the browser HTTP cache (GitHub Pages sends `max-age=600`) under the new cache name.
+`sw.js` CACHE `tumble-trainer-v3.9.5`.
+
+## v4.0 — Move metadata foundation (Phase 1 of REDESIGN.md)
+First phase of the capacity-and-load-planner redesign (see **REDESIGN.md** §2.1 and §6 —
+the plan of record). **No generator behavior change** — this ships the data model the
+Phase-2 pipeline will reason over. Routine schema **version 15**; `sw.js` CACHE
+`tumble-trainer-v4.0.0`.
+- **`routine.families[]` catalog** — a new top-level array of `{ id, name, phase,
+  maxPerSession? }`. `phase` is one of `power | strength | skill-strength | trunk |
+  accessory` (the Phase-2 ordering rank); `maxPerSession` defaults to 1 (omitted in the
+  seed). Seeded with the 17 families actually used by pool moves.
+- **Per-move functional metadata** on every `blocks.moves` entry: `family` (one catalog id),
+  `loads` (object of load-region → integer 0–3 over
+  `impact/shin/knee/foot/wrist/elbow/lumbar`, zero regions omitted), `fatigue` (integer 1–5
+  session-fatigue cost), and `qualitySensitive` (bool — degrades badly under fatigue). All
+  **optional** in the validator, so user-/coach-added moves without them stay valid. Warm-up
+  and cool-down are untouched.
+- **Validator** (`validateRoutine`): validates the optional top-level `families` array (unique
+  ids, `phase` enum, positive-integer `maxPerSession`) mirroring the `tags` catalog, and the
+  four optional move fields (`family` resolves into `routine.families` when that catalog
+  exists; `loads` keys ⊆ the seven regions with 0–3 integer values; `fatigue` 1–5;
+  `qualitySensitive` boolean). Constants `FAMILY_PHASES` and `LOAD_KEYS`.
+- **Migration `migrateRoutineV15`** (gated `version < 15`, idempotent): copies the seed's
+  `families` catalog onto the stored routine, then stamps `family/loads/fatigue/
+  qualitySensitive` onto each seed-known move **by name** (never overwriting a field the
+  stored move already carries), and sets `version = 15`. Registered in `normalizeState` right
+  after V14.
+- **Coach**: `COACH_MOVE_SCHEMA` gains the four fields (with LLM guidance — `family` "must
+  match an existing family id"); `update_move` replaces `loads` wholesale alongside
+  dose/goalScores; a new **`add_family`** tool (id slugified from name, `phase` enum, optional
+  `maxPerSession`) mirrors `add_tag` and stages a summary line. Families are mentioned in the
+  system prompt's capability list.
+- **Moves tab**: each move card shows its family as a subtle muted `.mv-family` chip
+  (`familyById` lookup). No slider or generator wiring yet.
+
+### Generator v2 (Phase 2 of REDESIGN.md §3)
+Retools `selectMoves` from a pure score lottery into a constrained planner while staying
+**deterministic** (no RNG, no `Date` — `buildFutureSession` day previews depend on it) and
+**pure** (all state via args). No schema change: the budgets/coverage/thresholds live in
+**code constants** (`GENERATOR_BUDGETS`, `COVERAGE_SLOTS`, `COVERAGE_BOOST`, `HIGH_FATIGUE`),
+tweakable without a migration. CACHE stays `tumble-trainer-v4.0.0` (bumped by Phase 1).
+
+Pipeline per selection — **filters → budgets → coverage → score → order**:
+- **Filters (unchanged):** drop `disabled`, tag at effective priority 1, and base
+  goal-weighted score ≤ 0. Recency boost, tag multiplier, `SECTION_DECAY`, superset-bias
+  multiplier and the greedy strictly-greater / earliest-pool-index tie-break all survive.
+- **Family caps (hard):** track picks per family; once a family reaches `maxPerSession`
+  (default 1) its remaining candidates are ineligible. Structurally prevents
+  hollow-hold + hollow-rocks sessions instead of tuning it away with scores.
+- **Load budgets (hard, session totals):** a candidate whose addition would exceed a budget
+  is skipped this pass (the loop continues with others). Budgets:
+
+  | Budget | Limit |
+  |---|---|
+  | Σ `moveLoad(impact)` | `{0 classes: 4, 1: 3, 2: 2}[weeklyClasses]` |
+  | moves with `fatigue ≥ 4` | 2 |
+  | arm-support moves (`wrist ≥ 2` OR `elbow ≥ 2`) | 2 |
+  | moves with `lumbar ≥ 2` | 2 |
+
+  A move whose single-key load already exceeds a budget can never be selected under it — e.g.
+  an `impact`-3 move is excluded outright at `weeklyClasses` 2 (impact budget 2). Intended: the
+  classes supply that week's impact.
+- **Coverage boost (soft):** an ordered 7-slot template (1 trunk control [`trunk-anti-extension`,
+  `gymnastics-shape`] · 2 anti-rotation [`trunk-anti-rotation`] · 3 shin/ankle [`shin-dorsiflexion`,
+  `calf-soleus`] · 4 squat/single-leg [`squat-knee`, `single-leg`] · 5 hinge [`hinge-hamstring`] ·
+  6 pull [`horizontal-pull`, `posture-accessory`] · 7 gymnastics-specific [`gymnastics-shape`,
+  `handstand-support`]), each a list of families. Active slot count = `min(7, max(3, settings.moves
+  − 2))`. While an active slot
+  has no chosen move from its families, candidates in those families get ×1.5 on their
+  effective score. Slots are preferences, never quotas — a slot with no eligible candidate is
+  simply never satisfied (no deadlock); one pick satisfies every slot its family appears in.
+- **Ordering pass:** in `buildSession`, within each section block, moves stable-sort by family
+  phase rank (`power 0 → strength 1 → skill-strength 2 → trunk 3 → accessory 4`; unknown →
+  strength). Power / quality-sensitive work lands fresh; low-fatigue accessories close.
+- **Termination:** the greedy loop breaks cleanly when no eligible candidate remains, even
+  under budget.
+
+**Missing metadata** (user/coach moves): `moveLoad` defaults 0 per key, `moveFatigue` 3,
+missing/unknown family → no cap, matches no coverage slot, ordering rank strength.
+
+**Superset compatibility** — one shared predicate `supersetPairOk(a, b)` used directly by
+`groupSupersets` (render bucketing) and transitively by `wouldSuperset` (bias scoring, which
+delegates to `groupSupersets`) so they can't drift. A move may join a group only if, versus
+every member: different family (missing = compatible), no shared muscle + same location + ≤1
+largeEquipment (existing), fatigue sum ≤ 6, not both `qualitySensitive`, not both arm-support,
+not both `impact ≥ 1`. Because `groupSupersets` is order-sensitive (greedy first-fit) and the
+Floor block renders **phase-ordered**, both the bias predicate (`wouldSuperset`) and the
+move-cost budget (`sessionMoveCost`) phase-order the Floor moves (`orderByPhase`) before
+grouping, so what selection models is exactly what renders (no cost/grouping divergence).
+
+**`settings.weeklyClasses`** (0|1|2, default 1) — gymnastics classes expected this week; scales
+the impact budget. A 3-stop slider in both the Settings → Session panel and the Gym → Adjust
+panel (shared `renderWeeklyClassesField`, wired through the generic `setting` onChange),
+included in `coachSettingsContext` and normalized/clamped in `normalizeState` + `freshState`.
+
+New pure exports: `moveLoad`, `moveFatigue`, `moveFamilyId`, `moveFamilyRank`, `isArmSupport`,
+`weeklyClasses`, `sessionBudgets`, `bustsBudget`, `coverageBoost`, `orderByPhase`,
+`supersetPairOk`. **Note:** superset-bias 0 no longer reproduces v3.x selection byte-for-byte
+— the generator redesign (caps/budgets/coverage/ordering) changes which moves are chosen.
+
+## v4.1 — Readiness check-in & session intents (Phase 3 of REDESIGN.md)
+
+A pre-session check-in on the Gym tab lets the athlete tell the generator how the body
+feels *today* and pick a session *intent*. These enter the deterministic generator as
+extra **hard filters** and **budget modifiers** — no RNG/Date, no schema change (routine
+stays version 15). Both are **per-session state, cleared on finish**.
+
+### State (per-session, NOT settings, NOT routine)
+
+```jsonc
+state.sessionIntent = "default"   // "default"|"gym-prep"|"recovery"|"low-impact"|"short"|"upper"
+state.readiness = {
+  shins: "good|caution|stop", knee: "good|caution|stop", foot: "good|caution|stop",
+  back: "good|sensitive", arms: "good|caution", energy: "low|normal|high", classSoon: bool
+}
+```
+
+Added in `freshState`; repaired in `normalizeState` (unknown region value → that region's
+default, unknown intent → `default`, `classSoon` coerced to strict boolean); persisted in the
+normal `tumbleTrainer.v2` blob so a mid-session reload keeps them; **reset to defaults in
+`finishSession`** alongside checks/collapsed/swaps. Pure helper `defaultReadiness()` is the
+single source of the all-good object.
+
+### Region → load-key cap mapping (`readinessCaps(state)`)
+
+A cap is the *max allowed load* on a key; a move whose load exceeds it leaves today's pool
+(`passesReadiness(move, caps)`). Only capped keys appear. When two sources cap the same key,
+the more restrictive (min) wins.
+
+| Input | Cap |
+|---|---|
+| region `caution` (shins/knee/foot) | that load key (`shin`/`knee`/`foot`) ≤ 1 |
+| region `stop` (shins/knee/foot) | that load key ≤ 0 |
+| back `sensitive` | `lumbar` ≤ 1 |
+| arms `caution` | `wrist` ≤ 1 **and** `elbow` ≤ 1 |
+| intent `upper` | `impact`,`shin`,`knee`,`foot` all ≤ 0 (a legs-off day) |
+
+### Budget modifiers (`sessionBudgets(state)`) — compose over the weeklyClasses base by `min()`
+
+| Budget | Base | Tightened to `min(base, …)` when |
+|---|---|---|
+| Σ impact | 4/3/2 by weeklyClasses 0/1/2 | `classSoon` or intent `gym-prep` → 1 · intent `low-impact`/`upper` → 0 |
+| moves with fatigue ≥ 4 | 2 | intent `recovery` or energy `low` → 1 |
+| arm-support moves (wrist∨elbow ≥ 2) | 2 | arms `caution` → 1 |
+| moves with lumbar ≥ 2 | 2 | back `sensitive` → 1 |
+
+Budgets only ever *tighten* — energy `high` adds no bonus. `sessionBudgets` accepts either a
+full state (applies modifiers) or a bare settings object (Phase-2 callers get base budgets),
+so existing call sites keep working.
+
+### Session intents (`sessionIntent(state)`, `effectiveMoveBudget(state)`)
+
+| Intent | Effect |
+|---|---|
+| `default` | nothing |
+| `gym-prep` | impact budget → min 1 |
+| `recovery` | fatigue≥4 budget → min 1 (move count unchanged) |
+| `low-impact` | impact budget → 0 |
+| `short` | move budget = `max(3, settings.moves − 2)` (the only intent that changes move count) |
+| `upper` | impact budget → 0 **and** leg loads (impact/shin/knee/foot) capped at 0 |
+
+### Log stamping & heuristic exclusion
+
+`finishSession` stamps the log entry with `intent` (when non-default) and `readiness` (a
+normalized copy, when non-default; `readinessIsDefault` decides). The volume nudge treats
+stamped entries as non-evidence in **both** directions (`unmodifiedEntry` guard): three
+cleared "short" sessions must not suggest raising the base moves slider, and a half-finished
+"recovery" session must not suggest lowering it. The stamps also give the Phase 4 feedback
+loop its "comparable session" signal.
+
+### Future-preview neutralization
+
+`buildFutureSession(state, offset>0)` deep-clones the state and resets `readiness` to
+`defaultReadiness()` and `sessionIntent` to `default` before simulating — a future day must
+not inherit "how I feel right now". Offset 0 is today and honours live readiness/intent.
+
+### Panel UX
+
+Collapsed-by-default "Readiness check-in" panel (transient `ui.readinessOpen`, reuses the
+`adjust-panel`/`adjust-toggle`/`adjust-body` collapse pattern), placed just below the Adjust
+panel above the session; hidden in preview. One segmented one-tap row per region + a
+class-within-24h toggle + a session-intent selector; each tap writes state, saves, and
+re-renders — the same live-regenerate pattern as the Adjust panel. A summary chip on the
+collapsed header (`readiness-chip`, e.g. "shins caution · short") keeps any active filter
+visible; a one-tap **Reset** restores defaults. Non-diagnostic helper copy: *"Filters today's
+session only — it doesn't assess injuries. Persistent, worsening, or neurological symptoms →
+clinician."* Readiness + intent are also fed into `coachSettingsContext` (compact, non-default
+values only) and the Coach system prompt notes they are athlete-only inputs it cannot set.
+
+New pure exports: `defaultReadiness`, `normalizeReadiness`, `readinessIsDefault`,
+`unmodifiedEntry`, `sessionIntent`, `readinessCaps`, `passesReadiness`, `effectiveMoveBudget`
+(plus the extended `sessionBudgets`).
+
+## v4.2 — 24-hour feedback loop (Phase 4 of REDESIGN.md)
+
+On the first Gym-tab open ≥12 h after a finished session, a one-tap prompt asks how the
+session settled. A yellow/red answer parks a body **region** in a persistent
+`state.regionStatus` map that the deterministic generator reads as *state* (never RNG/Date —
+`Date.now()` appears only in the UI gate and `finishSession`'s ISO stamp). No schema change
+(routine stays version 15).
+
+### State (persistent, NOT settings, NOT routine)
+
+```jsonc
+state.regionStatus = {
+  // key ∈ shins|knee|foot|back|arms ; absence of a key = green
+  shins: { light: "yellow", sessionsLeft: 1|2 },   // yellow carries sessionsLeft
+  back:  { light: "red" }                            // red carries no sessionsLeft
+}
+```
+
+Added in `freshState` (`{}`); repaired in `normalizeState` via pure `normalizeRegionStatus`
+(non-object → `{}`; unknown region/light dropped; yellow `sessionsLeft` rounded + clamped
+1..2, default 2; red stripped of `sessionsLeft`). Persisted in the normal `tumbleTrainer.v2`
+blob; **not** reset on finish (only a green check-in clears yellow, only Settings clears red).
+
+Module consts: `REGION_KEYS = { shins:['shin'], knee:['knee'], foot:['foot'], back:['lumbar'],
+arms:['wrist','elbow'] }`, `FEEDBACK_DELAY_MS = 12·3600·1000`, `YELLOW_SESSIONS = 2`,
+`DOSE_CUT = 0.8`.
+
+### Prompt trigger (`feedbackPromptEntry()`)
+
+Returns the **last** log entry iff the log is non-empty, that entry has neither `feedback`
+nor `feedbackSkipped`, and `Date.now() − Date.parse(entry.date) ≥ FEEDBACK_DELAY_MS`. Only
+ever the last entry — older unanswered entries are never prompted. The card renders above the
+suggestions (live view only, not while the finish sheet is up).
+
+The transient yellow/red region step (`ui.feedbackPick`) is pinned to the entry it was opened
+for (`ui.feedbackFor` = that entry's `session`); if the athlete leaves the step open, finishes
+another session, and a later prompt targets the newer entry, the stale pick is ignored and the
+card starts back at the light choice — a pick can never stamp an entry it wasn't made for.
+
+### Effects (green / yellow / red)
+
+| Answer | Log stamp | regionStatus | Generator effect |
+|---|---|---|---|
+| Green | `feedback:{light:'green'}` | delete every **yellow** region (red persists) | none |
+| Yellow(region) | `feedback:{light,region}` | `region → {yellow, sessionsLeft:2}` unless already red | region budget −1 step; implicated-move dose ~−20%; ready-pip suppressed |
+| Red(region) | `feedback:{light,region}` | `region → {red}` | region load keys capped at 0 (moves filtered out); dose/pip as yellow |
+| ✕ dismiss | `feedbackSkipped:true` | unchanged | none (benign / "unanswered" for gating) |
+
+### Region → keys and region → budget mappings
+
+`REGION_KEYS` above gives region → load keys. Budget mapping (yellow only, cumulative,
+floored at 0): **shins/knee/foot → impact −1**, **back → lumbar −1**, **arms → armSupport −1**
+(`sessionBudgets`). Red caps every one of a region's keys at 0 (`readinessCaps`, composed with
+readiness caution/stop via `min()`); yellow adds **no** cap.
+
+### Dose cut (`moveImplicated`, `doseCutLevel`, `effectiveDose`)
+
+`moveImplicated(move, regionStatus)` = some yellow **or** red region has `moveLoad(move,key) ≥ 1`
+on any of its keys. For an implicated move, `doseCutLevel(ladder, level)` picks the display
+level: level 0 (base) is the floor; else target = `DOSE_CUT × sets×amount` at `level`, walk
+down from `level−1` and return the first (highest) step ≤ target, else `level−1` (always ≥1
+step down; weight ignored). `effectiveDose` applies it and sets `reduced:true` (card shows a
+muted "· eased"). Because `finishSession` logs `effectiveDose`, reduced doses log
+automatically.
+
+### Decay (`finishSession`)
+
+"Comparable" = the finished session **loaded** the region: some done, non-warmup move carries
+that region's key ≥ 1. On finish, snapshot `entry.regionStatus = {region:light,…}`, then for
+each yellow region the session loaded, `sessionsLeft−−` (delete at 0). Red never decays. An
+'upper' day with shins yellow does **not** consume a shins session.
+
+### Contacts (`finishSession`)
+
+For done, non-warmup moves whose family is `landing-impact` or `jump-power` and whose effective
+dose unit is `reps`/`reps/side`, stamp `contacts = sets×amount` (`reps`) or `sets×amount×2`
+(`reps/side`) on the logged exercise, so weekly impact can be tallied against classes.
+
+### Progression gating (`progressionReady`, `renderProgression`)
+
+Keeps the 4+-completions rule and adds: the **most recent** session that completed this move,
+if flagged yellow/red, blocks progression (green / dismissed / unanswered → unaffected).
+`renderProgression` additionally suppresses the ready-pip (not the manual ▲) while the move is
+currently implicated.
+
+### Preview behavior
+
+`regionStatus` is persistent, so `buildFutureSession(offset>0)` KEEPS it (only readiness /
+sessionIntent are neutralized) — a red-shins region still filters the day-after preview, and
+yellow budget cuts still apply. `sessionsLeft` decay is **not** simulated in previews.
+
+### Volume-nudge exclusion
+
+`unmodifiedEntry(e)` extends to `!e.intent && !e.readiness && !e.regionStatus`: a
+region-constrained session is deliberately lighter, so the nudge ignores it in both directions.
+
+### Status visibility + clearing
+
+Gym tab: a compact "Settling: shins yellow · 2 sessions left" strip above the readiness panel
+(red phrased "back red — cleared in Settings"); a clinician `notice` banner when any region is
+red. Settings: a "Region status" block (one row per region + per-row Clear, `region-clear`).
+Coach: `coachSettingsContext` adds a compact line; the system prompt notes the feedback lights
+and region status are athlete-only inputs the Coach can see but never set or clear (no tools).
+
+### Interpretation notes (deliberate readings of REDESIGN §4)
+
+- **Region → budget** mapping is shins/knee/foot → impact, back → lumbar, arms → armSupport.
+- The **~20% dose cut** applies to all yellow-implicated moves (load ≥ 1 on a region key), not
+  only `landing-impact`/`jump-power` — the spec's "impact-move" is the typical case, not a
+  family filter. (The family filter *does* gate the separate contacts logging.)
+- **Green clears yellow only**; red is cleared only in Settings.
+
+New pure exports: `normalizeRegionStatus`, `moveImplicated`, `doseCutLevel`,
+`feedbackPromptEntry`, `REGION_KEYS` (`readinessCaps`, `sessionBudgets`, `progressionReady`,
+`unmodifiedEntry` already exported).
 
 ## Non-goals
 - No accounts, no server, no analytics
