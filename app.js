@@ -11,7 +11,7 @@
  *   6. Rendering  (Today view, Settings view, header, tabs)
  *   7. Event handling & mutations  (checks, steppers, finish, settings, editor)
  *   8. Import / export / clear / history  (Phase 2 & 3)
- *  10. Heuristics  (Phase 4 — volume nudge, skip swap, progression hint;
+ *  10. Heuristics  (Phase 4 — volume nudge, progression hint; skip-swap removed v4.8.1;
  *                   variety guarantee is in section 4's selectVariety)
  *   9. Service worker + init
  *
@@ -179,8 +179,10 @@ function freshState(routine) {
     log: [],                      // Phase 2 session log
     lastFinished: null,
     dismissed: {},                // Phase 4: { [suggestionKey]: sessionIndexWhenDismissed }
-    swaps: {},                    // Phase 4: { [exerciseName]: replacementName } — per-session, cleared on finish
     autoSuperset: true,           // v2.5: group same-location skill/core moves into supersets (default ON)
+    // v4.8.1: local calendar day "YYYY-MM-DD" the persisted per-day state belongs to. null =
+    // never stamped (first run / fresh state); rolloverNewDay() stamps it and resets on a new day.
+    dayStamp: null,
     // v4.1 (Phase 3): per-session readiness + intent (cleared on finish). Not in settings /
     // routine — a transient body-state the generator filters/budgets against. See selectMoves.
     sessionIntent: 'default',     // 'default'|'gym-prep'|'recovery'|'low-impact'|'short'|'upper'
@@ -1346,14 +1348,17 @@ function normalizeState(obj) {
     routineHistory: obj.routineHistory || [],
     log: obj.log || [],
     dismissed: obj.dismissed || {},
-    swaps: obj.swaps || {},
     // v2.5 Auto Superset — state-level toggle, default ON (NOT part of the routine migration).
     autoSuperset: typeof obj.autoSuperset === 'boolean' ? obj.autoSuperset : true,
+    // v4.8.1: carry the calendar-day stamp through (string or null; default null). Old saves
+    // with a `swaps` key are silently dropped — the skip-swap feature was removed in v4.8.1.
+    dayStamp: typeof obj.dayStamp === 'string' ? obj.dayStamp : null,
     deletedMoves: tombstones,
     routine: routine,
     view: ['today', 'daily', 'moves', 'coach', 'settings'].indexOf(obj.view) >= 0 ? obj.view : 'today'
   });
   delete merged.settings.aerial;   // obsolete — aerial is now a goal
+  delete merged.swaps;             // v4.8.1: skip-swap feature removed — drop any legacy swaps key
   // v3.9: seed the editable athlete profile on installs that predate the Coach.
   if (typeof merged.settings.coachProfile !== 'string') merged.settings.coachProfile = DEFAULT_COACH_PROFILE;
 
@@ -1689,6 +1694,10 @@ function validateRoutine(routine) {
     // goalScores ids are checked).
     if ('disabled' in ex && typeof ex.disabled !== 'boolean') {
       errors.push(path + ' (' + label + '): disabled must be a boolean');
+    }
+    // v4.8.1: optional `noSuperset` boolean keeps a move out of every superset (supersetPairOk).
+    if ('noSuperset' in ex && typeof ex.noSuperset !== 'boolean') {
+      errors.push(path + ' (' + label + '): noSuperset must be a boolean');
     }
     if ('tags' in ex) {
       if (!Array.isArray(ex.tags)) {
@@ -2141,8 +2150,10 @@ function orderByPhase(routine, moves) {
 // grouping (groupSupersets) and transitively by the bias scorer (wouldSuperset, which
 // delegates to groupSupersets) so the two cannot drift. True iff moves `a` and `b` may
 // share a superset group. Pure.
+// v4.8.1: a move flagged noSuperset is never grouped into a superset, on either side.
 function supersetPairOk(a, b) {
   if (!a || !b) return false;
+  if (a.noSuperset || b.noSuperset) return false;                          // v4.8.1: opt out of supersets
   if ((a.location || 'floor') !== (b.location || 'floor')) return false;   // existing: same location
   if (a.muscle && b.muscle && a.muscle === b.muscle) return false;         // existing: no shared muscle
   const fa = moveFamilyId(a), fb = moveFamilyId(b);
@@ -2298,10 +2309,12 @@ function sessionMoveCost(moves, autoSuperset, routine) {
  *   2. baseScore = Σ training goal weight × goalScore; drop moves scoring 0.
  *   3. Recency boost: sessionsSince = sessions since the move was last completed
  *      (never -> 6, capped at 6); effective = base × (1 + 0.1 × sessionsSince).
- *   4. Greedily take `moves` picks: each pick maximizes
+ *   4. Greedily take picks until the session cost reaches `moves`: each pick maximizes
  *      effective × SECTION_DECAY^(already-picked in that move's section),
  *      deterministic tie-break by pool order. The decay keeps the session from
  *      flooding with one section's moves so every populated section stays present.
+ *      v4.8.1: a candidate is eligible only if adding it keeps total cost <= `moves`
+ *      (superset members cost 0.5), so the session never overshoots the slider.
  * Returns the selected move objects in their original pool order.
  */
 function selectMoves(st) {
@@ -2372,6 +2385,12 @@ function selectMoves(st) {
   const biasOn = autoSuperset && bias > 0;
   const underBudget = () =>
     sessionMoveCost(chosen.slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset, st.routine) < count;
+  // v4.8.1: total session cost if `cand` were also chosen. Superset members cost 0.5, so a
+  // 1-cost candidate can push a 5.5-cost set to 6.5 when the slider says 6 — underBudget()
+  // only gates BEFORE the pick, never the result. A per-candidate check (not a blanket stop)
+  // is required because a floor move can be net +0 (it pairs an existing solo 1 into two 0.5s).
+  const costWith = (cand) =>
+    sessionMoveCost(chosen.concat([cand]).slice().sort((a, b2) => a.i - b2.i).map((o) => o.move), autoSuperset, st.routine);
   // Move a candidate (by `remaining` index) into `chosen`, updating every running total.
   const take = (idx) => {
     const pick = remaining.splice(idx, 1)[0];
@@ -2397,6 +2416,7 @@ function selectMoves(st) {
       const fam = moveFamilyId(c.move);
       if (fam && (famCount[fam] || 0) >= moveMaxPerFamily(st.routine, c.move)) continue;
       if (bustsBudget(c.move, budgetTotals, budgets)) continue;
+      if (costWith(c) > count) continue;   // v4.8.1: never overshoot the moves slider
       if (best === -1 || c.effective > bestVal || (c.effective === bestVal && c.i < remaining[best].i)) { bestVal = c.effective; best = j; }
     }
     if (best >= 0) take(best);
@@ -2409,6 +2429,7 @@ function selectMoves(st) {
       // Hard: family cap reached, or this pick would bust a load budget → ineligible.
       if (fam && (famCount[fam] || 0) >= moveMaxPerFamily(st.routine, c.move)) continue;
       if (bustsBudget(c.move, budgetTotals, budgets)) continue;
+      if (costWith(c) > count) continue;   // v4.8.1: skip picks that push total cost past the slider
       let val = c.effective * Math.pow(SECTION_DECAY, sectionCount[c.section] || 0);
       if (biasOn && wouldSuperset(chosen, c, st.routine)) val *= (1 + 0.1 * bias);
       val *= coverageBoost(c.move, famCount, activeSlots);   // soft coverage nudge
@@ -2756,7 +2777,7 @@ function buildSession(st) {
   const cooldown = buildCooldown(st, context);
   if (cooldown.length) blocks.push({ key: 'cooldown', title: 'Cool-down', exercises: cooldown });
 
-  return { session, day, blocks: applySwaps(blocks, st) };
+  return { session, day, blocks: blocks };
 }
 
 /*
@@ -2766,8 +2787,7 @@ function buildSession(st) {
  * each step builds that session, appends a simulated "completed" log entry (the
  * same shape finishSession writes, minus dose/intensity — recency only reads
  * name + done), and advances the session index; the target session is built from
- * the simulated state. Per-session swaps are dropped in the copy (applySwaps only
- * applies at offset 0), and intensity levels are NOT advanced (preview doses show
+ * the simulated state. Intensity levels are NOT advanced (preview doses show
  * at current intensity — see SPEC.md v3.1).
  */
 function simulatedLogEntry(sim, build) {
@@ -2791,7 +2811,6 @@ function buildFutureSession(st, offset) {
   offset = Math.max(0, offset | 0);
   if (!offset) return buildSession(st);
   const sim = deepClone(st);
-  sim.swaps = {};                       // preview ignores per-session swaps
   // v4.1 (Phase 3): a future day must NOT inherit today's readiness/intent — those are
   // a "how do I feel right now" input. Previews generate the neutral, all-good session.
   sim.readiness = defaultReadiness();
@@ -2835,26 +2854,6 @@ function collectPools(routine) {
     }
   });
   return pools;
-}
-
-/*
- * Phase 4, heuristic #2 (apply side): substitute skip-swapped exercises into
- * the rendered session only. state.routine is NEVER edited — this maps a
- * display copy. Swaps are cleared on finish (see finishSession), so a swap is
- * a one-session trial; if the skip pattern persists the suggestion returns.
- */
-function applySwaps(blocks, st) {
-  const swaps = st.swaps || {};
-  if (!Object.keys(swaps).length) return blocks;
-  return blocks.map((bl) => ({
-    key: bl.key, title: bl.title,
-    exercises: bl.exercises.map((ex) => {
-      const repName = swaps[ex.name];
-      if (!repName) return ex;
-      const rep = findExerciseByName(st.routine, repName);
-      return rep || ex;
-    })
-  }));
 }
 
 /* --- 5. Doses & intensity overrides (Phase 1) ----------------------------- */
@@ -3012,6 +3011,9 @@ function restTarget(ex, blockKey) {
 
 function render() {
   if (typeof document === 'undefined') return;   // no-op under Node (smoke tests call mutators directly)
+  // v4.8.1: roll over a stale calendar day before drawing (cheap string compare on the common
+  // path). Only mutates state/saves; it never calls render(), so this cannot recurse.
+  rolloverNewDay();
   const y = window.scrollY;
   renderTabs();
   const view = document.getElementById('view');
@@ -3277,7 +3279,7 @@ function renderToday(build) {
   renderedExercises = [];
   const preview = inPreview();
   let html = renderPreviewBar(build);
-  // Suggestions (incl. swap chips) are interactive — hide them while previewing.
+  // Suggestions are interactive — hide them while previewing.
   if (!preview) html += renderSuggestions(build);
   // v3.4: collapsible "Adjust session" — the same sliders/toggles as Settings, live in
   // the Gym tab so tuning immediately re-generates the session below. Hidden in preview.
@@ -3898,11 +3900,20 @@ function renderMoveRow(m, idx, training) {
     meta.push('<span class="mv-tag">' + escapeHtml(t ? t.name : id) + '</span>');
   });
   const disabled = !!m.disabled;
+  // v4.8.1: the "No superset" toggle only matters for Floor moves with a muscle — those are
+  // the only moves supersetPairOk/sessionMoveCost ever group. Show it just for them.
+  const supersetable = (m.section || 'floor') === 'floor' && !!m.muscle;
+  const noSuperset = !!m.noSuperset;
   return '<div class="mv-row' + (disabled ? ' mv-row-disabled' : '') + '">' +
     '<div class="mv-row-head">' +
       '<span class="mv-name">' + escapeHtml(m.name) +
         (disabled ? ' <span class="mv-off">disabled</span>' : '') + '</span>' +
       '<div class="mv-row-actions">' +
+        (supersetable ?
+          '<label class="mv-enable" title="Keep this move out of supersets">' +
+            '<input type="checkbox" data-action="mv-toggle-superset" data-idx="' + idx + '"' +
+              (noSuperset ? ' checked' : '') + ' aria-label="Keep ' + escapeHtml(m.name) + ' out of supersets">' +
+            '<span>No SS</span></label>' : '') +
         '<label class="mv-enable" title="Include this move in generated sessions">' +
           '<input type="checkbox" data-action="mv-toggle" data-idx="' + idx + '"' +
             (disabled ? '' : ' checked') + ' aria-label="Enable ' + escapeHtml(m.name) + '">' +
@@ -3937,6 +3948,9 @@ function renderAddMoveForm(training) {
     '<div class="field"><label for="mv-muscle">Muscle (Floor supersets)</label><input type="text" id="mv-muscle" placeholder="optional, e.g. core"></div>' +
     '<div class="field"><label for="mv-why">Why</label><input type="text" id="mv-why" placeholder="optional purpose"></div>' +
     '</div>';
+  // v4.8.1: opt a move out of supersets entirely (see supersetPairOk / noSuperset).
+  h += '<div class="field"><label class="mv-tag-chip"><input type="checkbox" id="mv-no-superset"> ' +
+    'No superset (never group this move into a superset)</label></div>';
   // v3.7: tag chips — every routine tag (including the auto Day A/B tags) is a toggle on
   // the new move. Plus a "new tag" affordance: typing a name adds a tag to the routine
   // (id slugified, collision-safe) and gives it a settings slider at 3.
@@ -3971,6 +3985,18 @@ function toggleMoveDisabled(i) {
   if (!m) return;
   if (m.disabled) delete m.disabled;
   else m.disabled = true;
+  saveState();
+  render();
+}
+
+// v4.8.1: toggle a move's noSuperset flag (kept out of every superset — see supersetPairOk).
+// Stored as `noSuperset: true` on the move; the flag is deleted when off (absent = false).
+// `m` is a live reference into state.routine.blocks.moves, so mutating it persists.
+function toggleMoveNoSuperset(i) {
+  const m = renderedMoves[i];
+  if (!m) return;
+  if (m.noSuperset) delete m.noSuperset;
+  else m.noSuperset = true;
   saveState();
   render();
 }
@@ -4016,6 +4042,8 @@ function addMove() {
   if (!isNaN(w) && w > 0) move.dose.weight = w;
   const muscle = ((g('mv-muscle') && g('mv-muscle').value) || '').trim();
   if (muscle) move.muscle = muscle;
+  // v4.8.1: only stamp the flag when checked (absent = false).
+  if (g('mv-no-superset') && g('mv-no-superset').checked) move.noSuperset = true;
   // v3.7: collect the checked tag chips into the move's `tags` array.
   const tags = [];
   if (typeof document.querySelectorAll === 'function') {
@@ -4360,6 +4388,7 @@ const COACH_MOVE_SCHEMA = {
     fatigue: { type: 'integer', minimum: 1, maximum: 5, description: 'session-fatigue cost 1 (trivial) .. 5 (very taxing)' },
     qualitySensitive: { type: 'boolean', description: 'true when the move degrades badly under fatigue (skill/power holds)' },
     muscle: { type: 'string' },
+    noSuperset: { type: 'boolean', description: 'true keeps this move out of every superset (never grouped)' },
     rest: { type: 'integer', description: 'rest seconds (> 0)' },
     progression: { type: 'object' },
     disabled: { type: 'boolean' }
@@ -4377,7 +4406,7 @@ const COACH_TOOLS = [
   },
   { type: 'function',
     name: 'update_move',
-    description: 'Shallow-merge a patch onto the move matched by exact name. dose, goalScores, progression, tags, care and loads are replaced wholesale when present in the patch.',
+    description: 'Shallow-merge a patch onto the move matched by exact name. dose, goalScores, progression, tags, care and loads are replaced wholesale when present in the patch. Set noSuperset: true to keep a move out of supersets (noSuperset: false clears the flag).',
     parameters: { type: 'object', properties: {
       name: { type: 'string' },
       patch: { type: 'object', description: 'partial move fields to overwrite' }
@@ -4469,6 +4498,8 @@ function applyCoachTool(name, args, trial) {
       const mv = findMove(args.name);
       if (!mv) return err('update_move: no move named "' + args.name + '"');
       Object.assign(mv, deepClone(args.patch));   // dose/goalScores/progression/tags/care/loads replace wholesale
+      // v4.8.1: noSuperset is an absent-means-false flag — a patch of false clears it rather than storing false.
+      if (mv.noSuperset === false) delete mv.noSuperset;
       return ok('Update move: ' + args.name + ' (' + Object.keys(args.patch).join(', ') + ')');
     }
     case 'delete_move': {
@@ -4598,7 +4629,8 @@ function coachSystemPrompt() {
     '- A valid move needs: name, section (one of ' + SECTIONS.join(', ') + '), why, dose',
     '  { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ' }, and goalScores',
     '  (map of training-goal id -> integer 0-10; omit goals scoring 0). Optional: care[] (care-goal ids),',
-    '  tags[] (ids from routine.tags), muscle, rest (seconds), progression, dose.weight (lb), disabled, and',
+    '  tags[] (ids from routine.tags), muscle, rest (seconds), progression, dose.weight (lb), disabled,',
+    '  noSuperset (bool — keep the move out of every superset), and',
     '  the functional metadata family (a routine.families id), loads (per-region 0-3, omit zeros),',
     '  fatigue (1-5), qualitySensitive (bool) — data the session planner reasons over.',
     '- goalScores keys must be existing TRAINING goal ids; care[] must be existing CARE goal ids; tags[]',
@@ -4779,8 +4811,7 @@ function coachApplyPending() {
     delete state.setsDone[name];
     if (ui.expanded.has(name)) ui.expanded.delete(name);
   });
-  state.swaps = {};                        // a routine change can invalidate per-session keys (mirrors rollback)
-  state.dismissed = {};
+  state.dismissed = {};                    // a routine change can invalidate per-session keys (mirrors rollback)
   ui.coach.pending = null;
   ui.coach.messages.push({ role: 'assistant', text: 'Applied — your routine is updated. (Undo via Settings → Routine history.)' });
   saveState();
@@ -4987,6 +5018,8 @@ function onChange(e) {
     render();
   } else if (action === 'mv-toggle') {
     toggleMoveDisabled(+el.dataset.idx);         // v3.4 Moves-tab enable/disable
+  } else if (action === 'mv-toggle-superset') {
+    toggleMoveNoSuperset(+el.dataset.idx);       // v4.8.1 Moves-tab no-superset flag
   } else if (action === 'coach-profile') {
     coachSaveProfile(el);                        // v3.9 persist the athlete profile on edit (no re-render)
   } else if (action === 'import') {
@@ -5187,6 +5220,52 @@ function cycleDailyMode() {
   render();
 }
 
+/* --- v4.8.1: calendar-day rollover --------------------------------------- *
+ * The per-day state (checks, setsDone, rest clock, readiness dials, session intent)
+ * is meant to describe TODAY. If the app is left open (or a PWA is reopened) after
+ * midnight, that stale state should not carry into the new calendar day. rolloverNewDay()
+ * runs at the top of render(): it compares state.dayStamp (the local day the state
+ * belongs to) against today. On a genuine day change it either auto-finishes an
+ * in-progress gym session (if any main gym move was checked off) or just resets the
+ * per-day fields, then re-stamps. It never runs in the pure engine (Date-free) sections.
+ */
+// Zero-pad a small integer to two digits ("7" -> "07"). Mutation-side helper.
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+// Local calendar day key "YYYY-MM-DD" (LOCAL time, not UTC — toISOString would shift days).
+function localDayKey() {
+  const d = new Date();
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+// Handle a calendar-day boundary. Returns true iff it reset/auto-finished for a new day.
+function rolloverNewDay() {
+  const today = localDayKey();
+  if (state.dayStamp === today) return false;           // same day — nothing to do (common path)
+  if (!state.dayStamp) {                                 // first run after upgrade — adopt today, keep any in-flight session
+    state.dayStamp = today;
+    saveState();
+    return false;
+  }
+  // A new day has started. If any MAIN gym move (not a warm-up/cool-down move, which are
+  // shared with the Daily tab) was checked off, the session was under way — log it as-is.
+  const built = buildSession(state);
+  const startedGym = (built.blocks || []).some((bl) =>
+    bl && bl.key !== 'warmup' && bl.key !== 'cooldown' &&
+    (bl.exercises || []).some((ex) => ex && state.checks[ex.name]));
+  if (startedGym) {
+    finishSession('Auto-completed (new day)');           // logs, advances A/B, resets per-day state + stamps dayStamp
+  } else {
+    // No gym work begun — just reset today's transient state (readiness dials are today's dials).
+    state.checks = {};
+    state.setsDone = {};
+    state.rest = { name: null, startedAt: null };
+    state.readiness = defaultReadiness();
+    state.sessionIntent = 'default';
+  }
+  state.dayStamp = today;
+  saveState();
+  return true;
+}
+
 // Finish: log the session (Phase 2), advance index, clear checks.
 function finishSession(note) {
   const built = buildSession(state);
@@ -5240,12 +5319,12 @@ function finishSession(note) {
   state.session += 1;
   state.checks = {};
   state.collapsed = {};          // v3.6: a fresh session starts with every block expanded
-  state.swaps = {};              // Phase 4: swaps are per-session trials — clear on finish
   state.setsDone = {};           // Feature E: per-session, cleared on finish
   state.rest = { name: null, startedAt: null };
   state.sessionIntent = 'default';        // v4.1: readiness/intent are a per-session input — reset
   state.readiness = defaultReadiness();
   state.lastFinished = entry.date;
+  state.dayStamp = localDayKey();  // v4.8.1: state is now current as of today — see rolloverNewDay
   previewOffset = 0;             // v3.1: finishing returns the Today view to today
   saveState();
 }
@@ -5319,8 +5398,7 @@ function rollback(hidx) {
   if (!confirm('Roll back to this routine version?')) return;
   pushHistory(state.routine);            // current becomes undoable
   state.routine = deepClone(entry.routine);
-  state.swaps = {};                      // a routine change may invalidate swap/dismissed keys
-  state.dismissed = {};
+  state.dismissed = {};                  // a routine change may invalidate dismissed keys
   saveState();
   render();
 }
@@ -5478,83 +5556,6 @@ function volumeNudge(st) {
   return null;
 }
 
-// The most-recent `k` appearances of `name` in the log (most-recent first).
-function recentAppearances(name, log, k) {
-  const apps = [];
-  for (let i = log.length - 1; i >= 0 && apps.length < k; i--) {
-    const e = (log[i].exercises || []).find((x) => x.name === name);
-    if (e) apps.push(e);
-  }
-  return apps;
-}
-
-// Heuristic #2 predicate: skipped in 2+ of its last 3 appearances (needs >=2 appearances).
-function skippedRecently(name, log) {
-  const apps = recentAppearances(name, log, 3);
-  if (apps.length < 2) return false;
-  return apps.filter((a) => !a.done).length >= 2;
-}
-
-// All goal/care ids a move touches — training goals it scores on, plus care tags.
-function moveGoalIds(ex) {
-  return Object.keys((ex && ex.goalScores) || {}).concat((ex && ex.care) || []);
-}
-
-/*
- * Pick a replacement for a skipped move (v3.0). Candidates come from blocks.moves,
- * share at least one goal/care id with the skipped move, aren't hard-avoided by a tag,
- * have a positive goal-weighted score, and aren't already shown/proposed/itself. Ranked
- * least-recently-completed (consistent with the variety guarantee), pool order.
- */
-function pickReplacement(name, st, shownNames, proposed, day) {
-  const routine = st.routine;
-  const base = findExerciseByName(routine, name);
-  if (!base) return null;
-  const baseIds = moveGoalIds(base);
-  const log = st.log || [];
-  const goals = ((routine && routine.goals) || []).filter((g) => g && g.kind === 'training');
-  const pool = (routine.blocks && routine.blocks.moves) || [];
-  const cands = [];
-  pool.forEach((ex) => {
-    if (!ex || ex.name === name) return;
-    if (!moveGoalIds(ex).some((g) => baseIds.indexOf(g) !== -1)) return;
-    if (tagScoreFactor(ex, routine, st.settings || {}, day).excluded) return;
-    if (scoreMove(ex, goals) <= 0) return;
-    if (shownNames.has(ex.name) || proposed.has(ex.name)) return;
-    if (!cands.some((c) => c.name === ex.name)) cands.push(ex);
-  });
-  if (!cands.length) return null;
-  return leastRecentlyCompleted(cands, log)[0].name;
-}
-
-// Heuristic #2 — one swap suggestion per currently-shown, recently-skipped exercise.
-function skipSuggestions(st, build) {
-  const log = st.log || [];
-  if (!build || !log.length) return [];
-  const shownNames = new Set();
-  build.blocks.forEach((bl) => bl.exercises.forEach((ex) => shownNames.add(ex.name)));
-
-  const out = [];
-  const proposed = new Set();   // don't propose the same replacement for two skips
-  build.blocks.forEach((bl) => {
-    if (bl.key === 'warmup') return;
-    bl.exercises.forEach((ex) => {
-      if (st.swaps && st.swaps[ex.name]) return;      // already swapped this session
-      if (!skippedRecently(ex.name, log)) return;
-      const rep = pickReplacement(ex.name, st, shownNames, proposed, build.day);
-      if (!rep) return;
-      proposed.add(rep);
-      out.push({
-        kind: 'swap', name: ex.name, replacement: rep,
-        key: 'swap:' + ex.name,
-        text: 'You keep skipping ' + ex.name + '. Swap in ' + rep + ' instead?',
-        applyLabel: 'Swap in ' + rep
-      });
-    });
-  });
-  return out;
-}
-
 /*
  * Heuristic #4 predicate: exercise completed 4+ times at the CURRENT effective
  * intensity (sets+amount+unit+weight). Bumping reps OR weight changes `cur`, so
@@ -5585,20 +5586,15 @@ function computeSuggestions(st, build) {
   const list = [];
   const vol = volumeNudge(st);
   if (vol && !isDismissed(vol.key, st)) list.push(vol);
-  skipSuggestions(st, build).forEach((sg) => { if (!isDismissed(sg.key, st)) list.push(sg); });
   return list;
 }
 
-// Apply: volume nudge writes the slider (user-owned knob); swap records a
-// per-session substitution (state.routine is never touched).
+// Apply: the volume nudge writes the slider (a user-owned knob). state.routine is never touched.
 function applySuggestion(i) {
   const sg = renderedSuggestions[i];
   if (!sg) return;
   if (sg.kind === 'raise' || sg.kind === 'lower') {
     state.settings[sg.knob] = sg.target;
-  } else if (sg.kind === 'swap') {
-    state.swaps = state.swaps || {};
-    state.swaps[sg.name] = sg.replacement;
   }
   saveState();
   render();
@@ -5705,7 +5701,7 @@ if (typeof module !== 'undefined' && module.exports) {
     // v3.7 — generic tag system (pure)
     tagIndex, tagMultiplier, tagEffectivePriority, tagScoreFactor, defaultTagPriority,
     slugify, uniqueTagId,
-    cardGoalIds, moveChipIds, moveGoalIds,
+    cardGoalIds, moveChipIds,
     // v4.3 (Phase 5) — warm-up engine (pure)
     buildWarmup, warmupContext, warmupMode, warmupModules, warmupRotationIndex, warmupModuleEligible, warmupModulePinned, warmupRotatePick,
     // v4.4 (Phase 6) — cool-down engine (pure)
@@ -5715,12 +5711,12 @@ if (typeof module !== 'undefined' && module.exports) {
     progressionParams, progressionLadder, currentLevel, restTarget,
     migrateRoutine, migrateRoutineV3, migrateRoutineV4, migrateRoutineV5, migrateRoutineV6, migrateRoutineV7, migrateRoutineV8, migrateRoutineV9, migrateRoutineV10, migrateRoutineV11, migrateRoutineV12, migrateRoutineV13, migrateRoutineV14, migrateRoutineV15, migrateRoutineV16, migrateRoutineV17, migrateRoutineV18, migrateRoutineV19, migrateRoutineV20, migrateRoutineV21, insertSeedMove, renameWarmupGroups, warmupGroups, isLegacyRoutine, migrateIntensity, normalizeState,
     // v2.5 Auto Superset (pure grouping + plan); v3.5 adds the bias predicate; v4.0 shares supersetPairOk (above)
-    groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset,
+    groupSupersets, supersetPlan, supersetRestTarget, wouldSuperset, sessionMoveCost,
     // Phase 4 heuristics (pure — take log/state as args)
     leastRecentlyCompleted, lastCompletedIndex, sessionCompletion, buildKnobMap,
-    volumeNudge, pickRaiseKnob, pickLowerKnob, skippedRecently, skipSuggestions,
-    pickReplacement, progressionReady, isDismissed, computeSuggestions,
-    findExerciseByName, collectPools, recentAppearances,
+    volumeNudge, pickRaiseKnob, pickLowerKnob,
+    progressionReady, isDismissed, computeSuggestions,
+    findExerciseByName, collectPools,
     // v3.9 Coach (pure-ish — applyCoachTool mutates the trial it's given)
     applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS,
     _ui: ui,

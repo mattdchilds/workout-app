@@ -1533,3 +1533,65 @@ inserts the two wrist moves via `insertSeedMove` (no-op if present; deleted-move
 filter after migrations), re-stamps `structure` prose (selection + module notes now describe the
 promotion). Routine schema **version 21**; `sw.js` CACHE `tumble-trainer-v4.8.0`. New pure exports:
 `readinessLightKeys`, `moveHelps`, `migrateRoutineV21`.
+
+## v4.8.1 — No-superset flag, move-count cap, day rollover, skip-swap removal
+
+A feature-patch on v4.8: no data-schema change (routine stays **version 21**), no new
+`migrateRoutineVN`. The new move flag defaults to absent and the new `state` field is repaired on
+load by `normalizeState`, not migrations. `sw.js` CACHE `tumble-trainer-v4.8.1`.
+
+### "No superset" move flag
+
+Moves gain an optional boolean **`noSuperset`** (absent = false). A move with `noSuperset: true` is
+never grouped into a superset, on either side of a pair. The single enforcement point is the shared
+pairing predicate **`supersetPairOk(a, b)`** — an early `if (a.noSuperset || b.noSuperset) return false;`
+— so render grouping (`groupSupersets`), the selection cost (`sessionMoveCost`) and the bias scorer
+(`wouldSuperset`) all honour it and cannot drift.
+
+- **Add-move form** — a "No superset" checkbox near the Muscle field; `addMove()` stamps
+  `move.noSuperset = true` only when checked (absent otherwise).
+- **Moves tab** — floor moves that carry a muscle (the only ones the pairing rules ever group) get a
+  "No SS" toggle on the card, wired via `data-action="mv-toggle-superset"` to `toggleMoveNoSuperset(i)`,
+  mirroring the enable/disable control. The flag is deleted when off.
+- **Coach** — `COACH_MOVE_SCHEMA` gains a `noSuperset` boolean; `update_move`'s description mentions it
+  and the apply side deletes the flag when a patch sets `noSuperset: false` (absent-means-false).
+- **Validation** — `validateRoutine` accepts an optional boolean `noSuperset` and rejects non-booleans.
+
+### Session cost capped at the moves count
+
+With Auto Superset on, superset members cost 0.5 each (`sessionMoveCost`). The old `selectMoves` loop
+only checked `cost < count` *before* picking, so a 1-cost pick at cost 5.5 landed on 6.5 when the
+slider said 6. Now a candidate is eligible only if adding it keeps total cost **≤ count**: a local
+`costWith(cand)` re-measures `sessionMoveCost(chosen + cand)` and both the v4.8 care pre-pick loop and
+the main greedy loop skip candidates that would overshoot — treated like the family-cap / load-budget
+hard gates. It is a per-candidate check, not a blanket stop: a floor move can be net +0 (it pairs an
+existing solo 1 into two 0.5s). The main loop still terminates cleanly via `best === -1`.
+
+### Calendar-day rollover
+
+New persisted field **`state.dayStamp`** — the local calendar day (`"YYYY-MM-DD"`, local time via
+`localDayKey()`, not UTC) the per-day state belongs to; carried through `normalizeState` (string or
+null, default null). New **`rolloverNewDay()`**, called at the top of `render()`:
+
+- Same day → no-op (cheap string compare on the common path).
+- First run after upgrade (`dayStamp` null) → adopt today, save, change nothing (never nukes an
+  in-flight session on upgrade day).
+- A genuine new day → if any **main gym move** (a block other than `warmup`/`cooldown`, which are
+  shared with the Daily tab) was checked off, `finishSession('Auto-completed (new day)')` logs the
+  session as-is and advances the A/B day; otherwise the transient per-day state is reset
+  (`checks`, `setsDone`, `rest`, `readiness` → `defaultReadiness()`, `sessionIntent` → `'default'`).
+  Then it re-stamps `dayStamp` and saves.
+
+`finishSession` also stamps `dayStamp = localDayKey()`, so finishing late at night and reopening the
+next morning can't double-trigger. `rolloverNewDay` never calls `render()`, so it cannot recurse.
+`localDayKey`/`pad2` live in the mutation section — the pure engine stays Date-free.
+
+### Skip-swap suggestion removed
+
+Heuristic #2 ("You keep skipping X. Swap in Y instead?") is gone entirely — the volume nudge
+(heuristic #1), the progression hint and the dismissal machinery are unchanged. Removed:
+`skippedRecently`, `pickReplacement`, `skipSuggestions`, `recentAppearances`, `moveGoalIds`
+(all orphaned once heuristic #2 went), `applySwaps` and its `buildSession` call site, the `'swap'`
+branch in `applySuggestion`, and `state.swaps` everywhere (freshState, finishSession, the
+routine-change clears, the preview copy). Old saved states with a `swaps` key are silently dropped by
+`normalizeState`. Deleted functions are removed from `module.exports`.
