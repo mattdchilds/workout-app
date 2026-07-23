@@ -2,7 +2,7 @@
    Cache-first, offline-first. Bump CACHE on every asset change so the
    activate handler evicts the stale cache. */
 
-const CACHE = 'tumble-trainer-v4.8.6';
+const CACHE = 'tumble-trainer-v4.8.7';
 
 const ASSETS = [
   './',

@@ -4433,6 +4433,50 @@ const COACH_MOVE_SCHEMA = {
   required: ['name', 'section', 'why', 'dose', 'goalScores']
 };
 
+// v4.8.7: a DAILY practice module move (blocks.dailyModules[].moves entry). Validated by
+// validateWarmupMove = validateStatic (+ optional loads): name/dose/goals/why are all REQUIRED
+// (goals a NON-EMPTY array of goal ids — training or care), plus optional loads and progression.
+// No `section`/`goalScores` (those are the pool's shape); daily moves carry `goals` instead.
+const COACH_DAILY_MOVE_SCHEMA = {
+  type: 'object',
+  description: 'A daily practice module move (blocks.dailyModules[].moves entry). Done every day, unlogged — keep doses light and sub-maximal.',
+  properties: {
+    name: { type: 'string', description: 'unique across the WHOLE routine (pool + every warm-up/daily/cool-down module move) — per-move state is keyed by bare name' },
+    why: { type: 'string', description: 'one-line rationale shown on the card' },
+    dose: {
+      type: 'object',
+      properties: {
+        sets: { type: 'integer', minimum: 1, maximum: 6 },
+        amount: { type: 'number', description: '> 0' },
+        unit: { type: 'string', enum: UNITS },
+        weight: { type: 'number', description: 'optional load in lb (> 0)' }
+      },
+      required: ['sets', 'amount', 'unit']
+    },
+    goals: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'non-empty array of EXISTING goal ids (training or care) this move serves. A move whose only training goals are all at weight 0 and which has no care goal is hidden from the Daily tab.'
+    },
+    loads: {
+      type: 'object',
+      description: 'per-region load facts, 0..3 each; omit zero regions. On the Daily tab these gate on the readiness check-in only.',
+      properties: {
+        impact: { type: 'integer', minimum: 0, maximum: 3 },
+        shin: { type: 'integer', minimum: 0, maximum: 3 },
+        knee: { type: 'integer', minimum: 0, maximum: 3 },
+        foot: { type: 'integer', minimum: 0, maximum: 3 },
+        wrist: { type: 'integer', minimum: 0, maximum: 3 },
+        elbow: { type: 'integer', minimum: 0, maximum: 3 },
+        lumbar: { type: 'integer', minimum: 0, maximum: 3 }
+      },
+      additionalProperties: false
+    },
+    progression: { type: 'object' }
+  },
+  required: ['name', 'dose', 'goals', 'why']
+};
+
 // Responses-API tool format: flat { type, name, description, parameters }
 // (the older chat-completions format nested these under a `function` key).
 const COACH_TOOLS = [
@@ -4504,6 +4548,27 @@ const COACH_TOOLS = [
     parameters: { type: 'object', properties: {
       goalId: { type: 'string', description: 'the goal id to delete (its exact name is also accepted)' }
     }, required: ['goalId'] }
+  },
+  { type: 'function',
+    name: 'add_daily_move',
+    description: 'Add a move to a DAILY practice module. moduleId must be one of: "jumps" (stim, pinned), "handstand" (skill), "shin-armor" (armor, pinned). The daily block is done EVERY day and is never logged, so doses must be light / sub-maximal (maintenance stim/skill/armor, not training volume). Move name must be unique across the whole routine.',
+    parameters: { type: 'object', properties: {
+      moduleId: { type: 'string', description: 'one of jumps / handstand / shin-armor' },
+      move: COACH_DAILY_MOVE_SCHEMA
+    }, required: ['moduleId', 'move'] }
+  },
+  { type: 'function',
+    name: 'update_daily_move',
+    description: 'Shallow-merge a patch onto the daily move matched by EXACT name (searched across all daily modules). dose, goals, loads and progression are replaced wholesale when present in the patch. Renaming (patch.name) resets the move\'s check/progression state (name-keyed) and the new name must be unique across the whole routine.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' },
+      patch: { type: 'object', description: 'partial daily-move fields to overwrite' }
+    }, required: ['name', 'patch'] }
+  },
+  { type: 'function',
+    name: 'delete_daily_move',
+    description: 'Remove the daily move with this exact name (searched across all daily modules). Refused for the last remaining move of a module — add its replacement first, then delete.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
   }
 ];
 
@@ -4563,6 +4628,30 @@ function applyCoachTool(name, args, trial) {
   args = args || {};
   const moves = () => (trial.routine.blocks && trial.routine.blocks.moves) || [];
   const findMove = (n) => moves().find((x) => x && x.name === n);
+
+  // v4.8.7 — daily-module helpers. dailyMods() = the editable daily module list.
+  const dailyMods = () => (trial.routine.blocks && trial.routine.blocks.dailyModules) || [];
+  const findDailyModule = (id) => dailyMods().find((m) => m && m.id === id);
+  // Locate a daily move by EXACT name across every daily module → { mod, mv, idx } or null.
+  const findDailyMove = (n) => {
+    const mods = dailyMods();
+    for (let i = 0; i < mods.length; i++) {
+      const mod = mods[i];
+      const arr = (mod && mod.moves) || [];
+      const idx = arr.findIndex((x) => x && x.name === n);
+      if (idx !== -1) return { mod: mod, mv: arr[idx], idx: idx };
+    }
+    return null;
+  };
+  // A name is unique across the WHOLE routine when it collides with no pool move and no module
+  // move anywhere (warm-up / daily / cool-down) — per-move state (checks, progression) is keyed
+  // by bare name, so a duplicate name would share that state. `ignore` skips the move being renamed.
+  const nameTakenInRoutine = (n, ignore) => {
+    const b = trial.routine.blocks || {};
+    if ((b.moves || []).some((x) => x && x.name === n && x !== ignore)) return true;
+    return ['warmupModules', 'dailyModules', 'cooldownModules'].some((k) =>
+      (b[k] || []).some((mod) => (mod && mod.moves || []).some((x) => x && x.name === n && x !== ignore)));
+  };
 
   switch (name) {
     case 'add_move': {
@@ -4662,6 +4751,45 @@ function applyCoachTool(name, args, trial) {
       if (!res.ok) return err('delete_goal: ' + res.error);
       return ok('Delete ' + res.kind + ' goal: ' + res.name + ' (id ' + res.id + ')');
     }
+    case 'add_daily_move': {
+      const m = args.move;
+      if (!m || typeof m !== 'object') return err('add_daily_move: missing "move" object');
+      if (!m.name) return err('add_daily_move: move.name is required');
+      const mod = findDailyModule(args.moduleId);
+      if (!mod) return err('add_daily_move: no daily module "' + args.moduleId + '" (valid ids: ' +
+        dailyMods().map((x) => x && x.id).filter(Boolean).join(', ') + ')');
+      if (nameTakenInRoutine(m.name)) return err('add_daily_move: a move named "' + m.name +
+        '" already exists in the routine (names must be unique across the whole routine)');
+      mod.moves = mod.moves || [];
+      mod.moves.push(deepClone(m));
+      return ok('Add daily move: ' + m.name + ' (module ' + mod.id + ')');
+    }
+    case 'update_daily_move': {
+      if (!args.name) return err('update_daily_move: "name" is required');
+      if (!args.patch || typeof args.patch !== 'object') return err('update_daily_move: "patch" object is required');
+      const hit = findDailyMove(args.name);
+      if (!hit) return err('update_daily_move: no daily move named "' + args.name + '"');
+      // A rename must keep the name unique across the whole routine (per-move state is name-keyed).
+      if ('name' in args.patch && args.patch.name !== args.name && nameTakenInRoutine(args.patch.name, hit.mv)) {
+        return err('update_daily_move: a move named "' + args.patch.name +
+          '" already exists in the routine (names must be unique across the whole routine)');
+      }
+      Object.assign(hit.mv, deepClone(args.patch));   // dose/goals/loads/progression replace wholesale
+      return ok('Update daily move: ' + args.name + ' (' + Object.keys(args.patch).join(', ') + ')');
+    }
+    case 'delete_daily_move': {
+      if (!args.name) return err('delete_daily_move: "name" is required');
+      const hit = findDailyMove(args.name);
+      if (!hit) return err('delete_daily_move: no daily move named "' + args.name + '"');
+      const arr = hit.mod.moves || [];
+      if (arr.length <= 1) return err('delete_daily_move: "' + args.name + '" is the only move in module "' +
+        hit.mod.id + '" — a module must keep at least one move. Add its replacement first, then delete.');
+      arr.splice(hit.idx, 1);
+      // validateModuleList requires pick ≤ moves.length; the seed has no picks, but clamp defensively.
+      if (Number.isInteger(hit.mod.pick) && hit.mod.pick > arr.length) hit.mod.pick = arr.length;
+      if (trial.deletedMoves.indexOf(args.name) === -1) trial.deletedMoves.push(args.name);
+      return ok('Delete daily move: ' + args.name);
+    }
     default:
       return err('Unknown tool: ' + name);
   }
@@ -4741,10 +4869,10 @@ function coachSystemPrompt() {
     '- When the athlete is only asking a question, just answer. Do not force an edit.',
     '',
     'SCOPE OF TOOLS:',
-    '- Tools edit ONLY blocks.moves (the generator pool), routine.tags, routine.goals, tag priorities and',
-    '  goal weights. You CANNOT and MUST NOT touch the warm-up, the daily practice block, or the cool-down —',
-    '  all three are now assembled by the session planner from modules (warm-up / daily / cool-down modules)',
-    '  and are completely off-limits to you (the athlete explicitly declined Coach access to them).',
+    '- Tools edit blocks.moves (the generator pool), routine.tags, routine.goals, tag priorities and goal',
+    '  weights, AND the DAILY practice modules (add_daily_move / update_daily_move / delete_daily_move).',
+    '  The WARM-UP and the COOL-DOWN remain completely off-limits — you CANNOT and MUST NOT touch them in any',
+    '  way (the athlete explicitly declined Coach access to those two blocks). Only the daily block is editable.',
     '- A valid move needs: name, section (one of ' + SECTIONS.join(', ') + '), why, dose',
     '  { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ' }, and goalScores',
     '  (map of training-goal id -> integer 0-10; omit goals scoring 0). Optional: care[] (care-goal ids),',
@@ -4756,6 +4884,21 @@ function coachSystemPrompt() {
     '  must be existing tag ids; family must be an existing family id. Create a goal, tag or family first',
     '  (add_goal / add_tag / add_family) if you need a new one.',
     '- Move names are unique. update_move/delete_move/set_move_disabled match by EXACT name.',
+    '',
+    'DAILY PRACTICE (editable):',
+    '- The Daily tab is assembled by the planner from blocks.dailyModules — three fixed modules:',
+    '  "jumps" (stim, pinned), "handstand" (skill), "shin-armor" (armor, pinned). Pinned modules appear',
+    '  EVERY day; the non-pinned handstand module only shows in standard/long daily mode. Module structure',
+    '  (ids, roles, pinning) is FIXED — only the moves inside are editable.',
+    '- The daily block is done EVERY day and is NEVER logged, so doses must stay light and sub-maximal:',
+    '  this is stim / skill / armor maintenance, not training volume. Do not prescribe heavy or high-rep work.',
+    '- A daily move needs: name (unique across the WHOLE routine — pool plus every warm-up/daily/cool-down',
+    '  module move, because per-move state is name-keyed), dose { sets 1-6, amount > 0, unit }, why, and a',
+    '  non-empty goals[] of EXISTING goal ids (training or care). Optional: loads (per-region 0-3 — on the',
+    '  daily tab these gate on the readiness check-in only), progression, dose.weight. A daily move whose only',
+    '  training goals are all at weight 0 and which has no care goal is HIDDEN from the tab.',
+    '- add_daily_move takes { moduleId, move }; update_daily_move / delete_daily_move match by EXACT name',
+    '  across the daily modules. Renaming a daily move RESETS its check/progression state (name-keyed).',
     '',
     'GUARDRAILS:',
     '- Be conservative with anything touching pain, rehab, or care items (plantar fasciitis, cubital',
@@ -4788,7 +4931,8 @@ function coachSystemPrompt() {
     'ATHLETE PROFILE:',
     (state.settings.coachProfile || '(none provided)'),
     '',
-    'CURRENT ROUTINE (JSON — warm-up / daily / cool-down modules included for context only, not editable):',
+    'CURRENT ROUTINE (JSON — warm-up / cool-down modules are context-only and NOT editable; the daily modules',
+    'ARE editable via add_daily_move / update_daily_move / delete_daily_move):',
     JSON.stringify(state.routine)
   ].join('\n');
 }

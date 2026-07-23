@@ -1,4 +1,3 @@
--Allow coach to edit daily modules
 -BIG NEW COACH FEATURE - Add a button for coach to tweak the workout routine. It would expose the coach to the routine, tell it to critique it based on goals, readiness, etc. Then it can do two things:
 --Be able to do a soft edit - Edit the routine without having to touch the backend, a manual edit of what the generator came up without
 --Permanantly edit moves with, like the coach can currently do.

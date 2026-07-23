@@ -1721,3 +1721,57 @@ SETTINGS, with a note that the list is planner output the coach cannot hand-edit
 the pool/goals, hence future output). The Settings coach-profile helper text now mentions the coach
 also reads today's generated session. Exposed via `module.exports` for smoke tests
 (`coachSystemPrompt`, `coachSessionContext`, `coachSettingsContext`).
+
+## v4.8.7 — Coach edits daily practice
+
+A feature-patch on v4.8.6: no data-schema change (routine stays **version 21**), no new
+`migrateRoutineVN`, no `routine-seed.json` edit. `sw.js` CACHE `tumble-trainer-v4.8.7`. This opens
+the **DAILY practice modules** (`blocks.dailyModules`) to the Coach. The warm-up and cool-down
+modules stay strictly off-limits (the athlete's explicit choice) — only the daily block is editable.
+
+### New coach tools
+
+`COACH_DAILY_MOVE_SCHEMA` (next to `COACH_MOVE_SCHEMA`) describes a daily-module move — the shape
+`validateWarmupMove`/`validateStatic` enforce: required **name / dose / goals / why** (`goals` a
+NON-EMPTY array of existing goal ids, training or care), optional **loads** (per-region 0–3) and
+**progression**. No `section`/`goalScores` (that is the pool's shape; daily moves carry `goals`).
+
+Three tools appended to `COACH_TOOLS` after `delete_goal`, with matching cases in `applyCoachTool`
+(mutating the coach trial clone — no staging/apply plumbing change, since `coachTrialBase`,
+`validateRoutine` and `coachApplyPending` already carry `dailyModules` end-to-end):
+
+- **`add_daily_move`** `{ moduleId, move }` — `moduleId` must be an existing daily module id (error
+  lists the valid ids: `jumps` / `handstand` / `shin-armor`). The move name must be unique across the
+  **entire** routine (pool `blocks.moves` plus every warm-up / daily / cool-down module move) because
+  per-move state (checks, progression) is keyed by bare name. Pushes `deepClone(move)`.
+- **`update_daily_move`** `{ name, patch }` — shallow-merges onto the daily move matched by EXACT name
+  across all daily modules (`dose`/`goals`/`loads`/`progression` replace wholesale, same semantics as
+  `update_move`). A rename (`patch.name`) re-enforces whole-routine name uniqueness; renaming resets
+  the move's name-keyed check/progression state.
+- **`delete_daily_move`** `{ name }` — EXACT-name match across daily modules; **refuses to delete the
+  last move of a module** (`validateModuleList` requires a non-empty `moves`) — asks to add the
+  replacement first. On success splices the move out, pushes its name into `trial.deletedMoves` (so
+  Apply tombstones it and clears its checks/progression, same as pool deletes), and defensively clamps
+  a module-level integer `pick` to `moves.length` if a delete drops below it (seed has no picks).
+
+Shared local helpers in the switch: `findDailyModule(id)`, `findDailyMove(name)` (returns
+`{ mod, mv, idx }` across all daily modules), and `nameTakenInRoutine(name, ignore)` (whole-routine
+uniqueness, `ignore` skips the move being renamed).
+
+### System prompt
+
+`coachSystemPrompt()` SCOPE-OF-TOOLS lockout rewritten: tools now edit the pool, tags, goals,
+priorities/weights AND the daily practice modules — the warm-up and cool-down stay completely
+off-limits. A new **DAILY PRACTICE** paragraph lists the three module ids + roles + pinning (pinned
+every day, handstand only in standard/long), stresses the block is done every day and never logged
+so doses stay light/sub-maximal, gives the daily-move shape (whole-routine-unique name, dose, why,
+non-empty existing-goal-id `goals`, optional readiness-gated `loads`, optional `progression`), notes
+the weight-0/no-care hidden rule, and that renaming resets name-keyed state. The CURRENT ROUTINE line
+now says warm-up / cool-down modules are context-only while the daily modules are editable.
+
+### Deviation from the brief
+
+The task listed `goals[]` as *optional* on a daily move, but `validateStatic` (which
+`validateWarmupMove` calls) makes **goals REQUIRED and non-empty**, and every seed daily move carries
+it — so the schema, tools and prompt treat `goals` as required, per the brief's own instruction to
+mirror `validateStatic` and prefer the code where it conflicts.
