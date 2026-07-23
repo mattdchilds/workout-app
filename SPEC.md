@@ -1679,3 +1679,45 @@ be added and weight-adjusted), so this is a fresh, safe deletion:
   `state.routine` wholesale — no separate per-goal settings state exists; goal weights live on
   `routine.goals[].weight`). The system prompt's guardrails note the capability, the last-training-goal
   limit, and that weight 0 is the way to merely switch a training goal off.
+
+## v4.8.6 — Coach explain button + session visibility
+
+A feature-patch on v4.8.5: no data-schema change (routine stays **version 21**), no new
+`migrateRoutineVN`, no `routine-seed.json` edit. `sw.js` CACHE `tumble-trainer-v4.8.6`.
+
+### "Explain" button on move cards
+
+Each move card gains a small ghost **Explain** button in its **expanded** detail area (never on
+the collapsed face, never in preview mode). Tapping it switches to the Coach tab and asks the
+existing OpenAI coach to explain that specific move.
+
+- **Helper.** `explainMoveBtn(name)` renders `<div class="card-explain"><button class="btn small
+  ghost explain-btn" data-action="coach-explain" data-name="…">Explain</button></div>` (name
+  `escapeHtml`-ed into the attribute).
+- **Placement.** Single-move cards (`renderCard`) append it after the progression controls when
+  `expanded` — so it shows on the Gym Today tab (alongside the Easier/Progress ladder) **and** on
+  the Daily tab (where the ladder is hidden, so the button is the sole expanded detail). Superset
+  cards (`renderSupersetProgression`) and warm-up group cards (`renderWarmupGroupCard`) add one
+  button **per member**, inside each `ss-prog-move` row, so every move is explainable individually.
+- **Handler.** New `coachExplainMove(name)` (next to `coachSend`) mirrors `coachSend`'s semantics:
+  no-op while `ui.coach.busy`; `setView('coach')` first (so a keyless athlete just lands on the
+  setup panel and it returns); otherwise it discards any stale `ui.coach.pending`, clears the
+  error, pushes a user turn (`Explain "<name>": …`), sets `busy`, renders, and runs `coachRun()`.
+  Dispatched via `data-action="coach-explain"` reading `el.dataset.name`.
+- **CSS.** `.card-explain` keeps the button tight; a `border-top` separates it when it is the only
+  detail, dropped when it follows `.progression` or sits inside an `.ss-prog-move`.
+
+### Coach can see the generated session
+
+The coach system prompt previously included the routine **pool** and generation settings but not
+what the session planner actually **generated**. New `coachSessionContext()` (next to
+`coachSettingsContext`) produces compact prose — `Session #N · Day A`, then one line per block
+(`Warm-up: move (dose); …`, floor/weights/machines, `Cool-down: …`) from `buildSession(state)`,
+plus a `Daily practice: …` line from `buildDaily(state)` — each move as `name (dose)` via
+`effectiveDose`/`formatDose`. Both builds are wrapped in `try/catch`; a generator failure degrades
+to `(session preview unavailable)` / a one-line note rather than breaking the prompt. It is spliced
+into `coachSystemPrompt()` under a **TODAY'S GENERATED SESSION** section after CURRENT GENERATION
+SETTINGS, with a note that the list is planner output the coach cannot hand-edit (its edits change
+the pool/goals, hence future output). The Settings coach-profile helper text now mentions the coach
+also reads today's generated session. Exposed via `module.exports` for smoke tests
+(`coachSystemPrompt`, `coachSessionContext`, `coachSettingsContext`).

@@ -263,6 +263,12 @@ html, body {
 }
 .ss-prog-move .progression { border-top: 0; padding-top: 6px; }
 
+/* v4.8.6: "Explain" button in a card's expanded detail area — kept tight. Border-top
+   separates it when it is the only detail (Daily tab, where progression is hidden). */
+.card-explain { padding: 10px 14px 12px; border-top: 1px solid var(--line); margin-top: -1px; }
+.progression + .card-explain { border-top: 0; padding-top: 0; margin-top: -6px; }
+.ss-prog-move .card-explain { border-top: 0; padding: 0 14px 10px 20px; margin-top: -4px; }
+
 .check {
   flex: 0 0 auto;
   width: 26px;

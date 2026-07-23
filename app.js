@@ -3426,6 +3426,7 @@ function renderWarmupGroupCard(card, idx) {
     '<div class="ss-prog-move">' +
       '<div class="ss-prog-name">' + escapeHtml(o.m.name) + '</div>' +
       renderProgression(o.m, idx, o.i) +
+      explainMoveBtn(o.m.name) +                   // v4.8.6: per-member Explain
     '</div>').join('') + '</div>' : '';
 
   return '' +
@@ -3669,6 +3670,7 @@ function renderSupersetProgression(card, idx) {
     '<div class="ss-prog-move">' +
       '<div class="ss-prog-name">' + escapeHtml(m.ex.name) + '</div>' +
       renderProgression(m.ex, idx, i) +
+      explainMoveBtn(m.ex.name) +                  // v4.8.6: per-member Explain
     '</div>').join('') + '</div>';
 }
 
@@ -3709,6 +3711,8 @@ function renderCard(ex, idx, blockKey) {
         check +
       '</div>' +
       (showProg ? renderProgression(ex, idx) : '') +
+      // v4.8.6: Explain button lives in the expanded detail area (Gym + Daily tabs), never in preview.
+      (expanded ? explainMoveBtn(ex.name) : '') +
     '</div>';
 }
 
@@ -3775,6 +3779,15 @@ function renderProgression(ex, idx, memberIdx) {
     : 'Step ' + (level + 1) + ' of ' + ladder.length +
       (weighted ? ' · ' + escapeHtml(formatDose(effectiveDose(ex))) : '')) + '</div>';
   return h + '</div>';
+}
+
+// v4.8.6: small ghost button in a card's EXPANDED area that jumps to the Coach and
+// asks it to explain the move. Rendered only when the card is open (never in preview).
+function explainMoveBtn(name) {
+  return '<div class="card-explain">' +
+    '<button class="btn small ghost explain-btn" data-action="coach-explain" data-name="' +
+      escapeHtml(name) + '">Explain</button>' +
+    '</div>';
 }
 
 // Render the suggestion banners (Phase 4) at the very top of the Today view.
@@ -4291,7 +4304,7 @@ function renderSettings() {
       '<textarea id="coach-profile" data-action="coach-profile" spellcheck="false">' +
         escapeHtml(state.settings.coachProfile || '') + '</textarea>' +
     '</div>' +
-    '<p class="muted">The Coach reads this plus your full routine and generation settings as context.</p>' +
+    '<p class="muted">The Coach reads this plus your full routine, generation settings, and today\'s generated session as context.</p>' +
     '</section>';
 
   // Data
@@ -4686,6 +4699,34 @@ function coachSettingsContext() {
     'Session intent: ' + (intent === 'default' ? 'default' : INTENT_LABELS[intent]);
 }
 
+// v4.8.6: compact prose of what the session planner ACTUALLY generated today — the warm-up,
+// the floor/weights/machines blocks, the cool-down (buildSession) plus the Daily practice
+// block (buildDaily) — so the Coach sees the athlete's real session, not only the pool. Each
+// move rendered as "name (dose)" via effectiveDose/formatDose. Both builds are wrapped in
+// try/catch so a generator failure degrades to a one-line note instead of breaking the prompt.
+function coachSessionContext() {
+  const lines = [];
+  try {
+    const built = buildSession(state);
+    lines.push('Session #' + built.session + ' · Day ' + built.day);
+    built.blocks.forEach((b) => {
+      const moves = (b.exercises || []).map((ex) =>
+        ex.name + ' (' + formatDose(effectiveDose(ex)) + ')').join('; ');
+      lines.push(b.title + ': ' + (moves || '(none)'));
+    });
+  } catch (e) {
+    return '(session preview unavailable)';
+  }
+  try {
+    const daily = buildDaily(state).map((ex) =>
+      ex.name + ' (' + formatDose(effectiveDose(ex)) + ')').join('; ');
+    lines.push('Daily practice: ' + (daily || '(none)'));
+  } catch (e) {
+    lines.push('Daily practice: (unavailable)');
+  }
+  return lines.join('\n');
+}
+
 function coachSystemPrompt() {
   return [
     'You are the in-app training coach for "Tumble Trainer", a gymnastics-and-strength workout PWA.',
@@ -4738,6 +4779,11 @@ function coachSystemPrompt() {
     '',
     'CURRENT GENERATION SETTINGS:',
     coachSettingsContext(),
+    '',
+    'TODAY\'S GENERATED SESSION (planner output the athlete sees on the Gym tab; regenerated',
+    'automatically — your edits change the pool/goals, which changes future output; you cannot',
+    'hand-edit this list):',
+    coachSessionContext(),
     '',
     'ATHLETE PROFILE:',
     (state.settings.coachProfile || '(none provided)'),
@@ -4873,6 +4919,22 @@ function coachSend() {
   ui.coach.pending = null;                 // a new message discards any stale staged edit
   ui.coach.error = null;
   ui.coach.messages.push({ role: 'user', text: text });
+  ui.coach.busy = true;
+  render();
+  coachRun();
+}
+
+// v4.8.6: the "Explain" button on move cards — switch to the Coach tab and ask it to
+// explain the move. Mirrors coachSend's semantics (discard stale pending, clear error,
+// push a user turn, run). No key → just switch (renderCoach shows the setup panel).
+function coachExplainMove(name) {
+  if (ui.coach.busy) return;
+  setView('coach');                        // saves + renders; renderCoach shows setup when keyless
+  if (!getOpenAIKey()) return;
+  ui.coach.pending = null;                 // a new message discards any stale staged edit
+  ui.coach.error = null;
+  ui.coach.messages.push({ role: 'user',
+    text: 'Explain "' + name + '": what it is, how to perform it with good form (key cues), and why it\'s in my plan. Keep it brief.' });
   ui.coach.busy = true;
   render();
   coachRun();
@@ -5034,6 +5096,7 @@ function onClick(e) {
     case 'mv-add': addMove(); break;
     case 'mv-add-tag': addTag(); break;                     // v3.7 create a routine tag
     case 'coach-send': coachSend(); break;                  // v3.9 Coach
+    case 'coach-explain': coachExplainMove(el.dataset.name); break;  // v4.8.6 explain a move
     case 'coach-new': coachNewChat(); break;
     case 'coach-apply': coachApplyPending(); break;
     case 'coach-discard': coachDiscardPending(); break;
@@ -5800,6 +5863,8 @@ if (typeof module !== 'undefined' && module.exports) {
     findExerciseByName, collectPools,
     // v3.9 Coach (pure-ish — applyCoachTool mutates the trial it's given); v4.8.5 adds deleteGoal
     applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS, deleteGoal,
+    // v4.8.6 Coach context builders (pure, read global state)
+    coachSystemPrompt, coachSessionContext, coachSettingsContext,
     _ui: ui,
     _set: (s) => { state = s; },
     _setSeed: (s) => { SEED_ROUTINE = s; }
