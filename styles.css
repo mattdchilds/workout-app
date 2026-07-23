@@ -181,6 +181,15 @@ html, body {
   opacity: 0.85;
   background: color-mix(in srgb, var(--cat) 10%, transparent);
 }
+/* v4.8.8: a coach today-only session tweak flags its card with an accent "today" chip. */
+.tweak-chip {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  opacity: 1;
+}
 .card-body { flex: 1 1 auto; min-width: 0; }
 .card-name { font-weight: 600; font-size: 15px; }
 .card-name .mod {
@@ -464,6 +473,22 @@ textarea {
 .suggest-text { font-size: 14px; line-height: 1.4; }
 .suggest-actions { display: flex; gap: 8px; margin-top: 10px; justify-content: flex-end; }
 .suggest-actions .btn { flex: 0 0 auto; }
+
+/* v4.8.8: slim "Coach review" bar on the Gym tab — sits between suggestions and the Adjust panel. */
+.coach-review-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.coach-review-bar .btn { flex: 0 0 auto; }
+.coach-review-note {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-right: auto;
+}
 
 /* --- Progression hint (Phase 4) — subtle inline marker by the steppers --- */
 .prog-hint {

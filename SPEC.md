@@ -1775,3 +1775,91 @@ The task listed `goals[]` as *optional* on a daily move, but `validateStatic` (w
 `validateWarmupMove` calls) makes **goals REQUIRED and non-empty**, and every seed daily move carries
 it — so the schema, tools and prompt treat `goals` as required, per the brief's own instruction to
 mirror `validateStatic` and prefer the code where it conflicts.
+
+## v4.8.8 — Coach session review + today-only tweaks
+
+A feature-patch on v4.8.7: no data-schema change (routine stays **version 21**), no new
+`migrateRoutineVN`, no `routine-seed.json` edit, no migration. `sw.js` CACHE `tumble-trainer-v4.8.8`.
+This lets the Coach critique **today's generated session** and stage two kinds of change: **today-only
+tweaks** — one-off drops / adds / dose overrides that touch just today's session instance and never
+the routine/pool — and its existing **permanent** pool/goal edits. Everything still flows through the
+trial → validate → stage → athlete-taps-Apply pipeline.
+
+### New state: `state.sessionTweaks`
+
+`null` or `{ session, drops: [names], adds: [names], doses: { name: { sets, amount, unit, weight? } } }`.
+Added to `freshState` (near `dayStamp`; default `null`). Repaired on every load by
+`normalizeSessionTweaks(tw, session)` in `normalizeState` — NOT schema-versioned (same treatment as
+readiness): anything not matching the shape → `null`, a stamp for a different `session` → `null`,
+drops/adds coerced to string arrays, doses to an object of valid-looking `{ sets, amount, unit, weight? }`.
+Keyed to the current session index so it is naturally per-session. Cleared in `finishSession` (the
+logged session is the tweaked one — the entry is built before the reset), in the not-started branch of
+`rolloverNewDay` (day boundary), and in `rollback` (tweaks were staged against the replaced routine).
+
+### Engine: `applySessionTweaks(st, selected)` (pure)
+
+Sits next to `buildSession`; returns the possibly-modified main-block list, never mutating `st`/`selected`.
+No-op unless `st.sessionTweaks.session === st.session`. **drops** filter by name; **adds** append an
+existing pool move by name (defensively skipping a missing / `disabled` / now-readiness-failing move —
+readiness can change after staging), stamped `{ tweaked: true }`; **doses** stamp `{ tweakDose, tweaked: true }`.
+`buildSession` calls `applySessionTweaks(st, selectMoves(st))` before ordering / warm-up-context derivation,
+so `orderByPhase` and `warmupContext` see the tweaked list; warm-up / cool-down / daily builders are
+untouched (tweaks are main-blocks only). `effectiveDose` checks `ex.tweakDose` FIRST and returns it
+verbatim (`{ sets, amount, unit, weight, tweaked: true }`), bypassing the intensity ladder entirely — a
+tweak dose is literal for today; the athlete's ladder level is untouched and returns tomorrow. Because
+`buildFutureSession` simulates on a bumped `sim.session`, previews (offset > 0) skip the tweaks; offset 0
+(today's preview) shows them. `finishSession` logs `effectiveDose`, so a tweak dose flows into the log
+automatically.
+
+### New coach tools (today-only)
+
+Four tools appended to `COACH_TOOLS` after `delete_daily_move`, with matching cases in `applyCoachTool`
+(summaries prefixed `Today only: `). They edit ONLY today's session instance (main gym blocks
+floor/weights/machines), never the routine/pool/goals, and are auto-cleared at finish / new day:
+
+- **`tweak_today_remove`** `{ name }` — drop a move from today's session; valid iff the name is in
+  today's tweaked main blocks. Also strips the name from `adds` / `doses`.
+- **`tweak_today_add`** `{ name }` — add an EXISTING pool move (exact `blocks.moves` name) to today's
+  session. Errors if unknown, `disabled`, already present, excluded by today's readiness caps (names the
+  blocking region), or (At home) tagged `gym-only`. Cancels a prior `drop` of the name.
+- **`tweak_today_dose`** `{ name, dose }` — literal today-only dose (integer sets 1–6, finite amount > 0,
+  unit ∈ `UNITS`, optional finite weight > 0). Errors if the move is not in today's tweaked main blocks.
+- **`tweak_today_clear`** `{}` — reset the trial's tweaks to `null`.
+
+Plumbing: `coachTrialBase()` carries `sessionTweaks` (a clone of the athlete's tweaks when they belong
+to this session, else `null`; tool cases lazily create `{ session, drops:[], adds:[], doses:{} }`).
+"Today's build" checks build a **composite state** per call — `Object.assign({}, state, { routine:
+trial.routine, sessionTweaks: trial.sessionTweaks, settings: { ...tagPriority: trial.settings.tagPriority } })`
+— passed to `buildSession` (fresh each call, since batches mutate `trial.sessionTweaks` between calls).
+`coachStagePending` carries `sessionTweaks` onto the pending object (an unchanged clone when no tweak
+tool ran); `coachApplyPending` adopts it into `state.sessionTweaks` (a no-op for non-tweak batches).
+
+### Gym-tab UI
+
+A slim **Coach review** bar (`renderCoachReviewBar`) renders between the suggestions and the Adjust
+panel (Gym tab, hidden in preview): a ghost `Coach review` button, plus — only when tweaks are active
+(`sessionTweaksActive(st)`: non-null, this session, drops/adds/doses non-empty in aggregate) — a "Coach
+tweaks active today" note and a `Clear` button. `data-action="coach-review"` → `coachReviewSession()`
+(modeled exactly on `coachExplainMove`: busy guard, `setView('coach')`, keyless bail-out, fresh user
+turn with a canned session-review prompt, `coachRun`). `data-action="tweak-clear"` → `state.sessionTweaks
+= null; saveState(); render()`. Cards for added/dose-overridden moves show a small accent **today** chip
+(`.tweak-chip`) via the existing `renderCard` chip markup (superset member cards skip the chip; their
+dose overrides still surface through `effectiveDose`). New CSS: `.coach-review-bar`, `.coach-review-note`,
+`.tweak-chip`.
+
+### System prompt
+
+The **TODAY'S GENERATED SESSION** header note is rewritten — the coach CAN adjust today's instance via
+the `tweak_today_*` tools (one-off, auto-cleared at finish/new day) while pool/goal edits change future
+generated output; both still stage for Apply. A new **TODAY-ONLY SESSION TWEAKS** section (after DAILY
+PRACTICE) documents the four tools, main-blocks-only scope, literal doses, lifecycle, Apply-gating, and
+when to prefer a tweak (one-off context) vs a permanent edit (recurring problem). `coachSessionContext()`
+appends a compact `Coach tweaks active today: drops [..], adds [..], dose overrides [..]` line (empty
+parts omitted) when tweaks are in effect.
+
+### Exports
+
+`applySessionTweaks`, `sessionTweaksActive`, `normalizeSessionTweaks`, `coachStagePending` and
+`finishSession` (all Node-safe — no `document`) added to `module.exports` for the smoke test.
+`coachReviewSession` and the `tweak-clear` handler touch `document` via `setView` and stay unexported
+(mirroring `coachExplainMove`).

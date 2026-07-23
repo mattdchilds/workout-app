@@ -149,6 +149,27 @@ function readinessIsDefault(r) {
   const n = normalizeReadiness(r);
   return Object.keys(d).every((k) => n[k] === d[k]);
 }
+// v4.8.8: repair a stored sessionTweaks object (today-only coach session edits). Anything not
+// matching the shape → null; a stamp for a different session → null (the tweaks are keyed to the
+// session they were staged against). drops/adds coerce to string arrays; doses to an object of
+// valid-looking { sets, amount, unit, weight? } entries. NOT schema-versioned — repaired on every
+// load like readiness. Pure — returns a fresh object or null.
+function normalizeSessionTweaks(tw, session) {
+  if (!tw || typeof tw !== 'object' || Array.isArray(tw)) return null;
+  if (tw.session !== session) return null;
+  const strs = (a) => (Array.isArray(a) ? a.filter((x) => typeof x === 'string' && x) : []);
+  const doses = {};
+  const src = (tw.doses && typeof tw.doses === 'object' && !Array.isArray(tw.doses)) ? tw.doses : {};
+  Object.keys(src).forEach((name) => {
+    const d = src[name];
+    if (!d || typeof d !== 'object') return;
+    if (typeof d.sets !== 'number' || typeof d.amount !== 'number' || typeof d.unit !== 'string') return;
+    const out = { sets: d.sets, amount: d.amount, unit: d.unit };
+    if (typeof d.weight === 'number' && isFinite(d.weight)) out.weight = d.weight;
+    doses[name] = out;
+  });
+  return { session: session, drops: strs(tw.drops), adds: strs(tw.adds), doses: doses };
+}
 
 function freshState(routine) {
   return {
@@ -183,6 +204,9 @@ function freshState(routine) {
     // v4.8.1: local calendar day "YYYY-MM-DD" the persisted per-day state belongs to. null =
     // never stamped (first run / fresh state); rolloverNewDay() stamps it and resets on a new day.
     dayStamp: null,
+    // v4.8.8: today-only coach edits to the generated session (drops/adds/dose overrides keyed to
+    // the current session index); never touch the routine/pool; cleared on finish / new day. null = none.
+    sessionTweaks: null,
     // v4.1 (Phase 3): per-session readiness + intent (cleared on finish). Not in settings /
     // routine — a transient body-state the generator filters/budgets against. See selectMoves.
     sessionIntent: 'default',     // 'default'|'gym-prep'|'recovery'|'low-impact'|'short'|'upper'
@@ -1445,6 +1469,9 @@ function normalizeState(obj) {
   // finish). Any unknown/garbage value snaps back to its default. Not in settings/routine.
   merged.sessionIntent = sessionIntent(merged);   // reads merged.sessionIntent; unknown → 'default'
   merged.readiness = normalizeReadiness(merged.readiness);
+  // v4.8.8: today-only coach session tweaks — repaired like readiness (not schema-versioned). Any
+  // stamp that doesn't match the current session index is dropped (a rolled-over session invalidates them).
+  merged.sessionTweaks = normalizeSessionTweaks(merged.sessionTweaks, merged.session);
   // v4.6: the v4.2 24h-feedback region-status map is retired — drop any stale persisted copy.
   delete merged.regionStatus;
 
@@ -2755,6 +2782,55 @@ const MOVE_SECTIONS = [
   { key: 'machines', title: 'Machines' }
 ];
 
+/*
+ * v4.8.8: apply today-only coach session tweaks to the freshly-selected main-block moves. Pure —
+ * returns the possibly-modified list, never mutates `st` or `selected`. Tweaks are keyed to the
+ * current session index, so a stamp for any other session is ignored (future previews build on a
+ * bumped index and naturally skip them). Main blocks only — warm-up/cool-down/daily never see this.
+ *   drops : remove selected moves by name.
+ *   adds  : append an EXISTING pool move by name (defensive re-checks: skip if missing, disabled, or
+ *           now failing readiness — readiness can change after a tweak was staged). Stamped `tweaked`.
+ *   doses : stamp a literal today-only dose on a move (`tweakDose`); effectiveDose returns it verbatim.
+ */
+function applySessionTweaks(st, selected) {
+  const tw = st.sessionTweaks;
+  if (!tw || tw.session !== st.session) return selected;
+  let out = selected;
+  const drops = tw.drops || [];
+  if (drops.length) out = out.filter((ex) => drops.indexOf(ex.name) === -1);
+  const adds = tw.adds || [];
+  if (adds.length) {
+    const caps = readinessCaps(st);
+    const pool = (st.routine && st.routine.blocks && st.routine.blocks.moves) || [];
+    const present = new Set(out.map((ex) => ex.name));
+    out = out.slice();
+    adds.forEach((name) => {
+      if (present.has(name)) return;
+      const mv = pool.find((x) => x && x.name === name);
+      if (!mv || mv.disabled) return;
+      if (!passesReadiness(mv, caps)) return;   // readiness can change after staging — re-check defensively
+      out.push(Object.assign({}, mv, { tweaked: true }));
+      present.add(name);
+    });
+  }
+  const doses = tw.doses || {};
+  if (Object.keys(doses).length) {
+    out = out.map((ex) => (doses[ex.name]
+      ? Object.assign({}, ex, { tweakDose: doses[ex.name], tweaked: true })
+      : ex));
+  }
+  return out;
+}
+
+// v4.8.8: true when today-only coach tweaks are actually in effect (non-null, this session, and at
+// least one drop/add/dose). Pure — used to gate the Gym-tab tweak bar and the context line.
+function sessionTweaksActive(st) {
+  const tw = st && st.sessionTweaks;
+  if (!tw || tw.session !== st.session) return false;
+  return (tw.drops && tw.drops.length > 0) || (tw.adds && tw.adds.length > 0) ||
+    (tw.doses && Object.keys(tw.doses).length > 0);
+}
+
 // Produce the ordered blocks for a session. Pure given `st`.
 // Order: Warm-up, Floor, Weights, Machines, Cool-down (empty blocks skipped).
 function buildSession(st) {
@@ -2765,7 +2841,9 @@ function buildSession(st) {
 
   // v4.3: the warm-up context depends on the selected middle sections (impact vs lift), so
   // selectMoves runs FIRST; the warm-up block is still pushed first so it renders at the top.
-  const selected = selectMoves(st);
+  // v4.8.8: today-only coach tweaks apply to the selected main-block moves BEFORE ordering and
+  // warm-up-context derivation, so section ordering and the warm-up/cool-down context see them.
+  const selected = applySessionTweaks(st, selectMoves(st));
   // v4.4: warm-up and cool-down share the SAME delivery context (they must agree on the kind
   // of day), so compute it once from the selected middle sections.
   const context = warmupContext(selected);
@@ -2963,6 +3041,14 @@ function currentLevel(ex) {
  * shows a single concrete pair and flags overridden.
  */
 function effectiveDose(ex) {
+  // v4.8.8: a coach today-only tweak dose is LITERAL for today — it wins over the intensity ladder
+  // entirely (the athlete's ladder level is untouched and returns tomorrow when the tweak clears).
+  if (ex.tweakDose) {
+    const t = ex.tweakDose;
+    const out = { sets: t.sets, amount: t.amount, unit: t.unit, tweaked: true };
+    if (t.weight != null) out.weight = t.weight;
+    return out;
+  }
   const d = ex.dose;
   const level = currentLevel(ex);
   if (!level) return { sets: d.sets, amount: d.amount, unit: d.unit, weight: d.weight };
@@ -3286,6 +3372,9 @@ function renderToday(build) {
   let html = renderPreviewBar(build);
   // Suggestions are interactive — hide them while previewing.
   if (!preview) html += renderSuggestions(build);
+  // v4.8.8: a slim "Coach review" row — ask the coach to critique today's generated session and
+  // (optionally) stage one-off tweaks. Hidden in preview (previews are neutral, non-interactive).
+  if (!preview) html += renderCoachReviewBar();
   // v3.4: collapsible "Adjust session" — the same sliders/toggles as Settings, live in
   // the Gym tab so tuning immediately re-generates the session below. Hidden in preview.
   if (!preview) html += renderAdjustPanel();
@@ -3690,7 +3779,9 @@ function renderCard(ex, idx, blockKey) {
 
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
-      escapeHtml(goalName(id)) + '</span>').join('');
+      escapeHtml(goalName(id)) + '</span>').join('') +
+    // v4.8.8: a coach today-only tweak (added move or dose override) flags the card with a "today" chip.
+    (ex.tweaked ? '<span class="chip tweak-chip">today</span>' : '');
   const mainAttrs = preview ? '' : ' data-action="expand" data-idx="' + idx + '"';
   const check = preview ? '' :
     '<input type="checkbox" class="check" data-action="check" data-idx="' + idx + '"' +
@@ -3791,6 +3882,19 @@ function explainMoveBtn(name) {
 }
 
 // Render the suggestion banners (Phase 4) at the very top of the Today view.
+// v4.8.8: the "Coach review" bar on the Gym tab. Always offers the review button; when today-only
+// tweaks are active it also shows a note and a Clear button. Never rendered in preview (caller-gated).
+function renderCoachReviewBar() {
+  const active = sessionTweaksActive(state);
+  return '<div class="coach-review-bar">' +
+    '<button class="btn small ghost" data-action="coach-review">Coach review</button>' +
+    (active
+      ? '<span class="coach-review-note">Coach tweaks active today</span>' +
+        '<button class="btn small ghost" data-action="tweak-clear">Clear</button>'
+      : '') +
+    '</div>';
+}
+
 function renderSuggestions(build) {
   renderedSuggestions = computeSuggestions(state, build);
   if (!renderedSuggestions.length) return '';
@@ -4569,6 +4673,32 @@ const COACH_TOOLS = [
     name: 'delete_daily_move',
     description: 'Remove the daily move with this exact name (searched across all daily modules). Refused for the last remaining move of a module — add its replacement first, then delete.',
     parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  // v4.8.8 — today-only session tweaks. These edit ONLY today's generated session instance (the main
+  // gym blocks: floor/weights/machines), never the routine/pool/goals, and are auto-cleared when the
+  // session is finished or a new day starts. Not for warm-up/cool-down/daily. Still staged for Apply.
+  { type: 'function',
+    name: 'tweak_today_remove',
+    description: 'TODAY ONLY: drop a move from just today\'s generated session. Does NOT change the routine/pool — the move still generates on other days. Auto-cleared when the session is finished or a new day starts. Main gym blocks only (floor/weights/machines), not warm-up/cool-down/daily. The name must be one of TODAY\'S GENERATED SESSION main-block moves. Still staged for the athlete\'s Apply.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  { type: 'function',
+    name: 'tweak_today_add',
+    description: 'TODAY ONLY: add an EXISTING pool move (exact name from blocks.moves) into just today\'s generated session. Does NOT change the routine/pool — it is a one-off for today, auto-cleared at finish / new day. Main gym blocks only. Errors if the move is unknown, disabled, already in today\'s session, excluded by today\'s readiness caps, or (when the athlete is At home) tagged gym-only. Still staged for Apply.',
+    parameters: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] }
+  },
+  { type: 'function',
+    name: 'tweak_today_dose',
+    description: 'TODAY ONLY: set a LITERAL dose for a move in today\'s session (no progression ladder — the value is used as-is for today, and the athlete\'s ladder level returns tomorrow). Does NOT change the routine/pool; auto-cleared at finish / new day. The move must be in today\'s (tweaked) main blocks. Still staged for Apply.',
+    parameters: { type: 'object', properties: {
+      name: { type: 'string' },
+      dose: { type: 'object', description: 'literal dose: { sets 1-6 integer, amount > 0, unit one of ' + UNITS.join(', ') + ', optional weight (lb) > 0 }' }
+    }, required: ['name', 'dose'] }
+  },
+  { type: 'function',
+    name: 'tweak_today_clear',
+    description: 'TODAY ONLY: discard all staged today-only session tweaks (drops, adds, dose overrides), returning today\'s session to the planner\'s output. Does not touch the routine/pool. Still staged for Apply.',
+    parameters: { type: 'object', properties: {}, required: [] }
   }
 ];
 
@@ -4578,7 +4708,11 @@ function coachTrialBase() {
   return {
     routine: deepClone(state.routine),
     settings: { tagPriority: deepClone(state.settings.tagPriority || {}) },
-    deletedMoves: []
+    deletedMoves: [],
+    // v4.8.8: today-only session tweaks the coach may add to (see the tweak_today_* tools). Carry the
+    // athlete's current tweaks if they belong to this session; else start clean (null → lazily created).
+    sessionTweaks: (state.sessionTweaks && state.sessionTweaks.session === state.session)
+      ? deepClone(state.sessionTweaks) : null
   };
 }
 
@@ -4790,6 +4924,90 @@ function applyCoachTool(name, args, trial) {
       if (trial.deletedMoves.indexOf(args.name) === -1) trial.deletedMoves.push(args.name);
       return ok('Delete daily move: ' + args.name);
     }
+    // v4.8.8 — today-only session tweaks. Build a COMPOSITE state that overlays the trial's routine,
+    // its in-progress tweaks and its tag-priority slice onto the live state, so "today's session" is
+    // computed exactly as buildSession would render it after Apply. Rebuilt per call (cheap; batches
+    // mutate trial.sessionTweaks between calls). Main blocks = the floor/weights/machines exercises.
+    case 'tweak_today_remove':
+    case 'tweak_today_add':
+    case 'tweak_today_dose':
+    case 'tweak_today_clear': {
+      const tweaks = () => {
+        if (!trial.sessionTweaks) trial.sessionTweaks = { session: state.session, drops: [], adds: [], doses: {} };
+        return trial.sessionTweaks;
+      };
+      // main-block move names of today's build under the trial's routine + current tweaks
+      const todayMainNames = () => {
+        const composite = Object.assign({}, state, {
+          routine: trial.routine,
+          sessionTweaks: trial.sessionTweaks,
+          settings: Object.assign({}, state.settings, { tagPriority: trial.settings.tagPriority })
+        });
+        const build = buildSession(composite);
+        const names = [];
+        (build.blocks || []).forEach((bl) => {
+          if (bl && (bl.key === 'floor' || bl.key === 'weights' || bl.key === 'machines')) {
+            (bl.exercises || []).forEach((ex) => { if (ex && ex.name) names.push(ex.name); });
+          }
+        });
+        return names;
+      };
+
+      if (name === 'tweak_today_remove') {
+        if (!args.name) return err('tweak_today_remove: "name" is required');
+        if (todayMainNames().indexOf(args.name) === -1) {
+          return err('tweak_today_remove: "' + args.name + '" is not in today\'s generated main-block session');
+        }
+        const tw = tweaks();
+        if (tw.drops.indexOf(args.name) === -1) tw.drops.push(args.name);
+        tw.adds = tw.adds.filter((n) => n !== args.name);          // a dropped move can't also be an add
+        delete tw.doses[args.name];                                 // ...nor carry a dose override
+        return ok('Today only: remove ' + args.name + ' from today\'s session');
+      }
+
+      if (name === 'tweak_today_add') {
+        if (!args.name) return err('tweak_today_add: "name" is required');
+        const mv = findMove(args.name);
+        if (!mv) return err('tweak_today_add: no pool move named "' + args.name + '" (must be an exact existing blocks.moves name)');
+        if (mv.disabled) return err('tweak_today_add: "' + args.name + '" is disabled — enable it first, or pick another move');
+        if (todayMainNames().indexOf(args.name) !== -1) {
+          return err('tweak_today_add: "' + args.name + '" is already in today\'s session');
+        }
+        if (state.settings.atGym === false && (mv.tags || []).indexOf('gym-only') !== -1) {
+          return err('tweak_today_add: "' + args.name + '" is a gym-only (equipment) move and the athlete is At home today');
+        }
+        const caps = readinessCaps(state);
+        if (!passesReadiness(mv, caps)) {
+          const blocked = LOAD_KEYS.filter((k) => (k in caps) && moveLoad(mv, k) > caps[k]);
+          return err('tweak_today_add: "' + args.name + '" is excluded by today\'s readiness for ' + blocked.join(', '));
+        }
+        const tw = tweaks();
+        if (tw.adds.indexOf(args.name) === -1) tw.adds.push(args.name);
+        tw.drops = tw.drops.filter((n) => n !== args.name);        // adding a move cancels a prior drop
+        return ok('Today only: add ' + args.name + ' to today\'s session');
+      }
+
+      if (name === 'tweak_today_dose') {
+        if (!args.name) return err('tweak_today_dose: "name" is required');
+        const d = args.dose;
+        if (!d || typeof d !== 'object') return err('tweak_today_dose: "dose" object is required');
+        if (!Number.isInteger(d.sets) || d.sets < 1 || d.sets > 6) return err('tweak_today_dose: dose.sets must be an integer 1-6');
+        if (typeof d.amount !== 'number' || !isFinite(d.amount) || d.amount <= 0) return err('tweak_today_dose: dose.amount must be a finite number > 0');
+        if (UNITS.indexOf(d.unit) === -1) return err('tweak_today_dose: dose.unit must be one of ' + UNITS.join(', '));
+        if (d.weight != null && (typeof d.weight !== 'number' || !isFinite(d.weight) || d.weight <= 0)) return err('tweak_today_dose: dose.weight, if given, must be a finite number > 0');
+        if (todayMainNames().indexOf(args.name) === -1) {
+          return err('tweak_today_dose: "' + args.name + '" is not in today\'s generated main-block session');
+        }
+        const dose = { sets: d.sets, amount: d.amount, unit: d.unit };
+        if (d.weight != null) dose.weight = d.weight;
+        tweaks().doses[args.name] = dose;
+        return ok('Today only: set ' + args.name + ' dose to ' + formatDose(dose));
+      }
+
+      // tweak_today_clear
+      trial.sessionTweaks = null;
+      return ok('Today only: clear all session tweaks');
+    }
     default:
       return err('Unknown tool: ' + name);
   }
@@ -4800,6 +5018,8 @@ function coachStagePending(trial, summary) {
     routine: deepClone(trial.routine),
     settingsPatch: { tagPriority: deepClone(trial.settings.tagPriority) },
     deletedNames: trial.deletedMoves.slice(),
+    // v4.8.8: carry the trial's today-only session tweaks (unchanged clone when no tweak tool ran).
+    sessionTweaks: trial.sessionTweaks ? deepClone(trial.sessionTweaks) : null,
     summary: summary.slice()
   };
 }
@@ -4852,6 +5072,17 @@ function coachSessionContext() {
   } catch (e) {
     lines.push('Daily practice: (unavailable)');
   }
+  // v4.8.8: surface any today-only tweaks already in effect so the model knows what it changed.
+  if (sessionTweaksActive(state)) {
+    const tw = state.sessionTweaks;
+    const parts = [];
+    if (tw.drops && tw.drops.length) parts.push('drops [' + tw.drops.join(', ') + ']');
+    if (tw.adds && tw.adds.length) parts.push('adds [' + tw.adds.join(', ') + ']');
+    const doseNames = Object.keys(tw.doses || {});
+    if (doseNames.length) parts.push('dose overrides [' + doseNames.map((n) =>
+      n + ': ' + formatDose(tw.doses[n])).join('; ') + ']');
+    if (parts.length) lines.push('Coach tweaks active today: ' + parts.join(', '));
+  }
   return lines.join('\n');
 }
 
@@ -4900,6 +5131,19 @@ function coachSystemPrompt() {
     '- add_daily_move takes { moduleId, move }; update_daily_move / delete_daily_move match by EXACT name',
     '  across the daily modules. Renaming a daily move RESETS its check/progression state (name-keyed).',
     '',
+    'TODAY-ONLY SESSION TWEAKS:',
+    '- tweak_today_remove { name }, tweak_today_add { name }, tweak_today_dose { name, dose } and',
+    '  tweak_today_clear {} adjust ONLY today\'s generated session instance — they never change the',
+    '  routine, pool, goals or doses for any other day. They apply to the main gym blocks only',
+    '  (floor / weights / machines), NOT the warm-up, cool-down or daily practice.',
+    '- add only pulls in an EXISTING pool move (exact name); a tweak dose is LITERAL for today (it',
+    '  ignores the progression ladder — the athlete\'s ladder level is untouched and returns tomorrow).',
+    '- These tweaks are auto-cleared when the session is finished or a new calendar day starts, and',
+    '  like every edit they are STAGED for the athlete to Apply — they do not take effect on their own.',
+    '- Prefer a today-only tweak for one-off context (feeling beat up, short on time, a piece of',
+    '  equipment is taken); use a permanent tool (update_move, set_goal_weight, set_move_disabled, ...)',
+    '  only for a recurring problem you expect to persist across sessions.',
+    '',
     'GUARDRAILS:',
     '- Be conservative with anything touching pain, rehab, or care items (plantar fasciitis, cubital',
     '  tunnel, posture, sciatic, joint recovery, splits). Do not remove care-serving work casually, and',
@@ -4923,9 +5167,10 @@ function coachSystemPrompt() {
     'CURRENT GENERATION SETTINGS:',
     coachSettingsContext(),
     '',
-    'TODAY\'S GENERATED SESSION (planner output the athlete sees on the Gym tab; regenerated',
-    'automatically — your edits change the pool/goals, which changes future output; you cannot',
-    'hand-edit this list):',
+    'TODAY\'S GENERATED SESSION (planner output the athlete sees on the Gym tab). You CAN adjust',
+    'THIS one instance with the tweak_today_* tools (one-off drops / adds / dose overrides that are',
+    'auto-cleared when the session is finished or a new day starts). Editing the pool/goals instead',
+    'changes FUTURE generated output. Both routes still stage for the athlete\'s Apply:',
     coachSessionContext(),
     '',
     'ATHLETE PROFILE:',
@@ -5084,6 +5329,22 @@ function coachExplainMove(name) {
   coachRun();
 }
 
+// v4.8.8: the "Coach review" button on the Gym tab — jump to the Coach and ask it to critique
+// today's generated session and, if warranted, stage today-only tweaks (or permanent edits).
+// Mirrors coachExplainMove exactly (busy guard, setView, keyless bail-out, fresh user turn, run).
+function coachReviewSession() {
+  if (ui.coach.busy) return;
+  setView('coach');                        // saves + renders; renderCoach shows setup when keyless
+  if (!getOpenAIKey()) return;
+  ui.coach.pending = null;                 // a new message discards any stale staged edit
+  ui.coach.error = null;
+  ui.coach.messages.push({ role: 'user',
+    text: 'Review today\'s generated session (TODAY\'S GENERATED SESSION in your context). Critique it against my goals and their weights, today\'s readiness dials and intent, my recent log, and your guardrails: what is well placed, what is questionable? If changes would help, stage them: use the tweak_today_* tools for one-off adjustments to just today\'s session, and the permanent tools (update_move, set_goal_weight, ...) only for recurring issues. Small, targeted changes; brief reasoning. If the session already looks right, say so and change nothing.' });
+  ui.coach.busy = true;
+  render();
+  coachRun();
+}
+
 function coachApplyPending() {
   const p = ui.coach.pending;
   if (!p) return;
@@ -5099,6 +5360,9 @@ function coachApplyPending() {
     if (ui.expanded.has(name)) ui.expanded.delete(name);
   });
   state.dismissed = {};                    // a routine change can invalidate per-session keys (mirrors rollback)
+  // v4.8.8: adopt the staged today-only session tweaks (pending always carries the field — an
+  // unchanged clone when no tweak tool ran — so this is a harmless no-op for non-tweak batches).
+  state.sessionTweaks = p.sessionTweaks ? deepClone(p.sessionTweaks) : null;
   ui.coach.pending = null;
   ui.coach.messages.push({ role: 'assistant', text: 'Applied — your routine is updated. (Undo via Settings → Routine history.)' });
   saveState();
@@ -5241,6 +5505,8 @@ function onClick(e) {
     case 'mv-add-tag': addTag(); break;                     // v3.7 create a routine tag
     case 'coach-send': coachSend(); break;                  // v3.9 Coach
     case 'coach-explain': coachExplainMove(el.dataset.name); break;  // v4.8.6 explain a move
+    case 'coach-review': coachReviewSession(); break;                // v4.8.8 review today's session
+    case 'tweak-clear': state.sessionTweaks = null; saveState(); render(); break;  // v4.8.8 clear today-only tweaks
     case 'coach-new': coachNewChat(); break;
     case 'coach-apply': coachApplyPending(); break;
     case 'coach-discard': coachDiscardPending(); break;
@@ -5548,6 +5814,7 @@ function rolloverNewDay() {
     state.rest = { name: null, startedAt: null };
     state.readiness = defaultReadiness();
     state.sessionIntent = 'default';
+    state.sessionTweaks = null;                          // v4.8.8: today-only tweaks don't survive the day boundary
   }
   state.dayStamp = today;
   saveState();
@@ -5611,6 +5878,7 @@ function finishSession(note) {
   state.rest = { name: null, startedAt: null };
   state.sessionIntent = 'default';        // v4.1: readiness/intent are a per-session input — reset
   state.readiness = defaultReadiness();
+  state.sessionTweaks = null;             // v4.8.8: today-only tweaks belong to the finished session (entry already built above)
   state.lastFinished = entry.date;
   state.dayStamp = localDayKey();  // v4.8.1: state is now current as of today — see rolloverNewDay
   previewOffset = 0;             // v3.1: finishing returns the Today view to today
@@ -5687,6 +5955,7 @@ function rollback(hidx) {
   pushHistory(state.routine);            // current becomes undoable
   state.routine = deepClone(entry.routine);
   state.dismissed = {};                  // a routine change may invalidate dismissed keys
+  state.sessionTweaks = null;            // v4.8.8: tweaks were staged against the replaced routine
   saveState();
   render();
 }
@@ -6009,6 +6278,9 @@ if (typeof module !== 'undefined' && module.exports) {
     applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS, deleteGoal,
     // v4.8.6 Coach context builders (pure, read global state)
     coachSystemPrompt, coachSessionContext, coachSettingsContext,
+    // v4.8.8 today-only session tweaks: pure engine helpers + repair + the stage step + finishSession
+    // (Node-safe — no document). coachReviewSession/tweak-clear touch document via setView, so unexported.
+    applySessionTweaks, sessionTweaksActive, normalizeSessionTweaks, coachStagePending, finishSession,
     _ui: ui,
     _set: (s) => { state = s; },
     _setSeed: (s) => { SEED_ROUTINE = s; }
