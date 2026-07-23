@@ -1595,3 +1595,87 @@ Heuristic #2 ("You keep skipping X. Swap in Y instead?") is gone entirely — th
 branch in `applySuggestion`, and `state.swaps` everywhere (freshState, finishSession, the
 routine-change clears, the preview copy). Old saved states with a `swaps` key are silently dropped by
 `normalizeState`. Deleted functions are removed from `module.exports`.
+
+## v4.8.5 — Unified Daily tab, superset cap & equal-sets, hidden superset bias
+
+A feature-patch on v4.8: no data-schema change (routine stays **version 21**), no new
+`migrateRoutineVN`, no `routine-seed.json` edit. Settings are repaired on load by `normalizeState`,
+not migrations. `sw.js` CACHE `tumble-trainer-v4.8.5`. (v4.9 is reserved for the goal-split feature.)
+
+### Daily tab is one block
+
+`renderDaily` previously rendered three separate blocks — Warm-up, Practice, Cool-down — each with its
+own length toggle. It now renders **one** `renderBlock('daily', 'Daily', …)` whose body is, in order,
+the grouped warm-up cards (`warmupGroups` / `renderWarmupGroupCard`), then the practice moves, then the
+cool-down moves. Each card keeps its **original** per-card blockKey when it calls
+`renderCard(ex, idx, 'warmup'|'daily'|'cooldown')` — set-circle behaviour, `restTarget` and the
+`'block:'+group` check semantics all depend on the block key, so only the visual wrapper is unified. The
+single header toggle is the existing daily-mode toggle (`renderDailyModeToggle`, `settings.dailyMode`).
+
+- **One length drives all three.** `buildWarmup` and `buildCooldown` now read `dailyMode(st.settings)`
+  instead of `warmupMode` / `cooldownMode` **when `context === 'daily'`**; the gym contexts
+  (`gym-impact` / `gym-lift`) are unchanged. So Short/Standard/Long on the Daily tab lengthens or
+  shortens the warm-up, practice and cool-down together.
+- **The warm-up and cool-down toggles no longer appear on the Daily tab.** They remain on the gym Today
+  tab's warm-up / cool-down block headers (via `renderToday`'s `headerExtra` wiring) and are otherwise
+  untouched.
+
+### No progression controls on the Daily tab
+
+On the unified Daily tab no card shows the Easier/Progress ladder. `renderCard`'s `showProg` gains a
+`state.view !== 'daily'` guard (on top of the existing `blockKey !== 'warmup'` rule), and
+`renderWarmupGroupCard` treats the daily view like preview — its `ladderMoves` list is emptied, so the
+group card is non-expandable there. The gym Today tab keeps all progression controls unchanged.
+
+### Supersets capped at 4 moves
+
+`groupSupersets`' target search now skips any group already holding 4 members
+(`if (g.members.length >= 4) …`), so a superset / giant set never exceeds four moves. Because
+`wouldSuperset` and `sessionMoveCost` both delegate to `groupSupersets`, they inherit the cap
+automatically — no separate enforcement.
+
+### Equal set counts preferred within a superset
+
+`groupSupersets` gains a **soft** preference for grouping moves with matching set counts so superset
+rounds line up. Target selection is now two-pass: pass 1 only joins a compatible group whose every
+existing member's base set count equals the candidate's; pass 2 falls back to any compatible group
+(the pre-v4.8.5 first-fit behaviour). The 4-member cap applies in both passes. Base set count reads the
+move's **authored** `dose.sets` (default 1), *not* `effectiveDose` — `groupSupersets` stays pure /
+state-free, so progression-modified set counts are intentionally not considered. The function's exported
+signature is unchanged.
+
+### Superset-bias setting hidden, pinned to 0
+
+The Superset-bias slider is removed from both the Adjust-session panel (`renderAdjustPanel`) and the
+Settings Session panel, and the Settings help prose drops its bias sentence. The value is pinned to **0**:
+`freshState`'s default is now `supersetBias: 0`, and `normalizeState` **forces**
+`merged.settings.supersetBias = 0` on every load (replacing the old clamp-from-stored logic). With bias
+0, `selectMoves`' `biasOn` is false, so the entire bias code path (`selectMoves` bias scoring,
+`wouldSuperset`) stays present but inert. `renderSupersetBiasField` and that whole path are **kept**
+intact and marked intentionally unreferenced so the setting can return later. The Coach settings-context
+line no longer reports "Superset bias"; the coach has no tool to patch `supersetBias`, so no coach-tool
+surface changed.
+
+### Coach can delete goals
+
+New coach tool **`delete_goal`** (`COACH_TOOLS`, `applyCoachTool`), backed by a pure-ish exported
+helper **`deleteGoal(routine, ident)`**. There was no prior manual goal-delete path (goals could only
+be added and weight-adjusted), so this is a fresh, safe deletion:
+
+- **Addressing.** `ident` matches a goal by exact **id or name** (mirrors `set_goal_weight`'s `goalId`
+  and `add_goal`'s `name`).
+- **Reference cleanup.** The goal is removed from `routine.goals` and its id is **stripped from every
+  move** — the `goalScores` key, and any `care[]` / `goals[]` array entry — across `blocks.moves` and
+  the warm-up / cool-down / daily module moves. This is deliberate, not cosmetic: `topGoalId` and
+  `moveChipIds` iterate a move's raw `goalScores` keys, so an orphaned key would otherwise surface as a
+  gray, raw-id chip (and `goalName`/`goalColor` fall back to the literal id / gray); `dailyMovePassesGoals`
+  reads `move.goals`; care chips read `move.care`. Stripping keeps all three read paths clean.
+- **Guards.** An unknown id/name returns an error result to the coach. Deleting the **last training
+  goal** is refused with a clear message — `selectMoves` scores moves only against training goals, so
+  an empty training-goal list scores every move 0 and empties every gym session. Care goals never gate
+  the main pool, so care-goal deletion is unrestricted.
+- **Staging.** Like every coach edit, the delete lands on `trial.routine` (deep-cloned), is staged in
+  `ui.coach.pending`, and only takes effect when the athlete taps Apply (`coachApplyPending` replaces
+  `state.routine` wholesale — no separate per-goal settings state exists; goal weights live on
+  `routine.goals[].weight`). The system prompt's guardrails note the capability, the last-training-goal
+  limit, and that weight 0 is the way to merely switch a training goal off.

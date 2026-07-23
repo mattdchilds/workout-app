@@ -168,7 +168,7 @@ function freshState(routine) {
     // v4.7: atGym (default true) is the "At gym / At home" location toggle. true = gym-only
     // (equipment) moves stay in the pool; false = they are hard-excluded. Replaces the gym-only
     // priority slider — see tagEffectivePriority.
-    settings: { moves: 10, cooldownMode: 'standard', dailyMode: 'standard', supersetBias: 5, weeklyClasses: 1, warmupMode: 'standard', atGym: true, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
+    settings: { moves: 10, cooldownMode: 'standard', dailyMode: 'standard', supersetBias: 0, weeklyClasses: 1, warmupMode: 'standard', atGym: true, tagPriority: defaultTagPriority(routine), coachProfile: DEFAULT_COACH_PROFILE },
     checks: {},                   // { [exerciseName]: true } — cleared on finish
     collapsed: {},                // v3.6: { [blockKey]: true } — collapsed session blocks; cleared on finish
     intensity: {},                // { [exerciseName]: { level } } — ladder index; survives sessions
@@ -1415,9 +1415,10 @@ function normalizeState(obj) {
   if (typeof (obj.settings && obj.settings.atGym) !== 'boolean') {
     merged.settings.atGym = !(storedTP['gym-only'] === 1);
   }
-  // v3.5/v3.7: superset bias — integer 0–30 (default 5). Missing / non-number → 5; clamp + int.
-  merged.settings.supersetBias = typeof merged.settings.supersetBias === 'number'
-    ? clamp(merged.settings.supersetBias | 0, 0, 30) : 5;
+  // v3.5/v3.7: superset bias — integer 0–30. v4.8.5: the setting is HIDDEN and pinned to 0 (bias 0
+  // makes selectMoves' biasOn false, so the bias code path stays but is inert). Pinned here until it
+  // returns — remove this force-line and restore the clamp-from-stored logic to re-enable it.
+  merged.settings.supersetBias = 0;
   // v4.0: weeklyClasses — integer 0–2 (default 1). Missing / non-number → 1; clamp + int.
   merged.settings.weeklyClasses = typeof merged.settings.weeklyClasses === 'number'
     ? clamp(merged.settings.weeklyClasses | 0, 0, 2) : 1;
@@ -2488,6 +2489,8 @@ function warmupRotatePick(pool, R, n) {
 }
 /*
  * Assemble the warm-up for `context` ('gym-impact'|'gym-lift'|'daily'). Pure given `st`.
+ * v4.8.5: length comes from dailyMode(st.settings) when context === 'daily' (the unified Daily
+ * tab drives warm-up + practice + cool-down from one toggle), else warmupMode(st.settings).
  * Steps: choose which eligible modules are IN (by mode + pinned + rotation), pick which moves
  * each `pick: n` module shows (same rotation), drop moves whose loads exceed today's readiness
  * caps (potentiate dropped whole when back is light/skip), drop any module emptied by gating.
@@ -2498,7 +2501,7 @@ function warmupRotatePick(pool, R, n) {
 function buildWarmup(st, context) {
   const r = st.routine;
   const all = warmupModules(r);
-  const mode = warmupMode(st.settings);
+  const mode = context === 'daily' ? dailyMode(st.settings) : warmupMode(st.settings);
   const caps = readinessCaps(st);
   const R = warmupRotationIndex(st);
   const isGym = context === 'gym-impact' || context === 'gym-lift';
@@ -2590,6 +2593,8 @@ function cooldownModules(routine) {
 }
 /*
  * Assemble the cool-down for `context` ('gym-impact'|'gym-lift'|'daily'). Pure given `st`.
+ * v4.8.5: length comes from dailyMode(st.settings) when context === 'daily' (the unified Daily
+ * tab drives warm-up + practice + cool-down from one toggle), else cooldownMode(st.settings).
  * Modes: short = pinned only; standard = pinned + ONE rotating non-pinned flex/care module + all
  * eligible downshift modules; long = every eligible module. Per chosen module: apply pick-n
  * rotation, then drop moves whose loads exceed readiness caps (module emptied by gating falls
@@ -2600,7 +2605,7 @@ function cooldownModules(routine) {
 function buildCooldown(st, context) {
   const r = st.routine;
   const all = cooldownModules(r);
-  const mode = cooldownMode(st.settings);
+  const mode = context === 'daily' ? dailyMode(st.settings) : cooldownMode(st.settings);
   const caps = readinessCaps(st);
   const R = warmupRotationIndex(st);
   const isGym = context === 'gym-impact' || context === 'gym-lift';
@@ -3144,7 +3149,7 @@ function renderAdjustPanel() {
       renderWeeklyClassesField() +
       renderTagPriorityFields() +
       renderAtGymField() +
-      renderSupersetBiasField() +
+      // v4.8.5: Superset-bias field hidden (setting pinned to 0). See renderSupersetBiasField.
       '<div class="adjust-goals-head">Goal weights</div>' +
       renderGoalWeightSliders() +
       '</div>';
@@ -3406,7 +3411,9 @@ function renderWarmupGroupCard(card, idx) {
       (over ? ' <span class="mod">modified</span>' : '') + '</li>';
   }).join('');
   // Moves with a real ladder (more than the base step) get progression controls behind expand.
-  const ladderMoves = preview ? [] : card.moves
+  // v4.8.5: the unified Daily tab (state.view === 'daily') hides progression entirely, so the
+  // warm-up group card there is non-expandable too (the gym Today tab keeps its ladders).
+  const ladderMoves = (preview || state.view === 'daily') ? [] : card.moves
     .map((m, i) => ({ m: m, i: i }))
     .filter((o) => progressionLadder(o.m).length > 1);
   const expandable = ladderMoves.length > 0;
@@ -3450,26 +3457,46 @@ function renderWarmupGroupCard(card, idx) {
  *   - every member shares the same `location` (defaults to "floor"),
  *   - no two members share the same `muscle`,
  *   - at most one member carries `largeEquipment`.
- * Each move joins the FIRST existing group it doesn't conflict with, else starts
- * a new group. No size cap (giant sets allowed). Size-1 groups are returned too;
- * the caller renders those as normal individual cards.
+ * Each move joins a compatible existing group, else starts a new one. v4.8.5: at most 4 members
+ * per group (the target search skips any group already at 4). v4.8.5 also adds a SOFT preference
+ * for equal set counts — a two-pass target search first tries a compatible group whose every
+ * member's base set count equals the candidate's (so superset rounds line up), then falls back to
+ * first-fit (the pre-v4.8.5 behaviour). Size-1 groups are returned too; the caller renders those
+ * as normal individual cards. `wouldSuperset` and `sessionMoveCost` delegate here, so both inherit
+ * the 4-cap and the equal-sets preference automatically.
  */
 function groupSupersets(members) {
   const groups = [];
+  // Base set count from the move's AUTHORED dose (NOT effectiveDose — groupSupersets must stay
+  // pure / state-free, so progression-modified set counts are intentionally not considered). → 1.
+  const baseSets = (ex) => (ex && ex.dose && typeof ex.dose.sets === 'number') ? ex.dose.sets : 1;
   (members || []).forEach((m) => {
     if (!m || !m.ex || !m.ex.muscle) return;
     const loc = m.ex.location || 'floor';
+    const mySets = baseSets(m.ex);
+    // A group is a legal target iff: same location, not already full (4-move cap, v4.8.5), m is
+    // pair-compatible with EVERY existing member (supersetPairOk folds in the old muscle-clash +
+    // location rules plus family / fatigue / quality-sensitive / arm-support / impact rules), and
+    // <= 1 large-equipment move total.
+    const canJoin = (g) => {
+      if (g.location !== loc) return false;
+      if (g.members.length >= 4) return false;                                   // v4.8.5: cap supersets at 4 moves
+      if (!g.members.every((x) => supersetPairOk(x.ex, m.ex))) return false;
+      const large = g.members.filter((x) => x.ex.largeEquipment).length + (m.ex.largeEquipment ? 1 : 0);
+      if (large > 1) return false;                                               // >1 large equipment
+      return true;
+    };
+    // Pass 1 (v4.8.5 equal-sets preference): a compatible group where every member matches mySets.
     let target = null;
     for (let gi = 0; gi < groups.length; gi++) {
       const g = groups[gi];
-      if (g.location !== loc) continue;
-      // v4.0 (Phase 2): the candidate must be pair-compatible with EVERY existing member
-      // (supersetPairOk folds in the old muscle-clash + location rules plus family / fatigue
-      // / quality-sensitive / arm-support / impact incompatibilities).
-      if (!g.members.every((x) => supersetPairOk(x.ex, m.ex))) continue;
-      const large = g.members.filter((x) => x.ex.largeEquipment).length + (m.ex.largeEquipment ? 1 : 0);
-      if (large > 1) continue;                                                   // >1 large equipment
-      target = g; break;
+      if (canJoin(g) && g.members.every((x) => baseSets(x.ex) === mySets)) { target = g; break; }
+    }
+    // Pass 2 (fallback): any compatible group, first-fit — the pre-v4.8.5 behaviour.
+    if (!target) {
+      for (let gi = 0; gi < groups.length; gi++) {
+        if (canJoin(groups[gi])) { target = groups[gi]; break; }
+      }
     }
     if (target) target.members.push(m);
     else groups.push({ location: loc, members: [m] });
@@ -3655,7 +3682,9 @@ function renderCard(ex, idx, blockKey) {
   const expanded = !preview && ui.expanded.has(ex.name);
   // v4.4/v4.5: cool-down and daily-practice cards expose the ladder behind expand (splits 5→8 min;
   // tibialis raises, handstand hold). Warm-up moves still surface their ladder via the group card.
-  const showProg = expanded && blockKey !== 'warmup';
+  // v4.8.5: the unified Daily tab hides the Easier/Progress ladder entirely — no card there shows
+  // progression controls (the gym Today tab keeps them).
+  const showProg = expanded && blockKey !== 'warmup' && state.view !== 'daily';
 
   const chips = goals.map((id, i) =>
     '<span class="' + (i === 0 ? 'tag' : 'chip') + ' c-' + escapeHtml(goalColor(id)) + '">' +
@@ -3777,10 +3806,13 @@ function renderFinish() {
 }
 
 /*
- * The "Daily" tab: the static warm-up and cool-down (reusing the Gym view's grouped
- * warm-up card + cool-down rendering and check-off) plus the daily Tuck jumps stim
- * after the warm-up. Shares state.checks with the Gym view for the same warm-up /
- * cool-down items, so a daily item stays checked across both tabs.
+ * The "Daily" tab: v4.8.5 presents the whole tab as ONE unified "Daily" block — warm-up
+ * items (grouped), then the daily practice moves, then the cool-down moves — under a single
+ * length toggle (the daily-mode toggle, which now drives all three via buildWarmup/buildDaily/
+ * buildCooldown's 'daily' context). Each card keeps its ORIGINAL per-card blockKey
+ * ('warmup'|'daily'|'cooldown') so set-circle behaviour, restTarget and 'block:'+group checks
+ * stay correct — only the visual block wrapper is unified. Shares state.checks with the Gym view
+ * for the same warm-up / cool-down items, so a daily item stays checked across both tabs.
  */
 function renderDaily() {
   renderedExercises = [];
@@ -3793,55 +3825,45 @@ function renderDaily() {
   html += renderReadinessPanel();
   html += renderAdjustPanel();
 
-  // Warm-up — same grouped-card rendering / check-off as the Gym view. v4.3: the Daily tab uses
-  // the 'daily' context (pinned care + posture + core; standard/long add a rotating slot). v4.5:
-  // the length toggle is now surfaced here too (the Daily tab is never a preview, so it always
-  // shows) — previously the daily warm-up silently inherited settings.warmupMode with no UI.
-  const warmup = buildWarmup(state, 'daily');
-  if (warmup.length) {
-    const startIdx = renderedExercises.length;
-    let inner = '';
-    warmupGroups(warmup).forEach((item) => {
-      const idx = renderedExercises.length;
-      if (item.kind === 'group') {
-        renderedExercises.push(item.card);
-        inner += renderWarmupGroupCard(item.card, idx);
-      } else {
-        renderedExercises.push(item.ex);
-        inner += renderCard(item.ex, idx, 'warmup');
-      }
-    });
-    html += renderBlock('warmup', 'Warm-up', inner, renderedExercises.slice(startIdx), renderWarmupModeToggle());
-  }
+  const startIdx = renderedExercises.length;
+  let inner = '';
 
-  // v4.5: the daily practice block — assembled by buildDaily (pinned jump stim + shin armor;
+  // Warm-up — same grouped-card rendering / check-off as the Gym view. v4.3: the Daily tab uses
+  // the 'daily' context (pinned care + posture + core; standard/long add a rotating slot). v4.8.5:
+  // its length now comes from the single daily-mode toggle (buildWarmup reads dailyMode for 'daily').
+  const warmup = buildWarmup(state, 'daily');
+  warmupGroups(warmup).forEach((item) => {
+    const idx = renderedExercises.length;
+    if (item.kind === 'group') {
+      renderedExercises.push(item.card);
+      inner += renderWarmupGroupCard(item.card, idx);
+    } else {
+      renderedExercises.push(item.ex);
+      inner += renderCard(item.ex, idx, 'warmup');
+    }
+  });
+
+  // v4.5: the daily practice moves — assembled by buildDaily (pinned jump stim + shin armor;
   // standard/long add the handstand touch). Flat per-move cards keyed by move name (so "Tuck
-  // jumps" stays checked across sessions). Its own length toggle on the header.
-  const daily = buildDaily(state);
-  if (daily.length) {
-    const startIdx = renderedExercises.length;
-    let inner = '';
-    daily.forEach((ex) => {
-      const idx = renderedExercises.length;
-      renderedExercises.push(ex);
-      inner += renderCard(ex, idx, 'daily');
-    });
-    html += renderBlock('daily', 'Practice', inner, renderedExercises.slice(startIdx), renderDailyModeToggle());
-  }
+  // jumps" stays checked across sessions). Keeps the 'daily' blockKey.
+  buildDaily(state).forEach((ex) => {
+    const idx = renderedExercises.length;
+    renderedExercises.push(ex);
+    inner += renderCard(ex, idx, 'daily');
+  });
 
   // Cool-down — v4.4: assembled by buildCooldown in the 'daily' context (pinned splits + calf/
-  // plantar + pec/thoracic; standard/long add a rotating flex/care slot). v4.5: length toggle
-  // surfaced here too.
-  const cooldown = buildCooldown(state, 'daily');
-  if (cooldown.length) {
-    const startIdx = renderedExercises.length;
-    let inner = '';
-    cooldown.forEach((ex) => {
-      const idx = renderedExercises.length;
-      renderedExercises.push(ex);
-      inner += renderCard(ex, idx, 'cooldown');
-    });
-    html += renderBlock('cooldown', 'Cool-down', inner, renderedExercises.slice(startIdx), renderCooldownModeToggle());
+  // plantar + pec/thoracic; standard/long add a rotating flex/care slot). v4.8.5: its length now
+  // comes from the single daily-mode toggle too. Keeps the 'cooldown' blockKey.
+  buildCooldown(state, 'daily').forEach((ex) => {
+    const idx = renderedExercises.length;
+    renderedExercises.push(ex);
+    inner += renderCard(ex, idx, 'cooldown');
+  });
+
+  // v4.8.5: ONE block wraps the whole tab, with the single daily-length toggle on its header.
+  if (inner) {
+    html += renderBlock('daily', 'Daily', inner, renderedExercises.slice(startIdx), renderDailyModeToggle());
   }
 
   return html;
@@ -4186,6 +4208,9 @@ function renderAutoSupersetField() {
 // prefers moves that pair into supersets (applies only while Auto superset is on). Range
 // is hard-coded 0–30 — NOT sourced from routine.structure.sliders. The formula is
 // unchanged (×(1 + 0.1×bias)), so 10 feels as before and 30 reaches 4×.
+// v4.8.5: INTENTIONALLY UNREFERENCED — the setting is hidden and pinned to 0 (freshState +
+// normalizeState). This render fn and the whole bias code path (selectMoves biasOn, wouldSuperset)
+// are kept intact so the setting can be re-surfaced later without rebuilding it.
 function renderSupersetBiasField() {
   const val = clamp(typeof state.settings.supersetBias === 'number' ? state.settings.supersetBias : 5, 0, 30);
   return '<div class="field">' +
@@ -4218,14 +4243,13 @@ function renderSettings() {
     renderTagPriorityFields() +
     renderAtGymField() +
     renderAutoSupersetField() +
-    renderSupersetBiasField() +
+    // v4.8.5: Superset-bias field hidden (setting pinned to 0). See renderSupersetBiasField.
     '<p class="muted">Each tag slider tunes how its moves are picked: 1 hard-avoids them, ' +
       '3 is neutral, 5 favours them. Training location toggles between At gym and At home — At home ' +
       'hard-excludes the gym-only (equipment) moves for a bodyweight-on-a-mat session. ' +
       'Day A/B are automatic — the current day is softly preferred, not locked. ' +
       'Auto superset groups same-muscle-free Floor moves into supersets — one card, alternate ' +
-      'the moves, rest after each round. Higher superset bias makes the generator prefer moves ' +
-      'that pair into supersets; it only applies while Auto superset is on.</p>' +
+      'the moves, rest after each round.</p>' +
     '</section>';
 
   // Goals (v3.0) — a 0–10 weight slider per TRAINING goal (0 = off). Care goals
@@ -4460,6 +4484,13 @@ const COACH_TOOLS = [
     parameters: { type: 'object', properties: {
       goalId: { type: 'string' }, weight: { type: 'integer', minimum: 0, maximum: 10 }
     }, required: ['goalId', 'weight'] }
+  },
+  { type: 'function',
+    name: 'delete_goal',
+    description: 'Delete a goal (training or care) by its id or exact name. Removes it from routine.goals and strips its id from every move (goalScores keys, care[] and goals[] lists). Refused for the LAST remaining training goal — the generator needs at least one to select moves. To merely turn a training goal off without deleting it, set its weight to 0 instead.',
+    parameters: { type: 'object', properties: {
+      goalId: { type: 'string', description: 'the goal id to delete (its exact name is also accepted)' }
+    }, required: ['goalId'] }
   }
 ];
 
@@ -4471,6 +4502,45 @@ function coachTrialBase() {
     settings: { tagPriority: deepClone(state.settings.tagPriority || {}) },
     deletedMoves: []
   };
+}
+
+/*
+ * v4.8.5: remove a goal from `routine` by exact id OR name, cleaning EVERY reference so no orphaned
+ * goal id survives. Mutates `routine` in place (like the coach trial tools; pure-ish — no global
+ * state). Why the cleanup matters: topGoalId / moveChipIds read raw `goalScores` keys, so a stale
+ * key would surface as a gray, raw-id chip on the card; the daily filter reads move.goals; care
+ * chips read move.care. So we strip the id from goalScores maps AND from care[] / goals[] arrays on
+ * every move (blocks.moves + the warm-up / cool-down / daily module moves).
+ * Guards: unknown goal → { ok:false, error }; and we REFUSE to delete the LAST training goal, because
+ * selectMoves scores moves only against training goals — an empty training-goal list scores every
+ * move 0 and empties every gym session (care goals never gate the main pool, so care deletes are safe).
+ * Returns { ok, error?, id, name, kind }.
+ */
+function deleteGoal(routine, ident) {
+  const goals = (routine && routine.goals) || [];
+  const key = String(ident == null ? '' : ident);
+  const g = goals.find((x) => x && (x.id === key || x.name === key));
+  if (!g) return { ok: false, error: 'no goal with id or name "' + key + '"' };
+  if (g.kind === 'training' && goals.filter((x) => x && x.kind === 'training').length <= 1) {
+    return { ok: false, error: 'cannot delete "' + g.name + '" — it is the last training goal, and the ' +
+      'session generator needs at least one training goal to select moves' };
+  }
+  const id = g.id;
+  routine.goals = goals.filter((x) => x !== g);
+  // Scrub the id out of every move: goalScores key (training score), care[] (care ref) and goals[]
+  // (the daily / warm-up / cool-down module chip lists). Each guarded, so it's a no-op where absent.
+  const scrub = (m) => {
+    if (!m) return;
+    if (m.goalScores && Object.prototype.hasOwnProperty.call(m.goalScores, id)) delete m.goalScores[id];
+    if (Array.isArray(m.care)) m.care = m.care.filter((x) => x !== id);
+    if (Array.isArray(m.goals)) m.goals = m.goals.filter((x) => x !== id);
+  };
+  const blocks = routine.blocks || {};
+  (blocks.moves || []).forEach(scrub);
+  [blocks.warmupModules, blocks.cooldownModules, blocks.dailyModules].forEach((mods) => {
+    (mods || []).forEach((mod) => { if (mod && Array.isArray(mod.moves)) mod.moves.forEach(scrub); });
+  });
+  return { ok: true, id: id, name: g.name, kind: g.kind };
 }
 
 // Apply one tool call to `trial`. Returns { ok:true, summary } or { ok:false, error }.
@@ -4571,6 +4641,14 @@ function applyCoachTool(name, args, trial) {
       g.weight = clamp(Math.round(args.weight), 0, 10);
       return ok('Set goal weight: ' + args.goalId + ' → ' + g.weight);
     }
+    case 'delete_goal': {
+      // v4.8.5: address a goal by id or name (matching set_goal_weight's goalId + add_goal's name).
+      const ident = args.goalId || args.name;
+      if (!ident) return err('delete_goal: "goalId" (or "name") is required');
+      const res = deleteGoal(trial.routine, ident);
+      if (!res.ok) return err('delete_goal: ' + res.error);
+      return ok('Delete ' + res.kind + ' goal: ' + res.name + ' (id ' + res.id + ')');
+    }
     default:
       return err('Unknown tool: ' + name);
   }
@@ -4601,8 +4679,8 @@ function coachSettingsContext() {
     'Tag priorities (1 avoid … 3 neutral … 5 favour): ' + (tags.join(', ') || '(none)') + '\n' +
     'Training location: ' + (state.settings.atGym === false
       ? 'at home (gym-only / equipment moves excluded)' : 'at gym (all moves available)') + '\n' +
-    'Superset bias: ' + (state.settings.supersetBias != null ? state.settings.supersetBias : 5) +
-    ' · moves/session: ' + state.settings.moves +
+    // v4.8.5: Superset bias hidden (pinned to 0) — no longer surfaced to the coach.
+    'moves/session: ' + state.settings.moves +
     ' · gymnastics classes this week: ' + weeklyClasses(state.settings) + '\n' +
     'Readiness (today, athlete-set): ' + (rParts.length ? rParts.join(', ') : 'all good') + '\n' +
     'Session intent: ' + (intent === 'default' ? 'default' : INTENT_LABELS[intent]);
@@ -4643,6 +4721,9 @@ function coachSystemPrompt() {
     '  tunnel, posture, sciatic, joint recovery, splits). Do not remove care-serving work casually, and',
     '  for symptom/pain topics advise seeing a professional rather than prescribing rehab.',
     '- Prefer small, targeted edits over sweeping rewrites. Keep names unique. Explain reasoning briefly.',
+    '- You may delete a goal (delete_goal) — but only on explicit request: deleting a goal strips it from',
+    '  every move that scored or referenced it, and the LAST training goal cannot be removed (the generator',
+    '  needs at least one). To simply switch a training goal off, set its weight to 0 rather than deleting it.',
     '- The session planner now enforces family caps (≤1 move per family), load budgets (Σ impact scaled by',
     '  weekly gymnastics classes, plus caps on fatigue≥4 / arm-support / lumbar≥2 moves) and coverage slots.',
     '  So structure/diversity is handled by the generator — do not try to fix it purely by nudging scores.',
@@ -5717,8 +5798,8 @@ if (typeof module !== 'undefined' && module.exports) {
     volumeNudge, pickRaiseKnob, pickLowerKnob,
     progressionReady, isDismissed, computeSuggestions,
     findExerciseByName, collectPools,
-    // v3.9 Coach (pure-ish — applyCoachTool mutates the trial it's given)
-    applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS,
+    // v3.9 Coach (pure-ish — applyCoachTool mutates the trial it's given); v4.8.5 adds deleteGoal
+    applyCoachTool, coachTrialBase, coachMarkdown, COACH_TOOLS, deleteGoal,
     _ui: ui,
     _set: (s) => { state = s; },
     _setSeed: (s) => { SEED_ROUTINE = s; }
